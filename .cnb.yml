@@ -1,0 +1,108 @@
+main:
+  push: 
+    - services:
+        - docker
+      ifModify:
+        - Dockerfile
+      stages:
+        - name: docker build & push
+          script: |
+            docker buildx build -t ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:latest --push .
+  vscode:
+    - runner:
+        cpus: 4
+      docker:
+        image: docker.cnb.cool/soucod-github/soucod/openclaw
+      services:
+        - name: vscode
+          options:
+            onlyPreview: true
+            launch: chmod +x ./start.sh && bash ./start.sh
+            keepAliveTimeout: 3600000
+            daemon: false
+            backup: true
+        - docker
+dev:
+  vscode:
+    - services:
+      - vscode
+      - docker
+
+$:
+  tag_push:
+    - stages:
+        - name: 生成 Code Wiki
+          timeout: 2h
+          image: cnbcool/codewiki:latest
+          settings:
+            git_doc_dir: /${CNB_BUILD_WORKSPACE}/${CNB_REPO_SLUG}/codewiki
+
+# .cnb.yml
+"**":  # 触发的分支名，默认所有分支，可按需修改
+  push:  # push 触发，可按需修改为 pull_request 等
+    - stages:
+      # 代码分析
+      - name: TCA
+        timeout: 2h
+        image: cnbcool/tca:latest
+        settings:
+          from_file:  # 可选，可以传递一个文件（比如 changed.txt），内容为需要分析的文件列表，一行一个文件（采用基于工作空间的相对路径）
+          ignore_paths: # 可选，指定一个或多个相对工作空间的文件屏蔽路径(黑名单)，多个路径可写成数组格式，路径采用Unix通配符格式。
+          white_paths: # 可选，指定一个或多个相对工作区的扫描路径(白名单)，多个路径可写成数组格式，路径采用Unix通配符格式。
+          block:  # 可选，默认为true, 如果有代码问题或分析异常，会阻塞流水线。如果不希望阻塞流水线，可以设置为false。
+
+main:
+  pull_request:
+    - stages:
+      - name: 代码评审
+        image: cnbcool/ai-review:latest
+        settings:
+          type: code-review
+
+    - stages:
+      - name: 变更总结
+        image: cnbcool/ai-review:latest
+        settings:
+          type: diff-summary
+        exports:
+          summary: SUMMARY
+      - name: 输出变更总结
+        script: echo $SUMMARY
+
+    - stages:
+      - name: 提交注释的可读性检测
+        image: cnbcool/ai-review:latest
+        settings:
+          type: commit-message-readability-check
+        exports:
+          status: STATUS
+      - name: 提交注释的可读性检测结果
+        script: |
+          case "${STATUS}" in
+              yes)
+                  echo "✅ 提交注释的可读性检测通过"
+                  ;;
+              no)
+                  echo "⚠️ 提交注释的可读性检测不通过"
+                  exit 1
+                  ;;
+          esac
+
+    - stages:
+      - name: 标题和描述的可读性检测
+        image: cnbcool/ai-review:latest
+        settings:
+          type: pr-info-readability-check
+        exports:
+          status: STATUS
+      - name: 标题和描述的可读性检测结果
+        script: |
+          case "${STATUS}" in
+              yes)
+                  echo "✅ 标题和描述的可读性检测通过"
+                  ;;
+              no)
+                  echo "⚠️ 标题和描述的可读性检测不通过"
+                  exit 1
+                  ;;
+          esac
