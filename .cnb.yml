@@ -1,4 +1,4 @@
-main:
+avwq_dev:
   push: 
     - services:
         - docker
@@ -17,7 +17,7 @@ main:
         - name: vscode
           options:
             onlyPreview: true
-            launch: chmod +x ./start.sh && bash ./start.sh
+            launch: chmod +x ./.cnb/start.sh && bash ./.cnb/start.sh
             keepAliveTimeout: 3600000
             daemon: false
             backup: true

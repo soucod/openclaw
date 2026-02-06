@@ -1,0 +1,80 @@
+{
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "cnb": {
+        "baseUrl": "${CNB_API_ENDPOINT}/${CNB_REPO_SLUG}/-/ai/",
+        "apiKey": "${CNB_TOKEN}",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "auto",
+            "name": "CNB-Models",
+            "reasoning": true,
+            "input": [
+              "text"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "cnb/auto"
+      },
+      "workspace": "/workspace/clawd",
+      "compaction": {
+        "mode": "safeguard"
+      },
+      "maxConcurrent": 4,
+      "subagents": {
+        "maxConcurrent": 8
+      }
+    }
+  },
+  "tools": {
+    "web": {
+      "search": {
+        "enabled": false
+      },
+      "fetch": {
+        "enabled": true
+      }
+    },
+    "agentToAgent": {
+      "enabled": true
+    },
+    "elevated": {
+      "enabled": true
+    },
+    "exec": {
+      "applyPatch": {
+        "enabled": true
+      }
+    }
+  },
+  "gateway": {
+    "mode": "local",
+    "auth": {
+      "mode": "token",
+      "token": "${CNB_TOKEN}"
+    },
+    "port": 18789,
+    "bind": "lan",
+    "tailscale": {
+      "mode": "off",
+      "resetOnExit": false
+    },
+    "controlUi": {
+      "enabled": true,
+      "allowInsecureAuth": true
+    }
+  },
+  "skills": {
+    "install": {
+      "nodeManager": "npm"
+    }
+  }
+}
