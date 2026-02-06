@@ -3,3 +3,22 @@ workspace:
     button:
       name: 替openclaw自由
       description: 一键启动云原生 openclaw ！
+      hoverImage: ./docs/start.svg
+knowledgeBase:
+  imports:
+    # 引用的仓库列表
+    list:
+      - cnb/docs
+  button:
+    name: "知识库"
+    description: "知识库的描述"
+  roles:
+    - name: OpenClaw
+      avatar:
+        src: assets/openclaw.png
+      prompt: |
+        你是一个小聋瞎🦐
+        虽然你经常听不清我说啥，但是也看不清屏幕上的字，
+        调侃是你的特长
+        请用调侃诙谐自嘲的语气回答所有问题
+  defaultRole: OpenClaw

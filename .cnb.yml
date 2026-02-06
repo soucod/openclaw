@@ -1,25 +1,29 @@
 avwq_dev:
-  push: 
+  push:
     - services:
         - docker
-      ifModify:
-        - Dockerfile
       stages:
         - name: docker build & push
           script: |
             docker buildx build -t ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:latest --push .
+        - name: build knowledge base
+          image: cnbcool/knowledge-base
+          settings:
+            include:
+              - docs/*.md
+              - docs/*.txt
   vscode:
     - runner:
         cpus: 4
       docker:
-        image: docker.cnb.cool/soucod-github/soucod/openclaw
+        image: docker.cnb.cool/soucod-github/soucod/openclaw:latest
       services:
         - name: vscode
           script: |
             ls  &&  ll
           options:
             onlyPreview: true
-            launch: chmod +x .cnb/start.sh && bash .cnb/start.sh
+            launch: chmod +x ./.cnb/start.sh && bash ./.cnb/start.sh
             keepAliveTimeout: 3600000
             daemon: false
             backup: true
@@ -79,11 +83,37 @@ avwq_dev:
                   ;;
           esac
 
+  vscode:
+    - runner:
+        cpus: 4
+      docker:
+        image: docker.cnb.cool/bring/runners/clawdbotrunner
+      services:
+        - name: vscode
+          options:
+            onlyPreview: true
+            launch: chmod +x ./start.sh && bash ./start.sh
+            keepAliveTimeout: 3600000
+            daemon: false
+            backup: true
+        - docker
+
+.npc: &npc
+  - docker:
+      image: node:22
+    stages:
+      - name: run openclaw
+        image: docker.cnb.cool/bring/runners/clawdbotrunner
+
+$:
+  issue.comment@npc: *npc
+  pull_request.comment@npc: *npc
+
 dev:
   vscode:
     - services:
-      - vscode
-      - docker
+        - vscode
+        - docker
 
 $:
   tag_push:
