@@ -83,20 +83,6 @@ avwq_dev:
                   ;;
           esac
 
-  vscode:
-    - runner:
-        cpus: 4
-      docker:
-        image: docker.cnb.cool/bring/runners/clawdbotrunner
-      services:
-        - name: vscode
-          options:
-            onlyPreview: true
-            launch: chmod +x ./start.sh && bash ./start.sh
-            keepAliveTimeout: 3600000
-            daemon: false
-            backup: true
-        - docker
 
 .npc: &npc
   - docker:
