@@ -91,9 +91,6 @@ avwq_dev:
       - name: run openclaw
         image: docker.cnb.cool/bring/runners/clawdbotrunner
 
-$:
-  issue.comment@npc: *npc
-  pull_request.comment@npc: *npc
 
 dev:
   vscode:
@@ -102,6 +99,8 @@ dev:
         - docker
 
 $:
+  issue.comment@npc: *npc
+  pull_request.comment@npc: *npc
   tag_push:
     - stages:
         - name: 生成 Code Wiki
