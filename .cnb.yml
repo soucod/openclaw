@@ -17,7 +17,7 @@ avwq_dev:
         - name: vscode
           options:
             onlyPreview: true
-            launch: chmod +x ./.cnb/start.sh && bash ./.cnb/start.sh
+            launch: chmod +x .cnb/start.sh && bash .cnb/start.sh
             keepAliveTimeout: 3600000
             daemon: false
             backup: true
