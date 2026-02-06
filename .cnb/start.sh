@@ -3,7 +3,7 @@
 set -e
 
 mkdir -p ~/.openclaw
-cp openclaw.json ~/.openclaw/openclaw.json
+cp .cnb/openclaw.json ~/.openclaw/openclaw.json
 
 cat > /etc/nginx/nginx.conf <<EOF
 worker_processes 1;
