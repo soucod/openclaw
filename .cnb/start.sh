@@ -2,6 +2,8 @@
 
 set -e
 
+cd ..
+
 mkdir -p ~/.openclaw
 cp .cnb/openclaw.json ~/.openclaw/openclaw.json
 
