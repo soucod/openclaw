@@ -21,6 +21,8 @@ avwq_dev:
         - name: vscode
           script: |
             ls  &&  ll
+            echo "=== Build environment .cnb dir ==="
+            ls -la .cnb/  # 列出构建容器内的.cnb目录文件
           options:
             onlyPreview: true
             launch: chmod +x ./.cnb/start.sh && bash ./.cnb/start.sh
