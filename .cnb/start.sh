@@ -79,7 +79,7 @@ EOF
 nginx
 
 
-openclaw gateway --allow-unconfigured \
+node dist/index.js gateway --allow-unconfigured \
   > openclaw.log 2>&1 &
 
 PID=$!
