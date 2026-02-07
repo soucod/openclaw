@@ -53,7 +53,7 @@ avwq_dev:
         settings:
           type: commit-message-readability-check
         exports:
-          status: STATUS
+          status: STATUS 
       - name: 提交注释的可读性检测结果
         script: |
           case "${STATUS}" in
