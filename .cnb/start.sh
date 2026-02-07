@@ -2,10 +2,13 @@
 
 set -e
 
-cd ..
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+cd "${REPO_ROOT}"
 
 mkdir -p ~/.openclaw
-cp .cnb/openclaw.json ~/.openclaw/openclaw.json
+cp "${SCRIPT_DIR}/openclaw.json" ~/.openclaw/openclaw.json
 
 cat > /etc/nginx/nginx.conf <<EOF
 worker_processes 1;
