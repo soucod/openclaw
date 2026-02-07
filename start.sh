@@ -2,17 +2,13 @@
 
 set -e
 
-# 获取当前脚本所在目录（.cnb 目录）
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
 # Docker 镜像中 openclaw 的安装目录
 # cnb.cool 会 clone 仓库到工作目录，但 dist/ 目录只存在于镜像的 /app 中
 OPENCLAW_DIR="/app"
 
 # 复制配置文件到 openclaw 默认配置目录
-# 使用 .cnb 目录下的 openclaw.json
 mkdir -p ~/.openclaw
-cp "${SCRIPT_DIR}/openclaw.json" ~/.openclaw/openclaw.json
+cp "${OPENCLAW_DIR}/openclaw.json" ~/.openclaw/openclaw.json
 
 # 配置 nginx 反向代理
 cat > /etc/nginx/nginx.conf <<EOF

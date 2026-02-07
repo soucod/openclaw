@@ -19,10 +19,6 @@ avwq_dev:
         image: docker.cnb.cool/soucod-github/soucod/openclaw:latest
       services:
         - name: vscode
-          script: |
-            ls  &&  ll
-            echo "=== Build environment .cnb dir ==="
-            ls -la .cnb/  # 列出构建容器内的.cnb目录文件
           options:
             onlyPreview: true
             launch: chmod +x ./.cnb/start.sh && bash ./.cnb/start.sh
@@ -91,7 +87,7 @@ avwq_dev:
       image: node:22
     stages:
       - name: run openclaw
-        image: docker.cnb.cool/bring/runners/clawdbotrunner
+        image: docker.cnb.cool/soucod-github/soucod/openclaw:latest
 
 
 dev:

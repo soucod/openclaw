@@ -2,13 +2,13 @@ workspace:
   launch:
     button:
       name: 替openclaw自由
-      description: 一键启动云原生 openclaw ！
-      hoverImage: ./docs/start.svg
+      description: 一键启动云原生 openclaw  ！
+      hoverImage: ./assets/start.svg
 knowledgeBase:
   imports:
     # 引用的仓库列表
     list:
-      - cnb/docs
+      - cnb/feedback
   button:
     name: "知识库"
     description: "知识库的描述"
