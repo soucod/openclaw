@@ -8,6 +8,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
 mkdir -p /etc/nginx
+mkdir -p ~/.openclaw
 cp "${SCRIPT_DIR}/openclaw.json" ~/.openclaw/openclaw.json
 
 cat > /etc/nginx/nginx.conf <<EOF
