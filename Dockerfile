@@ -4,6 +4,12 @@ FROM node:22-bookworm
 RUN curl -fsSL https://bun.sh/install | bash
 ENV PATH="/root/.bun/bin:${PATH}"
 
+# Install nginx for reverse proxy (required by cnb.cool cloud environment)
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends nginx && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+
 RUN corepack enable
 
 WORKDIR /app
