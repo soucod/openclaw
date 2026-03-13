@@ -20,7 +20,7 @@
       env:
         IMAGE: ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}
       script: |
-        OPENCLAW_VERSION=$(npm view openclaw version --registry "https://npm.cnb.cool/soucod-github/npm-soucod-github/-/packages/")
+        OPENCLAW_VERSION=$(npm view openclaw version --registry "https://npm.cnb.cool/soucod-github/npm-soucod-github-public/-/packages/")
         echo "openclaw version: $OPENCLAW_VERSION"
         docker buildx build \
           -t "${IMAGE}:${OPENCLAW_VERSION}" \
@@ -64,7 +64,7 @@ avwq_dev:
           env:
             IMAGE: ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}
           script: |
-            OPENCLAW_VERSION=$(npm view openclaw version --registry "https://npm.cnb.cool/soucod-github/npm-soucod-github/-/packages/")
+            OPENCLAW_VERSION=$(npm view openclaw version --registry "https://npm.cnb.cool/soucod-github/npm-soucod-github-public/-/packages/")
             echo "openclaw version: $OPENCLAW_VERSION"
             if ! docker pull "${IMAGE}:${OPENCLAW_VERSION}"; then
               docker buildx build \
