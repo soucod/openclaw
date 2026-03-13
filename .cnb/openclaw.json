@@ -1,0 +1,164 @@
+{
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "cnb": {
+        "baseUrl": "${CNB_API_ENDPOINT}/${CNB_REPO_SLUG}/-/ai/",
+        "apiKey": "${CNB_TOKEN}",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "auto",
+            "name": "CNB-Models",
+            "reasoning": true,
+            "input": [
+              "text"
+            ],
+            "contextWindow": 131072,
+            "maxTokens": 16384
+          }
+        ]
+      },
+      "codebuddy": {
+        "baseUrl": "${CNB_API_ENDPOINT}/${CNB_REPO_SLUG}/-/ai-ide/v2",
+        "apiKey": "${CNB_TOKEN}",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "glm-4.6v",
+            "name": "CNB-Models",
+            "reasoning": true,
+            "input": [
+              "text",
+              "image"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "cnb/auto"
+      },
+      "models": {
+        "cnb/auto": {
+          "alias": "CNB-Models"
+        }
+      },
+      "imageModel": {
+        "primary": "codebuddy/glm-4.6v"
+      },
+      "workspace": "/workspace/clawd",
+      "compaction": {
+        "mode": "safeguard",
+        "reserveTokensFloor": 20000,
+        "memoryFlush": {
+          "enabled": true,
+          "softThresholdTokens": 4000
+        }
+      },
+      "memorySearch": {
+        "provider": "openai",
+        "model": "bge-m3",
+        "remote": {
+          "baseUrl": "${CNB_API_ENDPOINT}/${CNB_REPO_SLUG}/-/ai-ide/v2",
+          "apiKey": "${CNB_TOKEN}"
+        },
+        "fallback": "local"
+      },
+      "maxConcurrent": 4,
+      "subagents": {
+        "maxConcurrent": 8,
+        "model": {
+          "primary": "cnb/auto"
+        }
+      }
+    }
+  },
+  "tools": {
+    "web": {
+      "search": {
+        "enabled": true
+      },
+      "fetch": {
+        "enabled": true
+      }
+    },
+    "agentToAgent": {
+      "enabled": true
+    },
+    "elevated": {
+      "enabled": true
+    },
+    "exec": {
+      "applyPatch": {
+        "enabled": true
+      }
+    }
+  },
+  "gateway": {
+    "mode": "local",
+    "auth": {
+      "mode": "token",
+      "token": "${CNB_TOKEN}"
+    },
+    "port": 18789,
+    "bind": "loopback",
+    "tailscale": {
+      "mode": "off",
+      "resetOnExit": false
+    },
+    "controlUi": {
+      "enabled": true,
+      "allowInsecureAuth": true,
+      "dangerouslyDisableDeviceAuth": true
+    }
+  },
+  "skills": {
+    "install": {
+      "nodeManager": "npm"
+    }
+  },
+  "plugins": {
+    "entries": {
+      "openclaw-mcp-adapter": {
+        "enabled": true,
+        "config": {
+          "servers": [
+            {
+              "name": "cnbcool",
+              "transport": "stdio",
+              "command": "npx",
+              "args": [
+                "-y",
+                "-p",
+                "@cnbcool/mcp-server",
+                "cnb-mcp-stdio"
+              ]
+            },
+            {
+              "name": "bing",
+              "transport": "stdio",
+              "command": "npx",
+              "args": [
+                "-y",
+                "bing-cn-mcp"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "installs": {
+      "openclaw-mcp-adapter": {
+        "source": "npm",
+        "spec": "openclaw-mcp-adapter",
+        "installPath": "/root/.openclaw/extensions/openclaw-mcp-adapter",
+        "version": "0.1.1",
+        "installedAt": "2026-02-09T05:22:58.362Z"
+      }
+    }
+  }
+}

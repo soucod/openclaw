@@ -1,0 +1,87 @@
+.npc: &npc
+  - runner:
+      cpus: 4
+    docker:
+      image: docker.cnb.cool/soucod-github/soucod/openclaw:latest
+    stages:
+      - name: run openclaw
+        script: bash ./start.sh
+
+.build: &build
+  docker:
+    image: node:22
+  services:
+    - docker
+  ifModify:
+    - "!(docs/*.md)"
+    - "!(docs/*.txt)"
+  stages:
+    - name: docker build & push
+      env:
+        IMAGE: ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}
+      script: |
+        OPENCLAW_VERSION=$(npm view openclaw version --registry "https://npm.cnb.cool/soucod-github/npm-soucod-github/-/packages/")
+        echo "openclaw version: $OPENCLAW_VERSION"
+        docker buildx build \
+          -t "${IMAGE}:${OPENCLAW_VERSION}" \
+          -t "${IMAGE}:latest" \
+          --push .
+
+avwq_dev:
+  vscode:
+    - runner:
+        cpus: 4
+      docker:
+        image: docker.cnb.cool/soucod-github/soucod/openclaw:latest
+      services:
+        - name: vscode
+          options:
+            onlyPreview: true
+            launch: bash ./start.sh
+            keepAliveTimeout: 3600000
+            daemon: false
+            backup: true
+        - docker
+  push:
+    - *build
+    - ifModify:
+        - "docs/*.md"
+        - "docs/*.txt"
+      stages:
+        - name: build knowledge base
+          image: cnbcool/knowledge-base
+          settings:
+            include:
+              - docs/*.md
+              - docs/*.txt
+  "crontab: 0 0 * * *":
+    - docker:
+        image: node:22
+      services:
+        - docker
+      stages:
+        - name: daily docker build & push
+          env:
+            IMAGE: ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}
+          script: |
+            OPENCLAW_VERSION=$(npm view openclaw version --registry "https://npm.cnb.cool/soucod-github/npm-soucod-github/-/packages/")
+            echo "openclaw version: $OPENCLAW_VERSION"
+            if ! docker pull "${IMAGE}:${OPENCLAW_VERSION}"; then
+              docker buildx build \
+                -t "${IMAGE}:${OPENCLAW_VERSION}" \
+                -t "${IMAGE}:latest" \
+                --push .
+            else
+              echo "Image ${IMAGE}:${OPENCLAW_VERSION} already exists, skipping build."
+            fi
+
+dev:
+  vscode:
+    - docker:
+        image: docker.cnb.cool/scaffold/examples/nodejs:latest
+      services:
+        - vscode
+        - docker
+OpenClaw:
+  issue.comment@npc: *npc
+  pull_request.comment@npc: *npc
