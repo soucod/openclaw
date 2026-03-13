@@ -137,18 +137,15 @@
                 "@cnbcool/mcp-server",
                 "cnb-mcp-stdio"
               ]
-            },
-            {
-              "name": "bing",
-              "transport": "stdio",
-              "command": "npx",
-              "args": [
-                "-y",
-                "bing-cn-mcp"
-              ]
             }
           ]
         }
+      },
+      "wecom-openclaw-plugin": {
+        "enabled": true
+      },
+      "qqbot": {
+        "enabled": true
       }
     },
     "installs": {
@@ -157,7 +154,39 @@
         "spec": "openclaw-mcp-adapter",
         "installPath": "/root/.openclaw/extensions/openclaw-mcp-adapter",
         "version": "0.1.1",
-        "installedAt": "2026-02-09T05:22:58.362Z"
+        "resolvedName": "openclaw-mcp-adapter",
+        "resolvedVersion": "0.1.1",
+        "resolvedSpec": "openclaw-mcp-adapter@0.1.1",
+        "integrity": "sha512-HqNPiC14f3KoYWIAz/6jB0a7M3kM3+BwtfAxwAoaWbZCBNcM6P5GB0IqzIHaeaBlJYeezHinQj431GN8c2IRbg==",
+        "shasum": "f196c78d966b149b121407cbc14b29da0a8428d9",
+        "resolvedAt": "2026-03-08T12:50:50.949Z",
+        "installedAt": "2026-03-08T12:50:52.234Z"
+      },
+      "wecom-openclaw-plugin": {
+        "source": "npm",
+        "spec": "@wecom/wecom-openclaw-plugin",
+        "installPath": "/root/.openclaw/extensions/wecom-openclaw-plugin",
+        "version": "1.0.6",
+        "resolvedName": "@wecom/wecom-openclaw-plugin",
+        "resolvedVersion": "1.0.6",
+        "resolvedSpec": "@wecom/wecom-openclaw-plugin@1.0.6",
+        "integrity": "sha512-1yn6P3KGdEfKoTuGH0Ot4vuoHOFqZJ+qlVrEXYBzkPwtNHb7s2ja2YKizaffYWb0h2s464PEXKhmkQq/RRJwkg==",
+        "shasum": "f77c23c0285a94d6034ce2e3c5a08df1acbcf1de",
+        "resolvedAt": "2026-03-09T08:35:53.372Z",
+        "installedAt": "2026-03-09T08:36:15.739Z"
+      },
+      "qqbot": {
+        "source": "npm",
+        "spec": "@sliverp/qqbot@latest",
+        "installPath": "/root/.openclaw/extensions/qqbot",
+        "version": "1.5.3",
+        "resolvedName": "@sliverp/qqbot",
+        "resolvedVersion": "1.5.3",
+        "resolvedSpec": "@sliverp/qqbot@1.5.3",
+        "integrity": "sha512-32g2LLjdGrZEOmw5umel0DuWfRyw2HYX3P6lafFapt/98CF+2LsyAXCYBhkpTS0gN9j/pvQpLYcPilO9mWAScA==",
+        "shasum": "8bc609f0a01315ab2c958915ccbff54e3881b868",
+        "resolvedAt": "2026-03-09T08:36:42.456Z",
+        "installedAt": "2026-03-09T08:36:54.376Z"
       }
     }
   }

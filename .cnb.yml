@@ -78,7 +78,7 @@ avwq_dev:
 dev:
   vscode:
     - docker:
-        image: docker.cnb.cool/scaffold/examples/nodejs:latest
+        image: docker.cnb.cool/avwq/cnb-soucod/official-images/node:latest
       services:
         - vscode
         - docker
