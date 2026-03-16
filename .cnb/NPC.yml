@@ -5,7 +5,7 @@
       image: docker.cnb.cool/soucod-github/soucod/openclaw:latest
     stages:
       - name: run openclaw
-        script: bash ./.cnb/start.sh
+        script: bash .cnb/start.sh
 
 OpenClaw:
   issue.comment@npc: *npc

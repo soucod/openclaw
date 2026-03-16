@@ -9,6 +9,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # cnb.cool 会 clone 仓库到工作目录，但 dist/ 目录只存在于镜像的 /app 中
 OPENCLAW_DIR="/app"
 
+sudo mkdir -p /etc/nginx
+
 # 复制配置文件到 openclaw 默认配置目录
 # 使用 .cnb 目录下的 openclaw.json
 mkdir -p ~/.openclaw
