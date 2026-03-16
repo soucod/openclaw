@@ -5,7 +5,7 @@
       image: docker.cnb.cool/soucod-github/soucod/openclaw:latest
     stages:
       - name: run openclaw
-        script: bash ./.cnb/start.sh
+        script: bash .cnb/start.sh
 
 .build: &build
   docker:
@@ -37,7 +37,7 @@ avwq_dev:
         - name: vscode
           options:
             onlyPreview: true
-            launch: bash ./.cnb/start.sh
+            launch: bash .cnb/start.sh
             keepAliveTimeout: 3600000
             daemon: false
             backup: true
