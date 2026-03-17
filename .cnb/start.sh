@@ -10,6 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OPENCLAW_DIR="/app"
 
 mkdir -p /etc/nginx
+apt update && apt install -y nginx 
 
 # 复制配置文件到 openclaw 默认配置目录
 # 使用 .cnb 目录下的 openclaw.json
