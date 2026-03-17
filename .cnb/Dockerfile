@@ -1,4 +1,4 @@
-FROM node:22-slim AS builder
+FROM node:22 AS builder
 
 WORKDIR /srv
 
@@ -12,7 +12,7 @@ RUN npm run build
 
 # ---
 
-FROM node:22-slim AS skills
+FROM node:22 AS skills
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates git && \
@@ -22,7 +22,7 @@ WORKDIR /tmp
 RUN git clone --depth 1 https://cnb.cool/cnb/sdk/cnb-openapi-skills /tmp/cnb-openapi-skills && \
     rm -rf /tmp/cnb-openapi-skills/.git
 
-FROM node:22-slim AS runtime-base
+FROM node:22 AS runtime-base
 
 RUN sed -i 's/deb.debian.org/mirrors.cloud.tencent.com/g' /etc/apt/sources.list.d/debian.sources && \
     sed -i 's/security.debian.org/mirrors.cloud.tencent.com/g' /etc/apt/sources.list.d/debian.sources && \
@@ -41,6 +41,8 @@ RUN openclaw plugins install openclaw-mcp-adapter@latest
 RUN openclaw plugins install @wecom/wecom-openclaw-plugin@latest
 
 RUN openclaw plugins install @sliverp/qqbot@latest
+
+RUN npx -y @larksuite/openclaw-lark-tools install
 
 FROM runtime-base
 
