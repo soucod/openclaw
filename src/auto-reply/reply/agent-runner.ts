@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import { lookupCachedContextTokens } from "../../agents/context-cache.js";
+import { lookupContextTokens } from "../../agents/context-tokens.runtime.js";
 import { DEFAULT_CONTEXT_TOKENS } from "../../agents/defaults.js";
 import { resolveModelAuthMode } from "../../agents/model-auth.js";
 import { isCliProvider } from "../../agents/model-selection.js";
@@ -9,7 +10,6 @@ import {
   resolveSessionFilePathOptions,
   resolveSessionTranscriptPath,
 } from "../../config/sessions/paths.js";
-import { updateSessionStore, updateSessionStoreEntry } from "../../config/sessions/store.js";
 import type { SessionEntry } from "../../config/sessions/types.js";
 import type { TypingMode } from "../../config/types.js";
 import { emitAgentEvent } from "../../infra/agent-events.js";
@@ -26,6 +26,7 @@ import {
 import type { OriginatingChannelType, TemplateContext } from "../templating.js";
 import { resolveResponseUsageMode, type VerboseLevel } from "../thinking.js";
 import type { GetReplyOptions, ReplyPayload } from "../types.js";
+import { runAgentTurnWithFallback } from "./agent-runner-execution.runtime.js";
 import {
   createShouldEmitToolOutput,
   createShouldEmitToolResult,
@@ -33,6 +34,7 @@ import {
   isAudioPayload,
   signalTypingIfNeeded,
 } from "./agent-runner-helpers.js";
+import { runMemoryFlushIfNeeded } from "./agent-runner-memory.runtime.js";
 import { buildReplyPayloads } from "./agent-runner-payloads.js";
 import {
   appendUnscheduledReminderNote,
@@ -46,9 +48,9 @@ import { createFollowupRunner } from "./followup-runner.js";
 import { resolveOriginMessageProvider, resolveOriginMessageTo } from "./origin-routing.js";
 import { readPostCompactionContext } from "./post-compaction-context.js";
 import { resolveActiveRunQueueAction } from "./queue-policy.js";
+import type { FollowupRun, QueueSettings } from "./queue.js";
 import { enqueueFollowupRun } from "./queue/enqueue.js";
-import type { FollowupRun, QueueSettings } from "./queue/types.js";
-import { createReplyMediaPathNormalizer } from "./reply-media-paths.js";
+import { createReplyMediaPathNormalizer } from "./reply-media-paths.runtime.js";
 import { createReplyToModeFilterForChannel, resolveReplyToMode } from "./reply-threading.js";
 import { incrementRunCompactionCount, persistRunSessionUsage } from "./session-run-accounting.js";
 import { createTypingSignaler } from "./typing-mode.js";
@@ -58,15 +60,9 @@ const BLOCK_REPLY_SEND_TIMEOUT_MS = 15_000;
 let piEmbeddedQueueRuntimePromise: Promise<
   typeof import("../../agents/pi-embedded-queue.runtime.js")
 > | null = null;
-let agentRunnerExecutionRuntimePromise: Promise<
-  typeof import("./agent-runner-execution.runtime.js")
-> | null = null;
-let agentRunnerMemoryRuntimePromise: Promise<
-  typeof import("./agent-runner-memory.runtime.js")
-> | null = null;
 let usageCostRuntimePromise: Promise<typeof import("./usage-cost.runtime.js")> | null = null;
-let contextTokensRuntimePromise: Promise<
-  typeof import("../../agents/context-tokens.runtime.js")
+let sessionStoreRuntimePromise: Promise<
+  typeof import("../../config/sessions/store.runtime.js")
 > | null = null;
 
 function loadPiEmbeddedQueueRuntime() {
@@ -74,24 +70,14 @@ function loadPiEmbeddedQueueRuntime() {
   return piEmbeddedQueueRuntimePromise;
 }
 
-function loadAgentRunnerExecutionRuntime() {
-  agentRunnerExecutionRuntimePromise ??= import("./agent-runner-execution.runtime.js");
-  return agentRunnerExecutionRuntimePromise;
-}
-
-function loadAgentRunnerMemoryRuntime() {
-  agentRunnerMemoryRuntimePromise ??= import("./agent-runner-memory.runtime.js");
-  return agentRunnerMemoryRuntimePromise;
-}
-
 function loadUsageCostRuntime() {
   usageCostRuntimePromise ??= import("./usage-cost.runtime.js");
   return usageCostRuntimePromise;
 }
 
-function loadContextTokensRuntime() {
-  contextTokensRuntimePromise ??= import("../../agents/context-tokens.runtime.js");
-  return contextTokensRuntimePromise;
+function loadSessionStoreRuntime() {
+  sessionStoreRuntimePromise ??= import("../../config/sessions/store.runtime.js");
+  return sessionStoreRuntimePromise;
 }
 
 export async function runReplyAgent(params: {
@@ -220,6 +206,7 @@ export async function runReplyAgent(params: {
     activeSessionEntry.updatedAt = updatedAt;
     activeSessionStore[sessionKey] = activeSessionEntry;
     if (storePath) {
+      const { updateSessionStoreEntry } = await loadSessionStoreRuntime();
       await updateSessionStoreEntry({
         storePath,
         sessionKey,
@@ -259,7 +246,6 @@ export async function runReplyAgent(params: {
 
   await typingSignals.signalRunStart();
 
-  const { runMemoryFlushIfNeeded } = await loadAgentRunnerMemoryRuntime();
   activeSessionEntry = await runMemoryFlushIfNeeded({
     cfg,
     followupRun,
@@ -339,6 +325,7 @@ export async function runReplyAgent(params: {
     nextEntry.sessionFile = nextSessionFile;
     activeSessionStore[sessionKey] = nextEntry;
     try {
+      const { updateSessionStore } = await loadSessionStoreRuntime();
       await updateSessionStore(storePath, (store) => {
         store[sessionKey] = nextEntry;
       });
@@ -388,7 +375,6 @@ export async function runReplyAgent(params: {
     });
   try {
     const runStartedAt = Date.now();
-    const { runAgentTurnWithFallback } = await loadAgentRunnerExecutionRuntime();
     const runOutcome = await runAgentTurnWithFallback({
       commandBody,
       followupRun,
@@ -439,6 +425,7 @@ export async function runReplyAgent(params: {
       activeSessionEntry.updatedAt = updatedAt;
       activeSessionStore[sessionKey] = activeSessionEntry;
       if (storePath) {
+        const { updateSessionStoreEntry } = await loadSessionStoreRuntime();
         await updateSessionStoreEntry({
           storePath,
           sessionKey,
@@ -495,6 +482,7 @@ export async function runReplyAgent(params: {
         activeSessionStore[sessionKey] = fallbackStateEntry;
       }
       if (sessionKey && storePath) {
+        const { updateSessionStoreEntry } = await loadSessionStoreRuntime();
         await updateSessionStoreEntry({
           storePath,
           sessionKey,
@@ -513,7 +501,7 @@ export async function runReplyAgent(params: {
     const contextTokensUsed =
       agentCfgContextTokens ??
       cachedContextTokens ??
-      (await loadContextTokensRuntime()).lookupContextTokens(modelUsed) ??
+      lookupContextTokens(modelUsed, { allowAsyncLoad: false }) ??
       activeSessionEntry?.contextTokens ??
       DEFAULT_CONTEXT_TOKENS;
 

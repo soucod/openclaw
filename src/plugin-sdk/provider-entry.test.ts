@@ -1,8 +1,25 @@
 import { describe, expect, it } from "vitest";
+import type { ModelDefinitionConfig } from "../config/types.models.js";
 import { capturePluginRegistration } from "../plugins/captured-registration.js";
 import type { ProviderCatalogContext } from "../plugins/types.js";
 import { defineSingleProviderPluginEntry } from "./provider-entry.js";
 
+function createModel(id: string, name: string): ModelDefinitionConfig {
+  return {
+    id,
+    name,
+    reasoning: false,
+    input: ["text"],
+    cost: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+    },
+    contextWindow: 128_000,
+    maxTokens: 8_192,
+  };
+}
 function createCatalogContext(
   config: ProviderCatalogContext["config"] = {},
 ): ProviderCatalogContext {
@@ -43,7 +60,7 @@ describe("defineSingleProviderPluginEntry", () => {
           buildProvider: () => ({
             api: "openai-completions",
             baseUrl: "https://api.demo.test/v1",
-            models: [{ id: "default", name: "Default" }],
+            models: [createModel("default", "Default")],
           }),
         },
       },
@@ -79,7 +96,7 @@ describe("defineSingleProviderPluginEntry", () => {
         api: "openai-completions",
         apiKey: "test-key",
         baseUrl: "https://api.demo.test/v1",
-        models: [{ id: "default", name: "Default" }],
+        models: [createModel("default", "Default")],
       },
     });
   });
@@ -114,7 +131,7 @@ describe("defineSingleProviderPluginEntry", () => {
           buildProvider: () => ({
             api: "openai-completions",
             baseUrl: "https://gateway.test/v1",
-            models: [{ id: "router", name: "Router" }],
+            models: [createModel("router", "Router")],
           }),
           allowExplicitBaseUrl: true,
         },
@@ -169,6 +186,7 @@ describe("defineSingleProviderPluginEntry", () => {
           providers: {
             gateway: {
               baseUrl: "https://override.test/v1",
+              models: [createModel("router", "Router")],
             },
           },
         },
@@ -179,7 +197,7 @@ describe("defineSingleProviderPluginEntry", () => {
         api: "openai-completions",
         apiKey: "test-key",
         baseUrl: "https://override.test/v1",
-        models: [{ id: "router", name: "Router" }],
+        models: [createModel("router", "Router")],
       },
     });
   });
