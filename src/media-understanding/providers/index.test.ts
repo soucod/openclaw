@@ -1,22 +1,22 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createEmptyPluginRegistry } from "../../plugins/registry.js";
-import { setActivePluginRegistry } from "../../plugins/runtime.js";
+import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../../plugins/runtime.js";
+
+const { loadOpenClawPluginsMock } = vi.hoisted(() => ({
+  loadOpenClawPluginsMock: vi.fn(() => createEmptyPluginRegistry()),
+}));
+
+vi.mock("../../plugins/loader.js", () => ({
+  loadOpenClawPlugins: loadOpenClawPluginsMock,
+}));
+
 import { buildMediaUnderstandingRegistry, getMediaUnderstandingProvider } from "./index.js";
 
 describe("media-understanding provider registry", () => {
   afterEach(() => {
-    setActivePluginRegistry(createEmptyPluginRegistry());
-  });
-
-  it("keeps core-owned fallback providers registered by default", () => {
-    const registry = buildMediaUnderstandingRegistry();
-    const groqProvider = getMediaUnderstandingProvider("groq", registry);
-    const deepgramProvider = getMediaUnderstandingProvider("deepgram", registry);
-
-    expect(groqProvider?.id).toBe("groq");
-    expect(groqProvider?.capabilities).toEqual(["audio"]);
-    expect(deepgramProvider?.id).toBe("deepgram");
-    expect(deepgramProvider?.capabilities).toEqual(["audio"]);
+    loadOpenClawPluginsMock.mockReset();
+    loadOpenClawPluginsMock.mockReturnValue(createEmptyPluginRegistry());
+    resetPluginRuntimeStateForTest();
   });
 
   it("merges plugin-registered media providers into the active registry", async () => {
@@ -59,5 +59,12 @@ describe("media-understanding provider registry", () => {
     const provider = getMediaUnderstandingProvider("gemini", registry);
 
     expect(provider?.id).toBe("google");
+  });
+
+  it("does not load plugins when config is absent and no runtime registry is active", () => {
+    const registry = buildMediaUnderstandingRegistry();
+
+    expect([...registry.keys()]).toEqual([]);
+    expect(loadOpenClawPluginsMock).not.toHaveBeenCalled();
   });
 });
