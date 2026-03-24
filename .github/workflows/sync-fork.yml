@@ -1,8 +1,8 @@
-name: Sync fork from upstream
+name: Sync openclaw main to avwq_dev
 
 on:
   schedule:
-    - cron: '0 1/7 * * *'   # 每天 1点后每7小时触发一次
+    - cron: '0 1/7 * * *'
       timezone: 'Asia/Shanghai'
   workflow_dispatch:
 
