@@ -1,0 +1,33 @@
+name: Sync fork from upstream
+
+on:
+  schedule:
+    - cron: '0 1/7 * * *'   # 每天 1点后每7小时触发一次
+      timezone: 'Asia/Shanghai'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync main from upstream
+        run: |
+          git config user.name ${{ secrets.GIT_NAME }}
+          git config user.email ${{ secrets.GIT_EMAIL }}
+
+          git remote add upstream https://github.com/openclaw/openclaw.git
+          git fetch upstream
+
+          git checkout avwq_dev
+          git merge --ff-only upstream/avwq_dev
+
+          git push origin avwq_dev
