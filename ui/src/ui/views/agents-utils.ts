@@ -1,4 +1,4 @@
-import { html } from "lit";
+import { html, nothing } from "lit";
 import {
   expandToolGroups,
   normalizeToolName,
@@ -8,6 +8,7 @@ import type {
   AgentIdentityResult,
   AgentsFilesListResult,
   AgentsListResult,
+  ModelCatalogEntry,
   ToolCatalogProfile,
   ToolsCatalogResult,
 } from "../types.ts";
@@ -200,22 +201,25 @@ export function resolveAgentAvatarUrl(
   agent: { identity?: { avatar?: string; avatarUrl?: string } },
   agentIdentity?: AgentIdentityResult | null,
 ): string | null {
-  const url =
-    agentIdentity?.avatar?.trim() ??
-    agent.identity?.avatarUrl?.trim() ??
-    agent.identity?.avatar?.trim();
-  if (!url) {
-    return null;
-  }
-  if (AVATAR_URL_RE.test(url)) {
-    return url;
+  const candidates = [
+    agentIdentity?.avatar?.trim(),
+    agent.identity?.avatarUrl?.trim(),
+    agent.identity?.avatar?.trim(),
+  ];
+  for (const candidate of candidates) {
+    if (!candidate) {
+      continue;
+    }
+    if (AVATAR_URL_RE.test(candidate)) {
+      return candidate;
+    }
   }
   return null;
 }
 
 export function agentLogoUrl(basePath: string): string {
   const base = basePath?.trim() ? basePath.replace(/\/$/, "") : "";
-  return base ? `${base}/favicon.svg` : "/favicon.svg";
+  return base ? `${base}/favicon.svg` : "favicon.svg";
 }
 
 function isLikelyEmoji(value: string) {
@@ -571,16 +575,38 @@ function resolveConfiguredModels(
 export function buildModelOptions(
   configForm: Record<string, unknown> | null,
   current?: string | null,
+  catalog?: ModelCatalogEntry[],
 ) {
-  const options = resolveConfiguredModels(configForm);
-  const hasCurrent = current ? options.some((option) => option.value === current) : false;
-  if (current && !hasCurrent) {
+  const seen = new Set<string>();
+  const options: ConfiguredModelOption[] = [];
+  const addOption = (value: string, label: string) => {
+    const key = value.toLowerCase();
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    options.push({ value, label });
+  };
+
+  for (const opt of resolveConfiguredModels(configForm)) {
+    addOption(opt.value, opt.label);
+  }
+
+  if (catalog) {
+    for (const entry of catalog) {
+      const provider = entry.provider?.trim();
+      const value = provider ? `${provider}/${entry.id}` : entry.id;
+      const label = provider ? `${entry.id} · ${provider}` : entry.id;
+      addOption(value, label);
+    }
+  }
+
+  if (current && !seen.has(current.toLowerCase())) {
     options.unshift({ value: current, label: `Current (${current})` });
   }
+
   if (options.length === 0) {
-    return html`
-      <option value="" disabled>No configured models</option>
-    `;
+    return nothing;
   }
   return options.map((option) => html`<option value=${option.value}>${option.label}</option>`);
 }
