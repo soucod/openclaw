@@ -1111,16 +1111,22 @@ describe("gateway server sessions", () => {
     expect(reset.payload?.entry.modelProvider).toBe("openai");
     expect(reset.payload?.entry.model).toBe("gpt-test-a");
     expect(reset.payload?.entry.contextTokens).toBeUndefined();
+    await expect(fs.stat(reset.payload?.entry.sessionFile as string)).resolves.toBeTruthy();
 
     ws.close();
   });
 
   test("sessions.reset preserves spawned session ownership metadata", async () => {
     const { storePath } = await createSessionStoreDir();
+    const customSessionFile = path.join(
+      await fs.realpath(path.dirname(storePath)),
+      "custom-owned-child-transcript.jsonl",
+    );
     await writeSessionStore({
       entries: {
         "subagent:child": {
           sessionId: "sess-owned-child",
+          sessionFile: customSessionFile,
           updatedAt: Date.now(),
           chatType: "group",
           channel: "discord",
@@ -1174,6 +1180,7 @@ describe("gateway server sessions", () => {
       ok: true;
       key: string;
       entry: {
+        sessionFile?: string;
         chatType?: string;
         channel?: string;
         groupId?: string;
@@ -1219,6 +1226,7 @@ describe("gateway server sessions", () => {
     }>(ws, "sessions.reset", { key: "subagent:child" });
 
     expect(reset.ok).toBe(true);
+    expect(reset.payload?.entry.sessionFile).toBe(customSessionFile);
     expect(reset.payload?.entry.chatType).toBe("group");
     expect(reset.payload?.entry.channel).toBe("discord");
     expect(reset.payload?.entry.groupId).toBe("group-1");
@@ -1264,6 +1272,7 @@ describe("gateway server sessions", () => {
     const store = JSON.parse(await fs.readFile(storePath, "utf-8")) as Record<
       string,
       {
+        sessionFile?: string;
         chatType?: string;
         channel?: string;
         groupId?: string;
@@ -1307,6 +1316,7 @@ describe("gateway server sessions", () => {
         label?: string;
       }
     >;
+    expect(store["agent:main:subagent:child"]?.sessionFile).toBe(customSessionFile);
     expect(store["agent:main:subagent:child"]?.chatType).toBe("group");
     expect(store["agent:main:subagent:child"]?.channel).toBe("discord");
     expect(store["agent:main:subagent:child"]?.groupId).toBe("group-1");
