@@ -17,11 +17,11 @@ export type PluginStatusReport = PluginRegistry & {
 };
 
 export type PluginCapabilityKind =
+  | "cli-backend"
   | "text-inference"
   | "speech"
   | "media-understanding"
   | "image-generation"
-  | "video-generation"
   | "web-search"
   | "channel";
 
@@ -162,11 +162,11 @@ export function buildPluginStatusReport(params?: {
 
 function buildCapabilityEntries(plugin: PluginRegistry["plugins"][number]) {
   return [
+    { kind: "cli-backend" as const, ids: plugin.cliBackendIds ?? [] },
     { kind: "text-inference" as const, ids: plugin.providerIds },
     { kind: "speech" as const, ids: plugin.speechProviderIds },
     { kind: "media-understanding" as const, ids: plugin.mediaUnderstandingProviderIds },
     { kind: "image-generation" as const, ids: plugin.imageGenerationProviderIds },
-    { kind: "video-generation" as const, ids: plugin.videoGenerationProviderIds },
     { kind: "web-search" as const, ids: plugin.webSearchProviderIds },
     { kind: "channel" as const, ids: plugin.channelIds },
   ].filter((entry) => entry.ids.length > 0);
