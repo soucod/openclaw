@@ -1,0 +1,10 @@
+.npc: &npc
+  - docker:
+      image: node:22
+    stages:
+      - name: run openclaw
+        image: docker.cnb.cool/soucod-github/soucod/openclaw:latest
+
+$:
+  issue.comment@npc: *npc
+  pull_request.comment@npc: *npc
