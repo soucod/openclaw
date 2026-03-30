@@ -14,6 +14,14 @@ OPENCLAW_DIR="/app"
 mkdir -p ~/.openclaw
 cp "${SCRIPT_DIR}/openclaw.json" ~/.openclaw/openclaw.json
 
+# 确保 nginx 已安装并配置好环境
+if ! command -v nginx &> /dev/null; then
+    echo "[openclaw] nginx not found, installing..."
+    apt-get update && apt-get install -y nginx
+fi
+
+mkdir -p /etc/nginx
+
 # 配置 nginx 反向代理
 cat > /etc/nginx/nginx.conf <<EOF
 worker_processes 1;
