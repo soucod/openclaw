@@ -10,6 +10,7 @@ export type {
 export {
   applyProviderDefaultModel,
   configureOpenAICompatibleSelfHostedProviderNonInteractive,
+  discoverOpenAICompatibleLocalModels,
   discoverOpenAICompatibleSelfHostedProvider,
   promptAndConfigureOpenAICompatibleSelfHostedProvider,
   promptAndConfigureOpenAICompatibleSelfHostedProviderAuth,
@@ -17,13 +18,16 @@ export {
   SELF_HOSTED_DEFAULT_COST,
   SELF_HOSTED_DEFAULT_MAX_TOKENS,
 } from "../plugins/provider-self-hosted-setup.js";
+// Keep shared setup barrels off the generated plugin facades. Source-first
+// facade loading can otherwise recurse back into the same plugin while its
+// public surface is still evaluating.
+export { OLLAMA_DEFAULT_BASE_URL, OLLAMA_DEFAULT_MODEL } from "../../extensions/ollama/api.js";
 export {
-  OLLAMA_DEFAULT_BASE_URL,
-  OLLAMA_DEFAULT_MODEL,
+  buildOllamaProvider,
   configureOllamaNonInteractive,
   ensureOllamaModelPulled,
   promptAndConfigureOllama,
-} from "../plugins/provider-ollama-setup.js";
+} from "../../extensions/ollama/api.js";
 export {
   VLLM_DEFAULT_BASE_URL,
   VLLM_DEFAULT_CONTEXT_WINDOW,
@@ -31,8 +35,5 @@ export {
   VLLM_DEFAULT_MAX_TOKENS,
   promptAndConfigureVllm,
 } from "../plugins/provider-vllm-setup.js";
-export {
-  buildOllamaProvider,
-  buildSglangProvider,
-  buildVllmProvider,
-} from "../agents/models-config.providers.discovery.js";
+export { buildVllmProvider } from "../../extensions/vllm/api.js";
+export { buildSglangProvider } from "../../extensions/sglang/api.js";
