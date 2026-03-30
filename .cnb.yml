@@ -14,7 +14,7 @@ avwq_dev:
               - docs/*.txt
   vscode:
     - runner:
-        cpus: 4
+        cpus: 16
       docker:
         image: docker.cnb.cool/soucod-github/soucod/openclaw:latest
       services:
