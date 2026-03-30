@@ -9,12 +9,10 @@ avwq_dev:
         - name: build knowledge base
           image: cnbcool/knowledge-base
           settings:
-            include:
-              - docs/*.md
-              - docs/*.txt
+            include: '**/*.md,**/*.mdx,**/*.pdf,**/*.docx,**/*.txt'
   vscode:
     - runner:
-        cpus: 4
+        cpus: 16
       docker:
         image: docker.cnb.cool/soucod-github/soucod/openclaw:latest
       services:
@@ -106,6 +104,21 @@ $:
           image: cnbcool/codewiki:latest
           settings:
             git_doc_dir: /${CNB_BUILD_WORKSPACE}/${CNB_REPO_SLUG}/codewiki
+  
+  vscode:
+    - runner:
+        cpus: 32
+      docker:
+        image: docker.cnb.cool/soucod-github/soucod/openclaw:latest
+      services:
+        - name: vscode
+          options:
+            onlyPreview: true
+            launch:  chmod +x ./start.sh && bash ./start.sh
+            keepAliveTimeout: 3600000
+            daemon: false
+            backup: true
+        - docker
 
 # .cnb.yml
 "**":  # 触发的分支名，默认所有分支，可按需修改
