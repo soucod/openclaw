@@ -1,18 +1,5 @@
-import {
-  createReplyPrefixOptions,
-  createTypingCallbacks,
-  ensureConfiguredAcpBindingReady,
-  formatAllowlistMatchMeta,
-  getAgentScopedMediaLocalRoots,
-  getSessionBindingService,
-  logInboundDrop,
-  logTypingFailure,
-  resolveControlCommandGate,
-  type PluginRuntime,
-  type ReplyPayload,
-  type RuntimeEnv,
-  type RuntimeLogger,
-} from "../../runtime-api.js";
+import { resolveControlCommandGate } from "openclaw/plugin-sdk/command-auth";
+import { getSessionBindingService } from "openclaw/plugin-sdk/conversation-runtime";
 import type { CoreConfig, MatrixRoomConfig, ReplyToMode } from "../../types.js";
 import { createMatrixDraftStream } from "../draft-stream.js";
 import {
@@ -38,6 +25,7 @@ import {
 } from "../send.js";
 import { resolveMatrixMonitorAccessState } from "./access-state.js";
 import { resolveMatrixAckReactionConfig } from "./ack-config.js";
+import { resolveMatrixAllowListMatch } from "./allowlist.js";
 import type { MatrixInboundEventDeduper } from "./inbound-dedupe.js";
 import { resolveMatrixLocation, type MatrixLocationPayload } from "./location.js";
 import { downloadMatrixMedia } from "./media.js";
@@ -49,6 +37,19 @@ import { createRoomHistoryTracker } from "./room-history.js";
 import type { HistoryEntry } from "./room-history.js";
 import { resolveMatrixRoomConfig } from "./rooms.js";
 import { resolveMatrixInboundRoute } from "./route.js";
+import {
+  createReplyPrefixOptions,
+  createTypingCallbacks,
+  ensureConfiguredAcpBindingReady,
+  formatAllowlistMatchMeta,
+  getAgentScopedMediaLocalRoots,
+  logInboundDrop,
+  logTypingFailure,
+  type PluginRuntime,
+  type ReplyPayload,
+  type RuntimeEnv,
+  type RuntimeLogger,
+} from "./runtime-api.js";
 import { createMatrixThreadContextResolver } from "./thread-context.js";
 import {
   resolveMatrixReplyToEventId,
@@ -83,6 +84,7 @@ export type MatrixMonitorHandlerParams = {
   /** DM-specific threadReplies override. Falls back to threadReplies when absent. */
   dmThreadReplies?: "off" | "inbound" | "always";
   streaming: "partial" | "off";
+  blockStreamingEnabled: boolean;
   dmEnabled: boolean;
   dmPolicy: "open" | "pairing" | "allowlist" | "disabled";
   textLimit: number;
@@ -200,6 +202,7 @@ export function createMatrixRoomMessageHandler(params: MatrixMonitorHandlerParam
     threadReplies,
     dmThreadReplies,
     streaming,
+    blockStreamingEnabled,
     dmEnabled,
     dmPolicy,
     textLimit,
@@ -471,6 +474,7 @@ export function createMatrixRoomMessageHandler(params: MatrixMonitorHandlerParam
           isRoom,
         });
         const {
+          effectiveGroupAllowFrom,
           effectiveRoomUsers,
           groupAllowConfigured,
           directAllowMatch,
@@ -860,6 +864,8 @@ export function createMatrixRoomMessageHandler(params: MatrixMonitorHandlerParam
           triggerSnapshot,
           threadRootId: _threadRootId,
           thread,
+          effectiveGroupAllowFrom,
+          effectiveRoomUsers,
         };
       };
       const ingressResult =
@@ -910,24 +916,62 @@ export function createMatrixRoomMessageHandler(params: MatrixMonitorHandlerParam
         triggerSnapshot,
         threadRootId: _threadRootId,
         thread,
+        effectiveGroupAllowFrom,
+        effectiveRoomUsers,
       } = resolvedIngressResult;
 
       // Keep the per-room ingress gate focused on ordering-sensitive state updates.
       // Prompt/session enrichment below can run concurrently after the history snapshot is fixed.
       const replyToEventId = resolveMatrixReplyToEventId(event.content as RoomMessageEventContent);
       const threadTarget = thread.threadId;
-      const threadContext = _threadRootId
+      const shouldIncludeRoomContextSender = (contextSenderId?: string): boolean => {
+        if (!isRoom || !contextSenderId) {
+          return true;
+        }
+        if (effectiveRoomUsers.length > 0) {
+          return resolveMatrixAllowListMatch({
+            allowList: effectiveRoomUsers,
+            userId: contextSenderId,
+          }).allowed;
+        }
+        if (groupPolicy === "allowlist" && effectiveGroupAllowFrom.length > 0) {
+          return resolveMatrixAllowListMatch({
+            allowList: effectiveGroupAllowFrom,
+            userId: contextSenderId,
+          }).allowed;
+        }
+        return true;
+      };
+      let threadContext = _threadRootId
         ? await resolveThreadContext({ roomId, threadRootId: _threadRootId })
         : undefined;
-      const replyContext =
-        replyToEventId && replyToEventId === _threadRootId && threadContext?.summary
-          ? {
-              replyToBody: threadContext.summary,
-              replyToSender: threadContext.senderLabel,
-            }
-          : replyToEventId
-            ? await resolveReplyContext({ roomId, eventId: replyToEventId })
-            : undefined;
+      let threadContextBlockedByAllowlist = false;
+      if (threadContext?.senderId && !shouldIncludeRoomContextSender(threadContext.senderId)) {
+        logVerboseMessage("matrix: drop thread root context (sender allowlist)");
+        threadContextBlockedByAllowlist = true;
+        threadContext = undefined;
+      }
+      let replyContext: Awaited<ReturnType<typeof resolveReplyContext>> | undefined;
+      if (replyToEventId && replyToEventId === _threadRootId && threadContextBlockedByAllowlist) {
+        replyContext = undefined;
+      } else if (replyToEventId && replyToEventId === _threadRootId && threadContext?.summary) {
+        replyContext = {
+          replyToBody: threadContext.summary,
+          replyToSender: threadContext.senderLabel,
+          replyToSenderId: threadContext.senderId,
+        };
+      } else {
+        replyContext = replyToEventId
+          ? await resolveReplyContext({ roomId, eventId: replyToEventId })
+          : undefined;
+      }
+      if (
+        replyContext?.replyToSenderId &&
+        !shouldIncludeRoomContextSender(replyContext.replyToSenderId)
+      ) {
+        logVerboseMessage("matrix: drop reply context (sender allowlist)");
+        replyContext = undefined;
+      }
       const roomInfo = isRoom ? await getRoomInfo(roomId) : undefined;
       const roomName = roomInfo?.name;
       const envelopeFrom = isDirectMessage ? senderName : (roomName ?? roomId);
@@ -1085,10 +1129,10 @@ export function createMatrixRoomMessageHandler(params: MatrixMonitorHandlerParam
           });
         },
       });
-      const streamingEnabled = streaming === "partial";
+      const draftStreamingEnabled = streaming === "partial";
       const draftReplyToId = replyToMode !== "off" && !threadTarget ? _messageId : undefined;
       let currentDraftReplyToId = draftReplyToId;
-      const draftStream = streamingEnabled
+      const draftStream = draftStreamingEnabled
         ? createMatrixDraftStream({
             roomId,
             client,
@@ -1308,9 +1352,11 @@ export function createMatrixRoomMessageHandler(params: MatrixMonitorHandlerParam
               replyOptions: {
                 ...replyOptions,
                 skillFilter: roomConfig?.skills,
-                // When streaming is active, disable block streaming — draft
-                // streaming replaces it with edit-in-place updates.
-                disableBlockStreaming: streamingEnabled ? true : undefined,
+                // Matrix expects explicit assistant progress updates as
+                // separate messages only when block streaming is explicitly
+                // enabled. Partial draft streaming still disables the shared
+                // block pipeline so draft edits do not double-send.
+                disableBlockStreaming: draftStream ? true : !blockStreamingEnabled,
                 onPartialReply: draftStream
                   ? (payload) => {
                       const fullText = payload.text ?? "";
