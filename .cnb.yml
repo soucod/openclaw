@@ -1,6 +1,6 @@
 .npc: &npc
   - runner:
-      cpus: 4
+      cpus: 16
     docker:
       image: docker.cnb.cool/soucod-github/soucod/openclaw:latest
     stages:
@@ -30,7 +30,7 @@
 avwq_dev:
   vscode:
     - runner:
-        cpus: 4
+        cpus: 16
       docker:
         image: docker.cnb.cool/soucod-github/soucod/openclaw:latest
       services:
@@ -51,10 +51,8 @@ avwq_dev:
         - name: build knowledge base
           image: cnbcool/knowledge-base
           settings:
-            include:
-              - docs/*.md
-              - docs/*.txt
-  "crontab: 0 0 * * *":
+            include: '**/*.md,**/*.mdx,**/*.pdf,**/*.docx,**/*.txt'
+  "crontab: 25 0 * * *":
     - docker:
         image: node:22
       services:

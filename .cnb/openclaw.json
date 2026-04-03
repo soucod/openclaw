@@ -151,7 +151,7 @@
     "installs": {
       "openclaw-mcp-adapter": {
         "source": "npm",
-        "spec": "openclaw-mcp-adapter",
+        "spec": "openclaw-mcp-adapter@latest",
         "installPath": "/root/.openclaw/extensions/openclaw-mcp-adapter",
         "version": "0.1.1",
         "resolvedName": "openclaw-mcp-adapter",
@@ -159,34 +159,34 @@
         "resolvedSpec": "openclaw-mcp-adapter@0.1.1",
         "integrity": "sha512-HqNPiC14f3KoYWIAz/6jB0a7M3kM3+BwtfAxwAoaWbZCBNcM6P5GB0IqzIHaeaBlJYeezHinQj431GN8c2IRbg==",
         "shasum": "f196c78d966b149b121407cbc14b29da0a8428d9",
-        "resolvedAt": "2026-03-08T12:50:50.949Z",
-        "installedAt": "2026-03-08T12:50:52.234Z"
+        "resolvedAt": "2026-03-18T06:00:31.267Z",
+        "installedAt": "2026-03-18T06:01:06.174Z"
       },
       "wecom-openclaw-plugin": {
         "source": "npm",
         "spec": "@wecom/wecom-openclaw-plugin",
         "installPath": "/root/.openclaw/extensions/wecom-openclaw-plugin",
-        "version": "1.0.6",
+        "version": "2026.3.30",
         "resolvedName": "@wecom/wecom-openclaw-plugin",
-        "resolvedVersion": "1.0.6",
-        "resolvedSpec": "@wecom/wecom-openclaw-plugin@1.0.6",
-        "integrity": "sha512-1yn6P3KGdEfKoTuGH0Ot4vuoHOFqZJ+qlVrEXYBzkPwtNHb7s2ja2YKizaffYWb0h2s464PEXKhmkQq/RRJwkg==",
-        "shasum": "f77c23c0285a94d6034ce2e3c5a08df1acbcf1de",
-        "resolvedAt": "2026-03-09T08:35:53.372Z",
-        "installedAt": "2026-03-09T08:36:15.739Z"
+        "resolvedVersion": "2026.3.30",
+        "resolvedSpec": "@wecom/wecom-openclaw-plugin@2026.3.30",
+        "integrity": "sha512-nEFEliWjQhoBwiSuMniC4P6U8kSLTlGu3EV+jojIVMeL/z1m2PSu17w0u33YwYDvpJH/59GwipEQGmle+VO4aQ==",
+        "shasum": "a67e756f8bbb5cf778254b480608b4dd12691d64",
+        "resolvedAt": "2026-04-01T02:12:55.654Z",
+        "installedAt": "2026-04-01T02:13:00.301Z"
       },
-      "qqbot": {
+      "openclaw-qqbot": {
         "source": "npm",
-        "spec": "@sliverp/qqbot@latest",
-        "installPath": "/root/.openclaw/extensions/qqbot",
-        "version": "1.5.3",
-        "resolvedName": "@sliverp/qqbot",
-        "resolvedVersion": "1.5.3",
-        "resolvedSpec": "@sliverp/qqbot@1.5.3",
-        "integrity": "sha512-32g2LLjdGrZEOmw5umel0DuWfRyw2HYX3P6lafFapt/98CF+2LsyAXCYBhkpTS0gN9j/pvQpLYcPilO9mWAScA==",
-        "shasum": "8bc609f0a01315ab2c958915ccbff54e3881b868",
-        "resolvedAt": "2026-03-09T08:36:42.456Z",
-        "installedAt": "2026-03-09T08:36:54.376Z"
+        "spec": "@tencent-connect/openclaw-qqbot",
+        "installPath": "/root/.openclaw/extensions/openclaw-qqbot",
+        "version": "1.6.7",
+        "resolvedName": "@tencent-connect/openclaw-qqbot",
+        "resolvedVersion": "1.6.7",
+        "resolvedSpec": "@tencent-connect/openclaw-qqbot@1.6.7",
+        "integrity": "sha512-0SynvYuS+/QZ5nmX1mTw46zR07Hiqzeo9SZqZPy2T39gLpxbg2Ifey01BfZDhM+KbRzIG+M0k2/R8jj0OzFxVA==",
+        "shasum": "3f2c4e9bff86f0708e694fe2097d5439df253759",
+        "resolvedAt": "2026-04-01T02:38:38.240Z",
+        "installedAt": "2026-04-01T02:39:27.181Z"
       }
     }
   }

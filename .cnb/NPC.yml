@@ -1,6 +1,6 @@
 .npc: &npc
   - runner:
-      cpus: 4
+      cpus: 8
     docker:
       image: docker.cnb.cool/soucod-github/soucod/openclaw:latest
     stages:

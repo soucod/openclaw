@@ -36,11 +36,14 @@ RUN OPENCLAW_VERSION="$(npm view openclaw version)" && \
     npm i -g "openclaw@${OPENCLAW_VERSION}" && \
     npm cache clean --force
 
+ENV OPENCLAW_PLUGIN_ALLOW_DANGEROUS=1
+ENV OPENCLAW_DISABLE_PLUGIN_SANDBOX=1
+    
 RUN openclaw plugins install openclaw-mcp-adapter@latest
 
 RUN openclaw plugins install @wecom/wecom-openclaw-plugin@latest
 
-RUN openclaw plugins install @sliverp/qqbot@latest
+RUN openclaw plugins install @tencent-connect/openclaw-qqbo@latest
 
 RUN npx -y @larksuite/openclaw-lark-tools install
 
