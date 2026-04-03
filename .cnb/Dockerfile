@@ -1,4 +1,4 @@
-FROM node:22 AS builder
+FROM node:24 AS builder
 
 WORKDIR /srv
 
@@ -12,7 +12,7 @@ RUN npm run build
 
 # ---
 
-FROM node:22 AS skills
+FROM node:24 AS skills
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates git && \
@@ -22,11 +22,11 @@ WORKDIR /tmp
 RUN git clone --depth 1 https://cnb.cool/cnb/sdk/cnb-openapi-skills /tmp/cnb-openapi-skills && \
     rm -rf /tmp/cnb-openapi-skills/.git
 
-FROM node:22 AS runtime-base
+FROM node:24 AS runtime-base
 
 RUN sed -i 's/deb.debian.org/mirrors.cloud.tencent.com/g' /etc/apt/sources.list.d/debian.sources && \
     sed -i 's/security.debian.org/mirrors.cloud.tencent.com/g' /etc/apt/sources.list.d/debian.sources && \
-    npm config set registry https://npm.cnb.cool/avwq/npm-cnb/-/packages/
+    npm config set registry https://npm.cnb.cool/avwq/avwq-npm-cnb-public/-/packages/
 
 RUN apt update && \
     apt install -y nginx curl git chromium chromium-sandbox jq && \
@@ -39,13 +39,17 @@ RUN OPENCLAW_VERSION="$(npm view openclaw version)" && \
 ENV OPENCLAW_PLUGIN_ALLOW_DANGEROUS=1
 ENV OPENCLAW_DISABLE_PLUGIN_SANDBOX=1
     
-RUN openclaw plugins install openclaw-mcp-adapter@latest
+RUN npm pack openclaw-mcp-adapter@0.1.1 && openclaw plugins install ./openclaw-mcp-adapter-0.1.1.tgz
 
-RUN openclaw plugins install @wecom/wecom-openclaw-plugin@latest
+RUN npm pack @wecom/wecom-openclaw-plugin@2026.4.3 && openclaw plugins install ./wecom-wecom-openclaw-plugin-2026.4.3.tgz
 
-RUN openclaw plugins install @tencent-connect/openclaw-qqbo@latest
+RUN npm pack @tencent-connect/openclaw-qqbot@1.7.1 && openclaw plugins install ./tencent-connect-openclaw-qqbot-1.7.1.tgz
 
-RUN npx -y @larksuite/openclaw-lark-tools install
+RUN openclaw plugins install @modelstudio/modelstudio-memory-for-openclaw@latest
+
+RUN npx -y @tencent-weixin/openclaw-weixin-cli@latest install
+
+RUN npx -y @larksuite/openclaw-lark install
 
 FROM runtime-base
 
