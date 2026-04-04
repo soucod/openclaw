@@ -2,8 +2,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const loadBundledPluginPublicSurfaceModuleSync = vi.hoisted(() => vi.fn());
 
-vi.mock("./plugin-sdk/facade-runtime.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("./plugin-sdk/facade-runtime.js")>();
+vi.mock("./plugin-sdk/facade-runtime.js", async () => {
+  const actual = await vi.importActual<typeof import("./plugin-sdk/facade-runtime.js")>(
+    "./plugin-sdk/facade-runtime.js",
+  );
   return {
     ...actual,
     loadBundledPluginPublicSurfaceModuleSync,
@@ -35,19 +37,16 @@ describe("plugin activation boundary", () => {
         DEFAULT_OPENCLAW_BROWSER_PROFILE_NAME: typeof import("./plugin-sdk/browser-runtime.js").DEFAULT_OPENCLAW_BROWSER_PROFILE_NAME;
         DEFAULT_UPLOAD_DIR: typeof import("./plugin-sdk/browser-runtime.js").DEFAULT_UPLOAD_DIR;
         closeTrackedBrowserTabsForSessions: typeof import("./plugin-sdk/browser-runtime.js").closeTrackedBrowserTabsForSessions;
+        parseBrowserMajorVersion: typeof import("./plugin-sdk/browser-runtime.js").parseBrowserMajorVersion;
         redactCdpUrl: typeof import("./plugin-sdk/browser-runtime.js").redactCdpUrl;
+        readBrowserVersion: typeof import("./plugin-sdk/browser-runtime.js").readBrowserVersion;
         resolveBrowserConfig: typeof import("./plugin-sdk/browser-runtime.js").resolveBrowserConfig;
         resolveBrowserControlAuth: typeof import("./plugin-sdk/browser-runtime.js").resolveBrowserControlAuth;
+        resolveGoogleChromeExecutableForPlatform: typeof import("./plugin-sdk/browser-runtime.js").resolveGoogleChromeExecutableForPlatform;
         resolveProfile: typeof import("./plugin-sdk/browser-runtime.js").resolveProfile;
       }>
     | undefined;
   let browserAmbientImportsPromise: Promise<void> | undefined;
-  let discordMaintenancePromise:
-    | Promise<{
-        unbindThreadBindingsBySessionKey: typeof import("./plugin-sdk/discord-thread-bindings.js").unbindThreadBindingsBySessionKey;
-      }>
-    | undefined;
-
   function importAmbientModules() {
     ambientImportsPromise ??= Promise.all([
       import("./agents/cli-session.js"),
@@ -84,9 +83,12 @@ describe("plugin activation boundary", () => {
       DEFAULT_OPENCLAW_BROWSER_PROFILE_NAME: module.DEFAULT_OPENCLAW_BROWSER_PROFILE_NAME,
       DEFAULT_UPLOAD_DIR: module.DEFAULT_UPLOAD_DIR,
       closeTrackedBrowserTabsForSessions: module.closeTrackedBrowserTabsForSessions,
+      parseBrowserMajorVersion: module.parseBrowserMajorVersion,
       redactCdpUrl: module.redactCdpUrl,
+      readBrowserVersion: module.readBrowserVersion,
       resolveBrowserConfig: module.resolveBrowserConfig,
       resolveBrowserControlAuth: module.resolveBrowserControlAuth,
+      resolveGoogleChromeExecutableForPlatform: module.resolveGoogleChromeExecutableForPlatform,
       resolveProfile: module.resolveProfile,
     }));
     return browserHelpersPromise;
@@ -96,20 +98,12 @@ describe("plugin activation boundary", () => {
     browserAmbientImportsPromise ??= Promise.all([
       import("./agents/sandbox/browser.js"),
       import("./agents/sandbox/context.js"),
+      import("./commands/doctor-browser.js"),
       import("./node-host/runner.js"),
       import("./security/audit.js"),
       import("./security/audit-extra.sync.js"),
     ]).then(() => undefined);
     return browserAmbientImportsPromise;
-  }
-
-  function importDiscordMaintenance() {
-    discordMaintenancePromise ??= import("./plugin-sdk/discord-thread-bindings.js").then(
-      (module) => ({
-        unbindThreadBindingsBySessionKey: module.unbindThreadBindingsBySessionKey,
-      }),
-    );
-    return discordMaintenancePromise;
   }
 
   it("does not load bundled provider plugins on ambient command imports", async () => {
@@ -122,7 +116,14 @@ describe("plugin activation boundary", () => {
     const { isChannelConfigured, resolveEnvApiKey } = await importConfigHelpers();
 
     expect(isChannelConfigured({}, "whatsapp", {})).toBe(false);
-    expect(resolveEnvApiKey("anthropic-vertex", {})).toBeNull();
+    expect(
+      resolveEnvApiKey("anthropic-vertex", {
+        ANTHROPIC_VERTEX_USE_GCP_METADATA: "true",
+      }),
+    ).toEqual({
+      apiKey: "gcp-vertex-credentials",
+      source: "gcloud adc",
+    });
     expect(loadBundledPluginPublicSurfaceModuleSync).not.toHaveBeenCalled();
   });
 
@@ -148,6 +149,7 @@ describe("plugin activation boundary", () => {
     expect(browser.DEFAULT_OPENCLAW_BROWSER_COLOR).toBe("#FF4500");
     expect(browser.DEFAULT_OPENCLAW_BROWSER_PROFILE_NAME).toBe("openclaw");
     expect(browser.DEFAULT_UPLOAD_DIR).toContain("uploads");
+    expect(browser.parseBrowserMajorVersion("Google Chrome 144.0.7534.0")).toBe(144);
     expect(browser.resolveBrowserControlAuth({}, {} as NodeJS.ProcessEnv)).toEqual({
       token: undefined,
       password: undefined,
@@ -162,6 +164,8 @@ describe("plugin activation boundary", () => {
     expect(
       browser.redactCdpUrl("wss://user:secret@example.com/devtools/browser/123"),
     ).not.toContain("secret");
+    expect(browser.readBrowserVersion("/path/that/does/not/exist")).toBeNull();
+    expect(browser.resolveGoogleChromeExecutableForPlatform("aix")).toBeNull();
     expect(loadBundledPluginPublicSurfaceModuleSync).not.toHaveBeenCalled();
   });
 
@@ -172,17 +176,16 @@ describe("plugin activation boundary", () => {
     expect(loadBundledPluginPublicSurfaceModuleSync).not.toHaveBeenCalled();
   });
 
-  it("keeps discord cleanup helpers cold when discord is disabled", async () => {
-    const discord = await importDiscordMaintenance();
+  it("keeps generic session-binding cleanup helpers cold when plugins are disabled", async () => {
+    const { getSessionBindingService } =
+      await import("./infra/outbound/session-binding-service.js");
 
-    expect(
-      discord.unbindThreadBindingsBySessionKey({
+    await expect(
+      getSessionBindingService().unbind({
         targetSessionKey: "agent:main:test",
-        targetKind: "acp",
         reason: "session-reset",
-        sendFarewell: true,
       }),
-    ).toEqual([]);
+    ).resolves.toEqual([]);
     expect(loadBundledPluginPublicSurfaceModuleSync).not.toHaveBeenCalled();
   });
 
