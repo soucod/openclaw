@@ -6,12 +6,12 @@ import type {
   ChannelMessageActionAdapter,
   ChannelMessageToolDiscovery,
 } from "openclaw/plugin-sdk/channel-contract";
+import { createChatChannelPlugin } from "openclaw/plugin-sdk/channel-core";
 import { createPairingPrefixStripper } from "openclaw/plugin-sdk/channel-pairing";
 import {
   createAllowlistProviderGroupPolicyWarningCollector,
   projectConfigWarningCollector,
 } from "openclaw/plugin-sdk/channel-policy";
-import { createChatChannelPlugin } from "openclaw/plugin-sdk/core";
 import {
   createChannelDirectoryAdapter,
   createRuntimeDirectoryLiveAdapter,
@@ -20,6 +20,7 @@ import {
 import { createLazyRuntimeNamedExport } from "openclaw/plugin-sdk/lazy-runtime";
 import { createRuntimeOutboundDelegates } from "openclaw/plugin-sdk/outbound-runtime";
 import { createComputedAccountStatusAdapter } from "openclaw/plugin-sdk/status-helpers";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/text-runtime";
 import { msTeamsApprovalAuth } from "./approval-auth.js";
 import {
   buildProbeChannelStatusSummary,
@@ -44,7 +45,7 @@ import {
   resolveMSTeamsChannelAllowlist,
   resolveMSTeamsUserAllowlist,
 } from "./resolve-allowlist.js";
-import { getMSTeamsRuntime } from "./runtime.js";
+import { collectRuntimeConfigAssignments, secretTargetRegistryEntries } from "./secret-contract.js";
 import { resolveMSTeamsOutboundSessionRoute } from "./session-route.js";
 import { msteamsSetupAdapter } from "./setup-core.js";
 import { msteamsSetupWizard } from "./setup-surface.js";
@@ -201,13 +202,6 @@ function resolveActionContent(params: Record<string, unknown>): string {
       : typeof params.message === "string"
         ? params.message
         : "";
-}
-
-function readOptionalTrimmedString(
-  params: Record<string, unknown>,
-  key: string,
-): string | undefined {
-  return typeof params[key] === "string" ? params[key].trim() || undefined : undefined;
 }
 
 function resolveActionUploadFilePath(params: Record<string, unknown>): string | undefined {
@@ -396,6 +390,10 @@ export const msteamsPlugin: ChannelPlugin<ResolvedMSTeamsAccount, ProbeMSTeamsRe
         collectMutableAllowlistWarnings: collectMSTeamsMutableAllowlistWarnings,
       },
       setup: msteamsSetupAdapter,
+      secrets: {
+        secretTargetRegistryEntries,
+        collectRuntimeConfigAssignments,
+      },
       messaging: {
         normalizeTarget: normalizeMSTeamsMessagingTarget,
         resolveOutboundSessionRoute: (params) => resolveMSTeamsOutboundSessionRoute(params),
@@ -635,8 +633,8 @@ export const msteamsPlugin: ChannelPlugin<ResolvedMSTeamsAccount, ProbeMSTeamsRe
                   text: resolveActionContent(ctx.params),
                   mediaUrl,
                   filename:
-                    readOptionalTrimmedString(ctx.params, "filename") ??
-                    readOptionalTrimmedString(ctx.params, "title"),
+                    normalizeOptionalString(ctx.params.filename) ??
+                    normalizeOptionalString(ctx.params.title),
                   mediaLocalRoots: ctx.mediaLocalRoots,
                   mediaReadFile: ctx.mediaReadFile,
                 });
@@ -926,7 +924,7 @@ export const msteamsPlugin: ChannelPlugin<ResolvedMSTeamsAccount, ProbeMSTeamsRe
               const hint = TEAMS_GRAPH_PERMISSION_HINTS[permission];
               return hint ? `${permission} (${hint})` : permission;
             };
-            if (graph.ok === false) {
+            if (!graph.ok) {
               lines.push({ text: `Graph: ${graph.error ?? "failed"}`, tone: "error" });
             } else if (roles.length > 0 || scopes.length > 0) {
               if (roles.length > 0) {
@@ -935,7 +933,7 @@ export const msteamsPlugin: ChannelPlugin<ResolvedMSTeamsAccount, ProbeMSTeamsRe
               if (scopes.length > 0) {
                 lines.push({ text: `Graph scopes: ${scopes.map(formatPermission).join(", ")}` });
               }
-            } else if (graph.ok === true) {
+            } else if (graph.ok) {
               lines.push({ text: "Graph: ok" });
             }
           }
@@ -986,7 +984,7 @@ export const msteamsPlugin: ChannelPlugin<ResolvedMSTeamsAccount, ProbeMSTeamsRe
     },
     threading: {
       buildToolContext: ({ context, hasRepliedRef }) => ({
-        currentChannelId: context.To?.trim() || undefined,
+        currentChannelId: normalizeOptionalString(context.To),
         currentThreadTs: context.ReplyToId,
         hasRepliedRef,
       }),

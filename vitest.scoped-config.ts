@@ -1,6 +1,7 @@
 import { defineConfig } from "vitest/config";
-import { narrowIncludePatternsForCli } from "./vitest.pattern-file.ts";
+import { loadPatternListFromEnv, narrowIncludePatternsForCli } from "./vitest.pattern-file.ts";
 import { sharedVitestConfig } from "./vitest.shared.config.ts";
+import { unitFastTestFiles } from "./vitest.unit-fast-paths.mjs";
 
 function normalizePathPattern(value: string): string {
   return value.replaceAll("\\", "/");
@@ -46,7 +47,7 @@ export function createScopedVitestConfig(
     includeOpenClawRuntimeSetup?: boolean;
     isolate?: boolean;
     name?: string;
-    pool?: "threads";
+    pool?: "forks" | "threads";
     passWithNoTests?: boolean;
     setupFiles?: string[];
     useNonIsolatedRunner?: boolean;
@@ -55,9 +56,11 @@ export function createScopedVitestConfig(
   const base = sharedVitestConfig as Record<string, unknown>;
   const baseTest = sharedVitestConfig.test ?? {};
   const scopedDir = options?.dir;
+  const env = options?.env;
+  const includeFromEnv = loadPatternListFromEnv("OPENCLAW_VITEST_INCLUDE_FILE", env);
   const cliInclude = narrowIncludePatternsForCli(include, options?.argv);
   const exclude = relativizeScopedPatterns(
-    [...(baseTest.exclude ?? []), ...(options?.exclude ?? [])],
+    [...(baseTest.exclude ?? []), ...unitFastTestFiles, ...(options?.exclude ?? [])],
     scopedDir,
   );
   const isolate = options?.isolate ?? resolveVitestIsolation(options?.env);
@@ -69,6 +72,7 @@ export function createScopedVitestConfig(
     ]),
   ];
   const useNonIsolatedRunner = options?.useNonIsolatedRunner ?? !isolate;
+  const runner = useNonIsolatedRunner ? "./test/non-isolated-runner.ts" : undefined;
 
   return defineConfig({
     ...base,
@@ -78,10 +82,10 @@ export function createScopedVitestConfig(
       ...(options?.name ? { name: options.name } : {}),
       ...(options?.environment ? { environment: options.environment } : {}),
       isolate,
-      ...(useNonIsolatedRunner ? { runner: "./test/non-isolated-runner.ts" } : {}),
+      ...(runner ? { runner } : { runner: undefined }),
       setupFiles,
       ...(scopedDir ? { dir: scopedDir } : {}),
-      include: relativizeScopedPatterns(cliInclude ?? include, scopedDir),
+      include: relativizeScopedPatterns(includeFromEnv ?? cliInclude ?? include, scopedDir),
       exclude,
       ...(options?.pool ? { pool: options.pool } : {}),
       ...(options?.passWithNoTests !== undefined || cliInclude !== null
