@@ -18,27 +18,43 @@ function resolveModel(model: string | undefined, fallback: string): string {
   return trimmed || fallback;
 }
 
+function resolveUploadFileName(fileName?: string, mime?: string): string {
+  const trimmed = fileName?.trim();
+  const baseName = trimmed ? path.basename(trimmed) : "audio";
+  const lowerMime = mime?.trim().toLowerCase();
+
+  if (/\.aac$/i.test(baseName)) {
+    return `${baseName.slice(0, -4) || "audio"}.m4a`;
+  }
+  if (!path.extname(baseName) && lowerMime === "audio/aac") {
+    return `${baseName || "audio"}.m4a`;
+  }
+  return baseName;
+}
+
 export async function transcribeOpenAiCompatibleAudio(
   params: OpenAiCompatibleAudioParams,
 ): Promise<AudioTranscriptionResult> {
   const fetchFn = params.fetchFn ?? fetch;
-  const { baseUrl, allowPrivateNetwork, headers } = resolveProviderHttpRequestConfig({
-    baseUrl: params.baseUrl,
-    defaultBaseUrl: params.defaultBaseUrl,
-    headers: params.headers,
-    defaultHeaders: {
-      authorization: `Bearer ${params.apiKey}`,
-    },
-    provider: params.provider,
-    api: "openai-audio-transcriptions",
-    capability: "audio",
-    transport: "media-understanding",
-  });
+  const { baseUrl, allowPrivateNetwork, headers, dispatcherPolicy } =
+    resolveProviderHttpRequestConfig({
+      baseUrl: params.baseUrl,
+      defaultBaseUrl: params.defaultBaseUrl,
+      headers: params.headers,
+      request: params.request,
+      defaultHeaders: {
+        authorization: `Bearer ${params.apiKey}`,
+      },
+      provider: params.provider,
+      api: "openai-audio-transcriptions",
+      capability: "audio",
+      transport: "media-understanding",
+    });
   const url = `${baseUrl}/audio/transcriptions`;
 
   const model = resolveModel(params.model, params.defaultModel);
   const form = new FormData();
-  const fileName = params.fileName?.trim() || path.basename(params.fileName) || "audio";
+  const fileName = resolveUploadFileName(params.fileName, params.mime);
   const bytes = new Uint8Array(params.buffer);
   const blob = new Blob([bytes], {
     type: params.mime ?? "application/octet-stream",
@@ -58,7 +74,9 @@ export async function transcribeOpenAiCompatibleAudio(
     body: form,
     timeoutMs: params.timeoutMs,
     fetchFn,
+    pinDns: false,
     allowPrivateNetwork,
+    dispatcherPolicy,
   });
 
   try {
