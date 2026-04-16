@@ -1,20 +1,33 @@
 import crypto from "node:crypto";
-import type { OpenClawConfig } from "../../config/config.js";
+import fs from "node:fs";
+import path from "node:path";
 import { resolveUserTimezone } from "../../agents/date-time.js";
 import { buildWorkspaceSkillSnapshot } from "../../agents/skills.js";
 import { ensureSkillsWatcher, getSkillsSnapshotVersion } from "../../agents/skills/refresh.js";
-import { type SessionEntry, updateSessionStore } from "../../config/sessions.js";
+import type { OpenClawConfig } from "../../config/config.js";
+import {
+  resolveSessionFilePath,
+  resolveSessionFilePathOptions,
+  type SessionEntry,
+  updateSessionStore,
+} from "../../config/sessions.js";
 import { buildChannelSummary } from "../../infra/channel-summary.js";
+import {
+  resolveTimezone,
+  formatUtcTimestamp,
+  formatZonedTimestamp,
+} from "../../infra/format-time/format-datetime.ts";
 import { getRemoteSkillEligibility } from "../../infra/skills-remote.js";
 import { drainSystemEventEntries } from "../../infra/system-events.js";
+import { resolveAgentIdFromSessionKey } from "../../routing/session-key.js";
 
-export async function prependSystemEvents(params: {
+/** Drain queued system events, format as `System:` lines, return the block (or undefined). */
+export async function drainFormattedSystemEvents(params: {
   cfg: OpenClawConfig;
   sessionKey: string;
   isMainSession: boolean;
   isNewSession: boolean;
-  prefixedBodyBase: string;
-}): Promise<string> {
+}): Promise<string | undefined> {
   const compactSystemEvent = (line: string): string | null => {
     const trimmed = line.trim();
     if (!trimmed) {
@@ -39,15 +52,6 @@ export async function prependSystemEvents(params: {
     return trimmed;
   };
 
-  const resolveExplicitTimezone = (value: string): string | undefined => {
-    try {
-      new Intl.DateTimeFormat("en-US", { timeZone: value }).format(new Date());
-      return value;
-    } catch {
-      return undefined;
-    }
-  };
-
   const resolveSystemEventTimezone = (cfg: OpenClawConfig) => {
     const raw = cfg.agents?.defaults?.envelopeTimezone?.trim();
     if (!raw) {
@@ -66,47 +70,8 @@ export async function prependSystemEvents(params: {
         timeZone: resolveUserTimezone(cfg.agents?.defaults?.userTimezone),
       };
     }
-    const explicit = resolveExplicitTimezone(raw);
+    const explicit = resolveTimezone(raw);
     return explicit ? { mode: "iana" as const, timeZone: explicit } : { mode: "local" as const };
-  };
-
-  const formatUtcTimestamp = (date: Date): string => {
-    const yyyy = String(date.getUTCFullYear()).padStart(4, "0");
-    const mm = String(date.getUTCMonth() + 1).padStart(2, "0");
-    const dd = String(date.getUTCDate()).padStart(2, "0");
-    const hh = String(date.getUTCHours()).padStart(2, "0");
-    const min = String(date.getUTCMinutes()).padStart(2, "0");
-    const sec = String(date.getUTCSeconds()).padStart(2, "0");
-    return `${yyyy}-${mm}-${dd}T${hh}:${min}:${sec}Z`;
-  };
-
-  const formatZonedTimestamp = (date: Date, timeZone?: string): string | undefined => {
-    const parts = new Intl.DateTimeFormat("en-US", {
-      timeZone,
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-      hourCycle: "h23",
-      timeZoneName: "short",
-    }).formatToParts(date);
-    const pick = (type: string) => parts.find((part) => part.type === type)?.value;
-    const yyyy = pick("year");
-    const mm = pick("month");
-    const dd = pick("day");
-    const hh = pick("hour");
-    const min = pick("minute");
-    const sec = pick("second");
-    const tz = [...parts]
-      .toReversed()
-      .find((part) => part.type === "timeZoneName")
-      ?.value?.trim();
-    if (!yyyy || !mm || !dd || !hh || !min || !sec) {
-      return undefined;
-    }
-    return `${yyyy}-${mm}-${dd} ${hh}:${min}:${sec}${tz ? ` ${tz}` : ""}`;
   };
 
   const formatSystemEventTimestamp = (ts: number, cfg: OpenClawConfig) => {
@@ -116,12 +81,15 @@ export async function prependSystemEvents(params: {
     }
     const zone = resolveSystemEventTimezone(cfg);
     if (zone.mode === "utc") {
-      return formatUtcTimestamp(date);
+      return formatUtcTimestamp(date, { displaySeconds: true });
     }
     if (zone.mode === "local") {
-      return formatZonedTimestamp(date) ?? "unknown-time";
+      return formatZonedTimestamp(date, { displaySeconds: true }) ?? "unknown-time";
     }
-    return formatZonedTimestamp(date, zone.timeZone) ?? "unknown-time";
+    return (
+      formatZonedTimestamp(date, { timeZone: zone.timeZone, displaySeconds: true }) ??
+      "unknown-time"
+    );
   };
 
   const systemLines: string[] = [];
@@ -144,11 +112,38 @@ export async function prependSystemEvents(params: {
     }
   }
   if (systemLines.length === 0) {
-    return params.prefixedBodyBase;
+    return undefined;
   }
 
-  const block = systemLines.map((l) => `System: ${l}`).join("\n");
-  return `${block}\n\n${params.prefixedBodyBase}`;
+  // Format events as trusted System: lines for the message timeline.
+  // Inbound sanitization rewrites any user-supplied "System:" to "System (untrusted):",
+  // so these gateway-originated lines are distinguishable by the model.
+  // Each sub-line of a multi-line event gets its own System: prefix so continuation
+  // lines can't be mistaken for user content.
+  return systemLines
+    .flatMap((line) => line.split("\n").map((subline) => `System: ${subline}`))
+    .join("\n");
+}
+
+async function persistSessionEntryUpdate(params: {
+  sessionStore?: Record<string, SessionEntry>;
+  sessionKey?: string;
+  storePath?: string;
+  nextEntry: SessionEntry;
+}) {
+  if (!params.sessionStore || !params.sessionKey) {
+    return;
+  }
+  params.sessionStore[params.sessionKey] = {
+    ...params.sessionStore[params.sessionKey],
+    ...params.nextEntry,
+  };
+  if (!params.storePath) {
+    return;
+  }
+  await updateSessionStore(params.storePath, (store) => {
+    store[params.sessionKey!] = { ...store[params.sessionKey!], ...params.nextEntry };
+  });
 }
 
 export async function ensureSkillSnapshot(params: {
@@ -167,6 +162,16 @@ export async function ensureSkillSnapshot(params: {
   skillsSnapshot?: SessionEntry["skillsSnapshot"];
   systemSent: boolean;
 }> {
+  if (process.env.OPENCLAW_TEST_FAST === "1") {
+    // In fast unit-test runs we skip filesystem scanning, watchers, and session-store writes.
+    // Dedicated skills tests cover snapshot generation behavior.
+    return {
+      sessionEntry: params.sessionEntry,
+      skillsSnapshot: params.sessionEntry?.skillsSnapshot,
+      systemSent: params.sessionEntry?.systemSent ?? false,
+    };
+  }
+
   const {
     sessionEntry,
     sessionStore,
@@ -209,12 +214,7 @@ export async function ensureSkillSnapshot(params: {
       systemSent: true,
       skillsSnapshot: skillSnapshot,
     };
-    sessionStore[sessionKey] = { ...sessionStore[sessionKey], ...nextEntry };
-    if (storePath) {
-      await updateSessionStore(storePath, (store) => {
-        store[sessionKey] = { ...store[sessionKey], ...nextEntry };
-      });
-    }
+    await persistSessionEntryUpdate({ sessionStore, sessionKey, storePath, nextEntry });
     systemSent = true;
   }
 
@@ -251,12 +251,7 @@ export async function ensureSkillSnapshot(params: {
       updatedAt: Date.now(),
       skillsSnapshot,
     };
-    sessionStore[sessionKey] = { ...sessionStore[sessionKey], ...nextEntry };
-    if (storePath) {
-      await updateSessionStore(storePath, (store) => {
-        store[sessionKey] = { ...store[sessionKey], ...nextEntry };
-      });
-    }
+    await persistSessionEntryUpdate({ sessionStore, sessionKey, storePath, nextEntry });
   }
 
   return { sessionEntry: nextEntry, skillsSnapshot, systemSent };
@@ -268,8 +263,11 @@ export async function incrementCompactionCount(params: {
   sessionKey?: string;
   storePath?: string;
   now?: number;
+  amount?: number;
   /** Token count after compaction - if provided, updates session token counts */
   tokensAfter?: number;
+  /** Session id after compaction, when the runtime rotated transcripts. */
+  newSessionId?: string;
 }): Promise<number | undefined> {
   const {
     sessionEntry,
@@ -277,7 +275,9 @@ export async function incrementCompactionCount(params: {
     sessionKey,
     storePath,
     now = Date.now(),
+    amount = 1,
     tokensAfter,
+    newSessionId,
   } = params;
   if (!sessionStore || !sessionKey) {
     return undefined;
@@ -286,18 +286,31 @@ export async function incrementCompactionCount(params: {
   if (!entry) {
     return undefined;
   }
-  const nextCount = (entry.compactionCount ?? 0) + 1;
+  const incrementBy = Math.max(0, amount);
+  const nextCount = (entry.compactionCount ?? 0) + incrementBy;
   // Build update payload with compaction count and optionally updated token counts
   const updates: Partial<SessionEntry> = {
     compactionCount: nextCount,
     updatedAt: now,
   };
+  if (newSessionId && newSessionId !== entry.sessionId) {
+    updates.sessionId = newSessionId;
+    updates.sessionFile = resolveCompactionSessionFile({
+      entry,
+      sessionKey,
+      storePath,
+      newSessionId,
+    });
+  }
   // If tokensAfter is provided, update the cached token counts to reflect post-compaction state
   if (tokensAfter != null && tokensAfter > 0) {
     updates.totalTokens = tokensAfter;
+    updates.totalTokensFresh = true;
     // Clear input/output breakdown since we only have the total estimate after compaction
     updates.inputTokens = undefined;
     updates.outputTokens = undefined;
+    updates.cacheRead = undefined;
+    updates.cacheWrite = undefined;
   }
   sessionStore[sessionKey] = {
     ...entry,
@@ -312,4 +325,73 @@ export async function incrementCompactionCount(params: {
     });
   }
   return nextCount;
+}
+
+function resolveCompactionSessionFile(params: {
+  entry: SessionEntry;
+  sessionKey: string;
+  storePath?: string;
+  newSessionId: string;
+}): string {
+  const agentId = resolveAgentIdFromSessionKey(params.sessionKey);
+  const pathOpts = resolveSessionFilePathOptions({
+    agentId,
+    storePath: params.storePath,
+  });
+  const rewrittenSessionFile = rewriteSessionFileForNewSessionId({
+    sessionFile: params.entry.sessionFile,
+    previousSessionId: params.entry.sessionId,
+    nextSessionId: params.newSessionId,
+  });
+  const normalizedRewrittenSessionFile =
+    rewrittenSessionFile && path.isAbsolute(rewrittenSessionFile)
+      ? canonicalizeAbsoluteSessionFilePath(rewrittenSessionFile)
+      : rewrittenSessionFile;
+  return resolveSessionFilePath(
+    params.newSessionId,
+    normalizedRewrittenSessionFile ? { sessionFile: normalizedRewrittenSessionFile } : undefined,
+    pathOpts,
+  );
+}
+
+function canonicalizeAbsoluteSessionFilePath(filePath: string): string {
+  const resolved = path.resolve(filePath);
+  try {
+    const parentDir = fs.realpathSync(path.dirname(resolved));
+    return path.join(parentDir, path.basename(resolved));
+  } catch {
+    return resolved;
+  }
+}
+
+function rewriteSessionFileForNewSessionId(params: {
+  sessionFile?: string;
+  previousSessionId: string;
+  nextSessionId: string;
+}): string | undefined {
+  const trimmed = params.sessionFile?.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  const base = path.basename(trimmed);
+  if (!base.endsWith(".jsonl")) {
+    return undefined;
+  }
+  const withoutExt = base.slice(0, -".jsonl".length);
+  if (withoutExt === params.previousSessionId) {
+    return path.join(path.dirname(trimmed), `${params.nextSessionId}.jsonl`);
+  }
+  if (withoutExt.startsWith(`${params.previousSessionId}-topic-`)) {
+    return path.join(
+      path.dirname(trimmed),
+      `${params.nextSessionId}${base.slice(params.previousSessionId.length)}`,
+    );
+  }
+  const forkMatch = withoutExt.match(
+    /^(\d{4}-\d{2}-\d{2}T[\w-]+(?:Z|[+-]\d{2}(?:-\d{2})?)?)_(.+)$/,
+  );
+  if (forkMatch?.[2] === params.previousSessionId) {
+    return path.join(path.dirname(trimmed), `${forkMatch[1]}_${params.nextSessionId}.jsonl`);
+  }
+  return undefined;
 }
