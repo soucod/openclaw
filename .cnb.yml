@@ -1,6 +1,6 @@
 .npc: &npc
   - runner:
-      cpus: 4
+      cpus: 8
     docker:
       image: docker.cnb.cool/soucod-github/soucod/openclaw:latest
     stages:
@@ -9,7 +9,7 @@
 
 .build: &build
   docker:
-    image: node:22
+    image: node:24
   services:
     - docker
   ifModify:
@@ -30,11 +30,12 @@
 avwq_dev:
   vscode:
     - runner:
-        cpus: 4
+        cpus: 16
       docker:
         image: docker.cnb.cool/soucod-github/soucod/openclaw:latest
       services:
         - name: vscode
+          timeout: 20m
           options:
             onlyPreview: true
             launch: bash .cnb/start.sh
@@ -56,7 +57,7 @@ avwq_dev:
               - docs/*.txt
   "crontab: 0 0 * * *":
     - docker:
-        image: node:22
+        image: node:24
       services:
         - docker
       stages:
