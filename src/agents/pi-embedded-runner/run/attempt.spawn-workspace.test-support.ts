@@ -424,6 +424,7 @@ vi.mock("../../pi-bundle-mcp-tools.js", () => ({
   createBundleMcpToolRuntime: async () => undefined,
   getOrCreateSessionMcpRuntime: async () => undefined,
   materializeBundleMcpToolsForRun: async () => undefined,
+  retireSessionMcpRuntime: async () => true,
 }));
 
 vi.mock("../../pi-bundle-lsp-runtime.js", () => ({
@@ -602,7 +603,6 @@ vi.mock("../tool-name-allowlist.js", () => ({
 
 vi.mock("../tool-split.js", () => ({
   splitSdkTools: ({ tools }: { tools: unknown[] }) => ({
-    builtInTools: [],
     customTools: tools,
   }),
 }));
