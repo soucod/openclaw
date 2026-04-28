@@ -77,6 +77,39 @@ describe("conversation resolution", () => {
     });
   });
 
+  it("can skip placement hints for callers that do not consume them", () => {
+    registerChannelPlugin({
+      ...createChannelTestPluginBase({
+        id: "discord",
+        label: "Discord",
+      }),
+      conversationBindings: {
+        supportsCurrentConversationBinding: true,
+        defaultTopLevelPlacement: "child",
+      },
+      bindings: {
+        ...createBindingProviderDefaults(),
+        resolveCommandConversation: () => ({ conversationId: "channel:123" }),
+      },
+    });
+
+    expect(
+      resolveCommandConversationResolution({
+        cfg: testConfig,
+        channel: "discord",
+        originatingTo: "discord:channel:123",
+        includePlacementHint: false,
+      }),
+    ).toEqual({
+      canonical: {
+        channel: "discord",
+        accountId: "default",
+        conversationId: "channel:123",
+      },
+      source: "command-provider",
+    });
+  });
+
   it("applies provider-owned self-parent defaults in one core path", () => {
     registerChannelPlugin({
       ...createChannelTestPluginBase({ id: "line", label: "LINE" }),
@@ -125,6 +158,31 @@ describe("conversation resolution", () => {
         parentConversationId: "parent-room",
       },
       threadId: "child-thread",
+      source: "command-fallback",
+    });
+  });
+
+  it("normalizes numeric command thread ids through the shared route contract", () => {
+    registerChannelPlugin({
+      ...createChannelTestPluginBase({ id: "test-chat", label: "Test chat" }),
+    });
+
+    expect(
+      resolveCommandConversationResolution({
+        cfg: testConfig,
+        channel: "test-chat",
+        accountId: "default",
+        originatingTo: "test-chat:channel:parent-room",
+        threadId: 42.9,
+      }),
+    ).toEqual({
+      canonical: {
+        channel: "test-chat",
+        accountId: "default",
+        conversationId: "42",
+        parentConversationId: "parent-room",
+      },
+      threadId: "42",
       source: "command-fallback",
     });
   });
@@ -233,6 +291,31 @@ describe("conversation resolution", () => {
         parentConversationId: "parent-room",
       },
       threadId: "child-thread",
+      source: "inbound-fallback",
+    });
+  });
+
+  it("normalizes numeric inbound thread ids through the shared route contract", () => {
+    registerChannelPlugin({
+      ...createChannelTestPluginBase({ id: "test-chat", label: "Test chat" }),
+    });
+
+    expect(
+      resolveInboundConversationResolution({
+        cfg: testConfig,
+        channel: "test-chat",
+        accountId: "default",
+        to: "test-chat:channel:parent-room",
+        threadId: 42.9,
+      }),
+    ).toEqual({
+      canonical: {
+        channel: "test-chat",
+        accountId: "default",
+        conversationId: "42",
+        parentConversationId: "parent-room",
+      },
+      threadId: "42",
       source: "inbound-fallback",
     });
   });
