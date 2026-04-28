@@ -10,11 +10,21 @@ import {
   realpathSync,
   rmSync,
 } from "node:fs";
+import { builtinModules } from "node:module";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative } from "node:path";
 import { pathToFileURL } from "node:url";
 import { formatErrorMessage } from "../src/infra/errors.ts";
 import { BUNDLED_RUNTIME_SIDECAR_PATHS } from "../src/plugins/runtime-sidecar-paths.ts";
+import { listBundledPluginPackArtifacts } from "./lib/bundled-plugin-build-entries.mjs";
+import {
+  collectBundledPluginRootRuntimeMirrorErrors,
+  collectRootDistBundledRuntimeMirrors,
+  collectRuntimeDependencySpecs,
+  packageNameFromSpecifier,
+} from "./lib/bundled-plugin-root-runtime-mirrors.mjs";
+import { runInstalledWorkspaceBootstrapSmoke } from "./lib/workspace-bootstrap-smoke.mjs";
 import { parseReleaseVersion, resolveNpmCommandInvocation } from "./openclaw-npm-release-check.ts";
 
 type InstalledPackageJson = {
@@ -26,19 +36,27 @@ type InstalledPackageJson = {
 type InstalledBundledExtensionPackageJson = {
   dependencies?: Record<string, string>;
   optionalDependencies?: Record<string, string>;
-  openclaw?: {
-    releaseChecks?: {
-      rootDependencyMirrorAllowlist?: unknown;
-    };
-  };
 };
 
 type InstalledBundledExtensionManifestRecord = {
+  id: string;
   manifest: InstalledBundledExtensionPackageJson;
   path: string;
 };
 
 const MAX_BUNDLED_EXTENSION_MANIFEST_BYTES = 1024 * 1024;
+const LEGACY_CONTEXT_ENGINE_UNRESOLVED_RUNTIME_MARKER =
+  "Failed to load legacy context engine runtime.";
+const PUBLISHED_BUNDLED_RUNTIME_SIDECAR_PATHS = BUNDLED_RUNTIME_SIDECAR_PATHS.filter(
+  (relativePath) => listBundledPluginPackArtifacts().includes(relativePath),
+);
+const NODE_BUILTIN_MODULES = new Set(builtinModules.map((name) => name.replace(/^node:/u, "")));
+const MAX_INSTALLED_ROOT_PACKAGE_JSON_BYTES = 1024 * 1024;
+const MAX_INSTALLED_ROOT_DIST_JS_BYTES = 2 * 1024 * 1024;
+const MAX_INSTALLED_ROOT_DIST_JS_FILES = 5000;
+const ROOT_DIST_JAVASCRIPT_MODULE_FILE_RE = /\.(?:c|m)?js$/u;
+const require = createRequire(import.meta.url);
+const acorn = require("acorn") as typeof import("acorn");
 
 export type PublishedInstallScenario = {
   name: string;
@@ -86,12 +104,14 @@ export function collectInstalledPackageErrors(params: {
     );
   }
 
-  for (const relativePath of BUNDLED_RUNTIME_SIDECAR_PATHS) {
+  for (const relativePath of PUBLISHED_BUNDLED_RUNTIME_SIDECAR_PATHS) {
     if (!existsSync(join(params.packageRoot, relativePath))) {
       errors.push(`installed package is missing required bundled runtime sidecar: ${relativePath}`);
     }
   }
 
+  errors.push(...collectInstalledContextEngineRuntimeErrors(params.packageRoot));
+  errors.push(...collectInstalledRootDependencyManifestErrors(params.packageRoot));
   errors.push(...collectInstalledMirroredRootDependencyManifestErrors(params.packageRoot));
 
   return errors;
@@ -103,33 +123,254 @@ export function normalizeInstalledBinaryVersion(output: string): string {
   return versionMatch?.[0] ?? trimmed;
 }
 
+function listDistJavaScriptFiles(
+  packageRoot: string,
+  opts: { skipRelativePath?: (relativePath: string) => boolean } = {},
+): string[] {
+  const distDir = join(packageRoot, "dist");
+  if (!existsSync(distDir)) {
+    return [];
+  }
+
+  const pending = [distDir];
+  const files: string[] = [];
+  while (pending.length > 0) {
+    const currentDir = pending.pop();
+    if (!currentDir) {
+      continue;
+    }
+    for (const entry of readdirSync(currentDir, { withFileTypes: true })) {
+      const entryPath = join(currentDir, entry.name);
+      const relativePath = relative(distDir, entryPath).replaceAll("\\", "/");
+      if (opts.skipRelativePath?.(relativePath)) {
+        continue;
+      }
+      if (entry.isDirectory()) {
+        pending.push(entryPath);
+        continue;
+      }
+      if (entry.isFile() && ROOT_DIST_JAVASCRIPT_MODULE_FILE_RE.test(entry.name)) {
+        files.push(entryPath);
+      }
+    }
+  }
+
+  return files;
+}
+
+export function collectInstalledContextEngineRuntimeErrors(packageRoot: string): string[] {
+  const errors: string[] = [];
+  for (const filePath of listDistJavaScriptFiles(packageRoot)) {
+    const contents = readFileSync(filePath, "utf8");
+    if (contents.includes(LEGACY_CONTEXT_ENGINE_UNRESOLVED_RUNTIME_MARKER)) {
+      errors.push(
+        "installed package includes unresolved legacy context engine runtime loader; rebuild with a bundler-traceable LegacyContextEngine import.",
+      );
+      break;
+    }
+  }
+  return errors;
+}
+
+function listInstalledRootDistJavaScriptFiles(packageRoot: string): string[] {
+  return listDistJavaScriptFiles(packageRoot, {
+    skipRelativePath: (relativePath) => relativePath.startsWith("extensions/"),
+  });
+}
+
+type ParsedImportSpecifiersResult =
+  | { ok: true; specifiers: Set<string> }
+  | { ok: false; error: string };
+
+function extractLiteralSpecifier(node: unknown): string | null {
+  if (!node || typeof node !== "object") {
+    return null;
+  }
+  const candidate = node as { type?: string; value?: unknown };
+  if (candidate.type === "Literal" && typeof candidate.value === "string") {
+    return candidate.value;
+  }
+  return null;
+}
+
+function extractJavaScriptImportSpecifiers(source: string): ParsedImportSpecifiersResult {
+  const specifiers = new Set<string>();
+  let program: unknown;
+  try {
+    program = acorn.parse(source, {
+      allowHashBang: true,
+      ecmaVersion: "latest",
+      sourceType: "module",
+    });
+  } catch (error) {
+    return { ok: false, error: formatErrorMessage(error) };
+  }
+
+  const visited = new Set<unknown>();
+  const pending: unknown[] = [program];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (!current || typeof current !== "object" || visited.has(current)) {
+      continue;
+    }
+    visited.add(current);
+    const node = current as Record<string, unknown>;
+    const nodeType = typeof node.type === "string" ? node.type : null;
+
+    if (nodeType === "ImportDeclaration") {
+      const specifier = extractLiteralSpecifier(node.source);
+      if (specifier) {
+        specifiers.add(specifier);
+      }
+    } else if (nodeType === "ExportAllDeclaration" || nodeType === "ExportNamedDeclaration") {
+      const specifier = extractLiteralSpecifier(node.source);
+      if (specifier) {
+        specifiers.add(specifier);
+      }
+    } else if (nodeType === "ImportExpression") {
+      const specifier = extractLiteralSpecifier(node.source);
+      if (specifier) {
+        specifiers.add(specifier);
+      }
+    } else if (nodeType === "CallExpression") {
+      const callee = node.callee as { type?: string; name?: string } | undefined;
+      const args = Array.isArray(node.arguments) ? node.arguments : [];
+      if (callee?.type === "Identifier" && callee.name === "require" && args.length === 1) {
+        const specifier = extractLiteralSpecifier(args[0]);
+        if (specifier) {
+          specifiers.add(specifier);
+        }
+      }
+    }
+
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value)) {
+        pending.push(...value);
+      } else if (value && typeof value === "object") {
+        pending.push(value);
+      }
+    }
+  }
+
+  return { ok: true, specifiers };
+}
+
+export function collectInstalledRootDependencyManifestErrors(packageRoot: string): string[] {
+  const packageJsonPath = join(packageRoot, "package.json");
+  if (!existsSync(packageJsonPath)) {
+    return ["installed package is missing package.json."];
+  }
+  const packageJsonStat = lstatSync(packageJsonPath);
+  if (!packageJsonStat.isFile() || packageJsonStat.size > MAX_INSTALLED_ROOT_PACKAGE_JSON_BYTES) {
+    return [
+      `installed package.json is invalid or exceeds ${MAX_INSTALLED_ROOT_PACKAGE_JSON_BYTES} bytes.`,
+    ];
+  }
+  let rootPackageJson: InstalledPackageJson;
+  try {
+    rootPackageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as InstalledPackageJson;
+  } catch (error) {
+    return [`installed package.json could not be parsed: ${formatErrorMessage(error)}.`];
+  }
+  const declaredRuntimeDeps = new Set([
+    ...Object.keys(rootPackageJson.dependencies ?? {}),
+    ...Object.keys(rootPackageJson.optionalDependencies ?? {}),
+  ]);
+  const distFiles = listInstalledRootDistJavaScriptFiles(packageRoot);
+  if (distFiles.length > MAX_INSTALLED_ROOT_DIST_JS_FILES) {
+    return [
+      `installed package root dist contains ${distFiles.length} JavaScript files, exceeding the ${MAX_INSTALLED_ROOT_DIST_JS_FILES} file scan limit.`,
+    ];
+  }
+  const missingImporters = new Map<string, Set<string>>();
+  const bundledExtensionRuntimeDependencyOwners =
+    collectBundledExtensionRuntimeDependencyOwners(packageRoot);
+
+  for (const filePath of distFiles) {
+    const fileStat = lstatSync(filePath);
+    if (!fileStat.isFile() || fileStat.size > MAX_INSTALLED_ROOT_DIST_JS_BYTES) {
+      const relativePath = relative(join(packageRoot, "dist"), filePath).replaceAll("\\", "/");
+      return [
+        `installed package root dist file '${relativePath}' is invalid or exceeds ${MAX_INSTALLED_ROOT_DIST_JS_BYTES} bytes.`,
+      ];
+    }
+    const source = readFileSync(filePath, "utf8");
+    const relativePath = relative(join(packageRoot, "dist"), filePath).replaceAll("\\", "/");
+    const parsedSpecifiers = extractJavaScriptImportSpecifiers(source);
+    if (!parsedSpecifiers.ok) {
+      return [
+        `installed package root dist file '${relativePath}' could not be parsed for runtime dependency verification: ${parsedSpecifiers.error}.`,
+      ];
+    }
+    for (const specifier of parsedSpecifiers.specifiers) {
+      const dependencyName = packageNameFromSpecifier(specifier);
+      if (
+        !dependencyName ||
+        NODE_BUILTIN_MODULES.has(dependencyName) ||
+        declaredRuntimeDeps.has(dependencyName) ||
+        isBundledExtensionOwnedRuntimeImport({
+          dependencyName,
+          ownersByDependency: bundledExtensionRuntimeDependencyOwners,
+          source,
+        })
+      ) {
+        continue;
+      }
+      const importers = missingImporters.get(dependencyName) ?? new Set<string>();
+      importers.add(relativePath);
+      missingImporters.set(dependencyName, importers);
+    }
+  }
+
+  return [...missingImporters.entries()]
+    .map(([dependencyName, importers]) => {
+      const importerList = [...importers].toSorted((left, right) => left.localeCompare(right));
+      return `installed package root is missing declared runtime dependency '${dependencyName}' for dist importers: ${importerList.join(", ")}. Add it to package.json dependencies/optionalDependencies.`;
+    })
+    .toSorted((left, right) => left.localeCompare(right));
+}
+
+function collectBundledExtensionRuntimeDependencyOwners(
+  packageRoot: string,
+): Map<string, Set<string>> {
+  const ownersByDependency = new Map<string, Set<string>>();
+  const { manifests } = readBundledExtensionPackageJsons(packageRoot);
+  for (const { id, manifest } of manifests) {
+    for (const dependencyName of collectRuntimeDependencySpecs(manifest).keys()) {
+      const owners = ownersByDependency.get(dependencyName) ?? new Set<string>();
+      owners.add(id);
+      ownersByDependency.set(dependencyName, owners);
+    }
+  }
+  return ownersByDependency;
+}
+
+function isBundledExtensionOwnedRuntimeImport(params: {
+  dependencyName: string;
+  ownersByDependency: Map<string, Set<string>>;
+  source: string;
+}): boolean {
+  const owners = params.ownersByDependency.get(params.dependencyName);
+  if (!owners) {
+    return false;
+  }
+  return [...owners].some((pluginId) =>
+    params.source.includes(`//#region extensions/${pluginId}/`),
+  );
+}
+
 export function resolveInstalledBinaryPath(prefixDir: string, platform = process.platform): string {
   return platform === "win32"
     ? join(prefixDir, "openclaw.cmd")
     : join(prefixDir, "bin", "openclaw");
 }
 
-function collectRuntimeDependencySpecs(packageJson: InstalledPackageJson): Map<string, string> {
-  return new Map([
-    ...Object.entries(packageJson.dependencies ?? {}),
-    ...Object.entries(packageJson.optionalDependencies ?? {}),
-  ]);
-}
-
-function collectExpectedBundledExtensionPackageIds(
-  sourceExtensionsDir = join(process.cwd(), "extensions"),
-): ReadonlySet<string> | null {
-  if (!existsSync(sourceExtensionsDir)) {
-    return null;
-  }
-
+function collectExpectedBundledExtensionPackageIds(): ReadonlySet<string> {
   const ids = new Set<string>();
-  for (const entry of readdirSync(sourceExtensionsDir, { withFileTypes: true })) {
-    if (!entry.isDirectory()) {
-      continue;
-    }
-    if (existsSync(join(sourceExtensionsDir, entry.name, "package.json"))) {
-      ids.add(entry.name);
+  for (const relativePath of listBundledPluginPackArtifacts()) {
+    const match = /^dist\/extensions\/([^/]+)\/package\.json$/u.exec(relativePath);
+    if (match) {
+      ids.add(match[1]);
     }
   }
   return ids;
@@ -156,7 +397,7 @@ function readBundledExtensionPackageJsons(packageRoot: string): {
     const extensionDirPath = join(extensionsDir, entry.name);
     const packageJsonPath = join(extensionsDir, entry.name, "package.json");
     if (!existsSync(packageJsonPath)) {
-      if (expectedPackageIds === null || expectedPackageIds.has(entry.name)) {
+      if (expectedPackageIds.has(entry.name)) {
         errors.push(`installed bundled extension manifest missing: ${packageJsonPath}.`);
       }
       continue;
@@ -183,6 +424,7 @@ function readBundledExtensionPackageJsons(packageRoot: string): {
       }
 
       manifests.push({
+        id: entry.name,
         manifest: JSON.parse(
           readFileSync(realPackageJsonPath, "utf8"),
         ) as InstalledBundledExtensionPackageJson,
@@ -207,53 +449,39 @@ export function collectInstalledMirroredRootDependencyManifestErrors(
   }
 
   const rootPackageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as InstalledPackageJson;
-  const rootRuntimeDeps = collectRuntimeDependencySpecs(rootPackageJson);
   const { manifests, errors } = readBundledExtensionPackageJsons(packageRoot);
+  const bundledRuntimeDependencySpecs = new Map<
+    string,
+    { conflicts: Array<{ pluginId: string; spec: string }>; pluginIds: string[]; spec: string }
+  >();
 
-  for (const { manifest: extensionPackageJson } of manifests) {
-    const allowlist = extensionPackageJson.openclaw?.releaseChecks?.rootDependencyMirrorAllowlist;
-    if (allowlist === undefined) {
-      continue;
-    }
-    if (!Array.isArray(allowlist)) {
-      errors.push(
-        "installed bundled extension manifest invalid: openclaw.releaseChecks.rootDependencyMirrorAllowlist must be an array.",
-      );
-      continue;
-    }
-
+  for (const { id, manifest: extensionPackageJson } of manifests) {
     const extensionRuntimeDeps = collectRuntimeDependencySpecs(extensionPackageJson);
-    for (const entry of allowlist) {
-      if (typeof entry !== "string" || entry.trim().length === 0) {
-        errors.push(
-          "installed bundled extension manifest invalid: openclaw.releaseChecks.rootDependencyMirrorAllowlist entries must be non-empty strings.",
-        );
+    for (const [dependencyName, spec] of extensionRuntimeDeps) {
+      const existing = bundledRuntimeDependencySpecs.get(dependencyName);
+      if (existing) {
+        if (existing.spec !== spec) {
+          existing.conflicts.push({ pluginId: id, spec });
+        } else if (!existing.pluginIds.includes(id)) {
+          existing.pluginIds.push(id);
+        }
         continue;
       }
-
-      const extensionSpec = extensionRuntimeDeps.get(entry);
-      if (!extensionSpec) {
-        errors.push(
-          `installed bundled extension manifest invalid: mirrored dependency '${entry}' must be declared in the extension runtime dependencies.`,
-        );
-        continue;
-      }
-
-      const rootSpec = rootRuntimeDeps.get(entry);
-      if (!rootSpec) {
-        errors.push(
-          `installed package is missing mirrored root runtime dependency '${entry}' required by a bundled extension.`,
-        );
-        continue;
-      }
-
-      if (rootSpec !== extensionSpec) {
-        errors.push(
-          `installed package mirrored dependency '${entry}' version mismatch: root '${rootSpec}', extension '${extensionSpec}'.`,
-        );
-      }
+      bundledRuntimeDependencySpecs.set(dependencyName, { conflicts: [], pluginIds: [id], spec });
     }
   }
+
+  const requiredRootMirrors = collectRootDistBundledRuntimeMirrors({
+    bundledRuntimeDependencySpecs,
+    distDir: join(packageRoot, "dist"),
+  });
+  errors.push(
+    ...collectBundledPluginRootRuntimeMirrorErrors({
+      bundledRuntimeDependencySpecs,
+      requiredRootMirrors,
+      rootPackageJson,
+    }),
+  );
 
   return errors;
 }
@@ -276,8 +504,12 @@ function resolveGlobalRoot(prefixDir: string, cwd: string): string {
   return npmExec(["root", "-g", "--prefix", prefixDir], cwd);
 }
 
+export function buildPublishedInstallCommandArgs(prefixDir: string, spec: string): string[] {
+  return ["install", "-g", "--prefix", prefixDir, spec, "--no-fund", "--no-audit"];
+}
+
 function installSpec(prefixDir: string, spec: string, cwd: string): void {
-  npmExec(["install", "-g", "--prefix", prefixDir, spec, "--no-fund", "--no-audit"], cwd);
+  npmExec(buildPublishedInstallCommandArgs(prefixDir, spec), cwd);
 }
 
 function readInstalledBinaryVersion(prefixDir: string, cwd: string): string {
@@ -314,6 +546,10 @@ function verifyScenario(version: string, scenario: PublishedInstallScenario): vo
       errors.push(
         `installed openclaw binary version mismatch: expected ${scenario.expectedVersion}, found ${installedBinaryVersion || "<missing>"}.`,
       );
+    }
+
+    if (errors.length === 0) {
+      runInstalledWorkspaceBootstrapSmoke({ packageRoot });
     }
 
     if (errors.length > 0) {
