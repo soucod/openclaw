@@ -1,13 +1,18 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { loadConfig, type OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-types";
 import { encodePngRgba, fillPixel } from "openclaw/plugin-sdk/media-runtime";
-import { describe, expect, it } from "vitest";
 import {
   registerProviderPlugin,
   requireRegisteredProvider,
-} from "../../test/helpers/plugins/provider-registration.js";
+} from "openclaw/plugin-sdk/plugin-test-runtime";
+import {
+  expectOpenClawLiveTranscriptMarker,
+  runRealtimeSttLiveTest,
+} from "openclaw/plugin-sdk/provider-test-contracts";
+import { getRuntimeConfig } from "openclaw/plugin-sdk/runtime-config-snapshot";
+import { describe, expect, it } from "vitest";
 import plugin from "./index.js";
 import { XAI_DEFAULT_STT_MODEL } from "./stt.js";
 
@@ -18,7 +23,7 @@ const describeLive = liveEnabled ? describe : describe.skip;
 const EMPTY_AUTH_STORE = { version: 1, profiles: {} } as const;
 
 function createLiveConfig(): OpenClawConfig {
-  const cfg = loadConfig();
+  const cfg = getRuntimeConfig();
   return {
     ...cfg,
     models: {
@@ -65,25 +70,6 @@ const registerXaiPlugin = () =>
     id: "xai",
     name: "xAI Provider",
   });
-
-async function waitForLiveExpectation(expectation: () => void, timeoutMs = 30_000) {
-  const started = Date.now();
-  let lastError: unknown;
-  while (Date.now() - started < timeoutMs) {
-    try {
-      expectation();
-      return;
-    } catch (error) {
-      lastError = error;
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-  }
-  throw lastError;
-}
-
-function normalizeTranscriptForMatch(value: string): string {
-  return value.toLowerCase().replace(/[^a-z0-9]+/g, "");
-}
 
 describeLive("xai plugin live", () => {
   it("synthesizes TTS through the registered speech provider", async () => {
@@ -159,9 +145,8 @@ describeLive("xai plugin live", () => {
     });
 
     const normalized = transcript?.text.toLowerCase() ?? "";
-    const compact = normalizeTranscriptForMatch(normalized);
     expect(transcript?.model).toBe(XAI_DEFAULT_STT_MODEL);
-    expect(compact).toContain("openclaw");
+    expectOpenClawLiveTranscriptMarker(normalized);
     expect(normalized).toContain("speech");
     expect(normalized).toContain("text");
     expect(normalized).toContain("integration");
@@ -216,10 +201,9 @@ describeLive("xai plugin live", () => {
     expect(telephony.outputFormat).toBe("pcm");
     expect(telephony.sampleRate).toBe(24_000);
 
-    const transcripts: string[] = [];
-    const partials: string[] = [];
-    const errors: Error[] = [];
-    const session = realtimeProvider.createSession({
+    const chunkSize = Math.max(1, Math.floor(telephony.sampleRate * 2 * 0.1));
+    const { transcripts, partials } = await runRealtimeSttLiveTest({
+      provider: realtimeProvider,
       providerConfig: {
         apiKey: XAI_API_KEY,
         baseUrl: "https://api.x.ai/v1",
@@ -229,29 +213,14 @@ describeLive("xai plugin live", () => {
         endpointingMs: 500,
         language: "en",
       },
-      onPartial: (partial) => partials.push(partial),
-      onTranscript: (transcript) => transcripts.push(transcript),
-      onError: (error) => errors.push(error),
+      audio: telephony.audioBuffer,
+      chunkSize,
+      delayMs: 20,
+      closeBeforeWait: true,
     });
 
-    await session.connect();
-    const audio = telephony.audioBuffer;
-    const chunkSize = Math.max(1, Math.floor(telephony.sampleRate * 2 * 0.1));
-    for (let offset = 0; offset < audio.byteLength; offset += chunkSize) {
-      session.sendAudio(audio.subarray(offset, offset + chunkSize));
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    }
-    session.close();
-
-    await waitForLiveExpectation(() => {
-      if (errors[0]) {
-        throw errors[0];
-      }
-      expect(normalizeTranscriptForMatch(transcripts.join(" "))).toContain("openclaw");
-    }, 60_000);
     const normalized = transcripts.join(" ").toLowerCase();
-    const compact = normalizeTranscriptForMatch(normalized);
-    expect(compact).toContain("openclaw");
+    expectOpenClawLiveTranscriptMarker(normalized);
     expect(normalized).toContain("transcription");
     expect(partials.length + transcripts.length).toBeGreaterThan(0);
   }, 180_000);

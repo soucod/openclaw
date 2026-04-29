@@ -28,14 +28,14 @@ import { BUNDLED_PLUGIN_PATH_PREFIX, BUNDLED_PLUGIN_ROOT_DIR } from "./bundled-p
 import { listAvailableExtensionIds } from "./changed-extensions.mjs";
 
 const repoRoot = path.resolve(import.meta.dirname, "..", "..");
-export const DEFAULT_EXTENSION_TEST_SHARD_COUNT = 6;
+export const DEFAULT_EXTENSION_TEST_SHARD_COUNT = 8;
 const EXTENSION_TEST_COST_MULTIPLIERS = {
   // CI shard planning uses measured wall time rather than raw file count.
   // These ratios come from Blacksmith extension batch timings; import-heavy
   // suites vary widely, and file count alone leaves long tail shards.
   "test/vitest/vitest.extension-acpx.config.ts": 0.75,
   "test/vitest/vitest.extension-bluebubbles.config.ts": 0.8,
-  "test/vitest/vitest.extension-browser.config.ts": 0.3,
+  "test/vitest/vitest.extension-browser.config.ts": 0.5,
   "test/vitest/vitest.extension-diffs.config.ts": 0.6,
   "test/vitest/vitest.extension-discord.config.ts": 0.62,
   "test/vitest/vitest.extension-feishu.config.ts": 0.18,

@@ -4,7 +4,7 @@ import {
   shouldAckReaction as shouldAckReactionGate,
 } from "openclaw/plugin-sdk/channel-feedback";
 import { logInboundDrop } from "openclaw/plugin-sdk/channel-inbound";
-import type { TelegramDirectConfig, TelegramGroupConfig } from "openclaw/plugin-sdk/config-runtime";
+import type { TelegramDirectConfig, TelegramGroupConfig } from "openclaw/plugin-sdk/config-types";
 import { deriveLastRoutePolicy } from "openclaw/plugin-sdk/routing";
 import { normalizeAccountId, resolveThreadSessionKeys } from "openclaw/plugin-sdk/routing";
 import { logVerbose } from "openclaw/plugin-sdk/runtime-env";
@@ -222,7 +222,7 @@ export const buildTelegramMessageContext = async ({
   // Fresh config for bindings lookup; other routing inputs are payload-derived.
   const freshCfg =
     loadFreshConfig?.() ??
-    (runtime?.loadConfig ?? (await loadTelegramMessageContextRuntime()).loadConfig)();
+    (runtime?.getRuntimeConfig ?? (await loadTelegramMessageContextRuntime()).getRuntimeConfig)();
   let { route, configuredBinding, configuredBindingSessionKey } = resolveTelegramConversationRoute({
     cfg: freshCfg,
     accountId: account.accountId,
@@ -262,7 +262,7 @@ export const buildTelegramMessageContext = async ({
   });
   // Group sender checks are explicit and must not inherit DM pairing-store entries.
   const effectiveGroupAllow = normalizeAllowFrom(groupAllowOverride ?? groupAllowFrom);
-  const hasGroupAllowOverride = typeof groupAllowOverride !== "undefined";
+  const hasGroupAllowOverride = groupAllowOverride !== undefined;
   const senderUsername = msg.from?.username ?? "";
   const baseAccess = evaluateTelegramGroupBaseAccess({
     isGroup,
@@ -578,6 +578,9 @@ export const buildTelegramMessageContext = async ({
     topicConfig,
     stickerCacheHit: bodyResult.stickerCacheHit,
     effectiveWasMentioned: bodyResult.effectiveWasMentioned,
+    ...(bodyResult.audioTranscribedMediaIndex !== undefined
+      ? { audioTranscribedMediaIndex: bodyResult.audioTranscribedMediaIndex }
+      : {}),
     locationData: bodyResult.locationData,
     options,
     dmAllowFrom,

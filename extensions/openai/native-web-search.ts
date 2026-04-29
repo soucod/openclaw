@@ -1,6 +1,6 @@
 import type { StreamFn } from "@mariozechner/pi-agent-core";
 import { streamSimple } from "@mariozechner/pi-ai";
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-types";
 import { normalizeProviderId } from "openclaw/plugin-sdk/provider-model-shared";
 import { streamWithPayloadPatch } from "openclaw/plugin-sdk/provider-stream-shared";
 import { isOpenAIApiBaseUrl } from "./base-url.js";
@@ -57,6 +57,14 @@ function isManagedWebSearchTool(tool: unknown): boolean {
   return isRecord(tool) && tool.type === "function" && tool.name === OPENAI_WEB_SEARCH_TOOL.type;
 }
 
+function raiseMinimalReasoningForOpenAINativeWebSearch(payload: Record<string, unknown>): void {
+  const reasoning = payload.reasoning;
+  if (!isRecord(reasoning) || reasoning.effort !== "minimal") {
+    return;
+  }
+  reasoning.effort = "low";
+}
+
 export function patchOpenAINativeWebSearchPayload(
   payload: unknown,
 ): OpenAINativeWebSearchPatchResult {
@@ -70,10 +78,12 @@ export function patchOpenAINativeWebSearchPayload(
     if (filteredTools.length !== existingTools.length) {
       payload.tools = filteredTools;
     }
+    raiseMinimalReasoningForOpenAINativeWebSearch(payload);
     return "native_tool_already_present";
   }
 
   payload.tools = [...filteredTools, OPENAI_WEB_SEARCH_TOOL];
+  raiseMinimalReasoningForOpenAINativeWebSearch(payload);
   return "injected";
 }
 

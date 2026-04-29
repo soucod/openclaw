@@ -522,7 +522,7 @@ describe("diagnostic support export", () => {
     >;
 
     expect(Object.getPrototypeOf(snapshot)).toBe(null);
-    expect(snapshot.__proto__).toBeUndefined();
+    expect(Object.hasOwn(snapshot, "__proto__")).toBe(false);
     expect(snapshot.constructor).toBeUndefined();
     expect(snapshot.prototype).toBeUndefined();
     expect(snapshot.field0000).toBe(0);
@@ -556,7 +556,7 @@ describe("diagnostic support export", () => {
     const cases = [
       [
         "connect wss://support-user:support-password@gateway.example/ws?token=short-token&ok=1",
-        "connect wss://<redacted>:<redacted>@gateway.example/ws?token=<redacted>",
+        "connect wss://<redacted>:<redacted>@gateway.example/ws?token=<redacted>&ok=1",
       ],
       [
         "connect https://gateway.example/ws?access-token=short-token",

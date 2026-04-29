@@ -13,6 +13,7 @@ import {
   DmPolicySchema,
   GroupPolicySchema,
   MarkdownConfigSchema,
+  ReplyToModeSchema,
 } from "./zod-schema.core.js";
 
 const ToolPolicyBySenderSchema = z.record(z.string(), ToolPolicySchema).optional();
@@ -81,6 +82,8 @@ function buildWhatsAppCommonShape(params: { useDefaults: boolean }) {
     debounceMs: params.useDefaults
       ? z.number().int().nonnegative().optional().default(0)
       : z.number().int().nonnegative().optional(),
+    replyToMode: ReplyToModeSchema.optional(),
+    exposeErrorText: z.boolean().optional(),
     heartbeat: ChannelHeartbeatVisibilitySchema,
     healthMonitor: ChannelHealthMonitorSchema,
   };
