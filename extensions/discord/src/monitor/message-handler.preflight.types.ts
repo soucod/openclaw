@@ -11,7 +11,7 @@ import type { DiscordSenderIdentity } from "./sender-identity.js";
 export type { DiscordSenderIdentity } from "./sender-identity.js";
 import type { DiscordThreadChannel } from "./threading.js";
 
-export type LoadedConfig = OpenClawConfig;
+type LoadedConfig = OpenClawConfig;
 export type RuntimeEnv = import("openclaw/plugin-sdk/runtime-env").RuntimeEnv;
 
 export type DiscordMessageEvent = import("./listeners.js").DiscordMessageEvent;
@@ -42,6 +42,7 @@ export type DiscordMessagePreflightContext = DiscordMessagePreflightSharedFields
   messageChannelId: string;
   author: User;
   sender: DiscordSenderIdentity;
+  canonicalMessageId?: string;
   memberRoleIds: string[];
 
   channelInfo: DiscordChannelInfo | null;
@@ -97,6 +98,7 @@ export type DiscordMessagePreflightParams = DiscordMessagePreflightSharedFields 
   dmEnabled: boolean;
   groupDmEnabled: boolean;
   groupDmChannels?: string[];
+  dmPolicy: "open" | "pairing" | "allowlist" | "disabled";
   allowFrom?: string[];
   guildEntries?: Record<string, DiscordGuildEntryResolved>;
   ackReactionScope: DiscordMessagePreflightContext["ackReactionScope"];

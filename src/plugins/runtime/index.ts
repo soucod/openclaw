@@ -56,6 +56,7 @@ function createRuntimeTts(): PluginRuntime["tts"] {
   const bindTtsRuntime = createLazyRuntimeMethodBinder(loadTtsRuntime);
   return {
     textToSpeech: bindTtsRuntime((runtime) => runtime.textToSpeech),
+    textToSpeechStream: bindTtsRuntime((runtime) => runtime.textToSpeechStream),
     textToSpeechTelephony: bindTtsRuntime((runtime) => runtime.textToSpeechTelephony),
     listVoices: bindTtsRuntime((runtime) => runtime.listSpeechVoices),
   };
@@ -115,6 +116,7 @@ function createRuntimeModelAuth(): PluginRuntime["modelAuth"] {
       getApiKeyForModel({
         model: params.model,
         cfg: params.cfg,
+        workspaceDir: params.workspaceDir,
       }),
     getRuntimeAuthForModel: (params) =>
       getRuntimeAuthForModel({
@@ -126,6 +128,7 @@ function createRuntimeModelAuth(): PluginRuntime["modelAuth"] {
       resolveApiKeyForProvider({
         provider: params.provider,
         cfg: params.cfg,
+        workspaceDir: params.workspaceDir,
       }),
   };
 }
