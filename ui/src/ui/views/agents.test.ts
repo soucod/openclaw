@@ -1,5 +1,7 @@
 import { render } from "lit";
 import { describe, expect, it, vi } from "vitest";
+import { i18n } from "../../i18n/index.ts";
+import { createStorageMock } from "../../test-helpers/storage.ts";
 import { renderAgentFiles } from "./agents-panels-status-files.ts";
 import { renderAgents, type AgentsProps } from "./agents.ts";
 
@@ -306,6 +308,40 @@ describe("renderAgents", () => {
 
     expect(skillsTab?.textContent?.trim()).toContain("1");
   });
+
+  it("keeps the Cron Jobs tab label while localizing channel refresh never state", async () => {
+    vi.stubGlobal("localStorage", createStorageMock());
+    await i18n.setLocale("zh-CN");
+    const container = document.createElement("div");
+
+    try {
+      render(
+        renderAgents(
+          createProps({
+            activePanel: "channels",
+            channels: {
+              snapshot: null,
+              loading: false,
+              error: null,
+              lastSuccess: null,
+            },
+          }),
+        ),
+        container,
+      );
+      await Promise.resolve();
+
+      const tabLabels = Array.from(container.querySelectorAll<HTMLButtonElement>(".agent-tab")).map(
+        (button) => button.textContent?.trim(),
+      );
+
+      expect(tabLabels).toContain("Cron Jobs");
+      expect(container.textContent).toContain("上次刷新：从未");
+    } finally {
+      await i18n.setLocale("en");
+      vi.unstubAllGlobals();
+    }
+  });
 });
 
 describe("renderAgentFiles", () => {
@@ -347,7 +383,9 @@ describe("renderAgentFiles", () => {
       container,
     );
 
-    expect(container.querySelector(".md-preview-dialog__reader.sidebar-markdown")).not.toBeNull();
+    expect(container.querySelectorAll(".md-preview-dialog__reader.sidebar-markdown")).toHaveLength(
+      1,
+    );
     expect(container.querySelector(".md-preview-dialog__path")?.textContent?.trim()).toBe(
       "USER.md",
     );
@@ -450,14 +488,17 @@ describe("renderAgentFiles", () => {
     const panel = container.querySelector<HTMLElement>(".md-preview-dialog__panel");
     const expandButton = container.querySelector<HTMLButtonElement>(".md-preview-expand-btn");
 
-    expandButton?.click();
+    expect(dialog).toBeInstanceOf(HTMLDialogElement);
+    expect(panel).toBeInstanceOf(HTMLElement);
+    expect(expandButton).toBeInstanceOf(HTMLButtonElement);
+    expandButton!.click();
 
     expect(panel?.classList.contains("fullscreen")).toBe(true);
     expect(expandButton?.classList.contains("is-fullscreen")).toBe(true);
     expect(expandButton?.getAttribute("aria-pressed")).toBe("true");
     expect(expandButton?.getAttribute("aria-label")).toBe("Collapse preview");
 
-    dialog?.dispatchEvent(new Event("close"));
+    dialog!.dispatchEvent(new Event("close"));
 
     expect(panel?.classList.contains("fullscreen")).toBe(false);
     expect(expandButton?.classList.contains("is-fullscreen")).toBe(false);

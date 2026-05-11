@@ -5,13 +5,13 @@ import type {
   GroupMetadata,
   WAMessage,
   WASocket,
-} from "@whiskeysockets/baileys";
+} from "baileys";
 import { recordChannelActivity } from "openclaw/plugin-sdk/channel-activity-runtime";
 import { formatLocationText } from "openclaw/plugin-sdk/channel-inbound";
 import { createInboundDebouncer } from "openclaw/plugin-sdk/channel-inbound-debounce";
+import { getChildLogger } from "openclaw/plugin-sdk/logging-core";
 import { defaultRuntime } from "openclaw/plugin-sdk/runtime-env";
 import { createSubsystemLogger } from "openclaw/plugin-sdk/runtime-env";
-import { getChildLogger } from "openclaw/plugin-sdk/text-runtime";
 import { readWebSelfIdentityForDecision, WhatsAppAuthUnstableError } from "../auth-store.js";
 import { getPrimaryIdentityId, resolveComparableIdentity } from "../identity.js";
 import { cacheInboundMessageMeta } from "../quoted-message.js";
@@ -39,9 +39,16 @@ import {
   hasInboundUserContent,
 } from "./extract.js";
 import { attachEmitterListener, closeInboundMonitorSocket } from "./lifecycle.js";
-import { downloadInboundMedia } from "./media.js";
+import { downloadInboundMedia, downloadQuotedInboundMedia } from "./media.js";
+import {
+  addWhatsAppOutboundMentionsToContent,
+  mayContainWhatsAppOutboundMention,
+  resolveWhatsAppOutboundMentions,
+  type WhatsAppOutboundMentionParticipant,
+} from "./outbound-mentions.js";
 import { DisconnectReason, isJidGroup, saveMediaBuffer } from "./runtime-api.js";
 import { createWebSendApi } from "./send-api.js";
+import { normalizeWhatsAppSendResult } from "./send-result.js";
 import type { WebInboundMessage, WebListenerCloseReason } from "./types.js";
 
 const LOGGED_OUT_STATUS = DisconnectReason?.loggedOut ?? 401;
@@ -49,13 +56,14 @@ const RECONNECT_IN_PROGRESS_ERROR = "no active socket - reconnection in progress
 const GROUP_META_TTL_MS = 5 * 60 * 1000; // 5 minutes
 export const WHATSAPP_GROUP_METADATA_CACHE_MAX_ENTRIES = 500;
 
-export type WhatsAppGroupMetadataCacheEntry = {
+type WhatsAppGroupMetadataCacheEntry = {
   subject?: string;
   expires: number;
 };
 export type WhatsAppGroupMetadataCache = Map<string, WhatsAppGroupMetadataCacheEntry>;
 type LocalGroupMetadataCacheEntry = WhatsAppGroupMetadataCacheEntry & {
   participants?: string[];
+  mentionParticipants?: WhatsAppOutboundMentionParticipant[];
 };
 
 function rememberGroupMetadataCacheEntry<T extends WhatsAppGroupMetadataCacheEntry>(
@@ -105,6 +113,14 @@ function isGroupJid(jid: string): boolean {
   return (typeof isJidGroup === "function" ? isJidGroup(jid) : jid.endsWith("@g.us")) === true;
 }
 
+function recordAcceptedInboundActivity(accountId: string): void {
+  recordChannelActivity({
+    channel: "whatsapp",
+    accountId,
+    direction: "inbound",
+  });
+}
+
 function isRetryableSendDisconnectError(err: unknown): boolean {
   return /closed|reset|timed\s*out|disconnect|no active socket/i.test(formatError(err));
 }
@@ -117,8 +133,9 @@ function isNonEmptyString(value: string | undefined): value is string {
   return Boolean(value);
 }
 
-export type MonitorWebInboxOptions = {
+type MonitorWebInboxOptions = {
   cfg: OpenClawConfig;
+  loadConfig?: () => OpenClawConfig;
   verbose: boolean;
   accountId: string;
   authDir: string;
@@ -354,18 +371,26 @@ export async function attachWebInboxToSocket(
   };
 
   const summarizeGroupMeta = async (meta: GroupMetadata) => {
-    const participants =
-      (
-        await Promise.all(
-          meta.participants?.map(async (p) => {
-            const mapped = await resolveInboundJid(p.id);
-            return mapped ?? p.id;
-          }) ?? [],
-        )
-      ).filter(Boolean) ?? [];
+    const participantEntries = await Promise.all(
+      meta.participants?.map(async (p) => {
+        const mapped = await resolveInboundJid(p.id);
+        return {
+          display: mapped ?? p.id,
+          mention: {
+            id: p.id,
+            lid: p.lid,
+            phoneNumber: p.phoneNumber,
+            e164: mapped,
+          } satisfies WhatsAppOutboundMentionParticipant,
+        };
+      }) ?? [],
+    );
+    const participants = participantEntries.map((entry) => entry.display).filter(Boolean);
+    const mentionParticipants = participantEntries.map((entry) => entry.mention);
     return {
       subject: meta.subject,
       participants,
+      mentionParticipants,
       expires: Date.now() + GROUP_META_TTL_MS,
     };
   };
@@ -383,7 +408,7 @@ export async function attachWebInboxToSocket(
       return cached;
     }
     try {
-      const meta = await sock.groupMetadata(jid);
+      const meta = await (getCurrentSock() ?? sock).groupMetadata(jid);
       const entry = await summarizeGroupMeta(meta);
       rememberGroupMetadataCacheEntry(groupMetadataCache, jid, {
         subject: entry.subject,
@@ -407,6 +432,43 @@ export async function attachWebInboxToSocket(
       );
       return { expires: Date.now() + GROUP_META_TTL_MS };
     }
+  };
+
+  const resolveOutboundMentionsForGroup = async (
+    jid: string,
+    text: string,
+  ): Promise<{ text: string; mentionedJids: string[] }> => {
+    if (!isGroupJid(jid) || !mayContainWhatsAppOutboundMention(text)) {
+      return { text, mentionedJids: [] };
+    }
+    const meta = await getGroupMeta(jid);
+    return resolveWhatsAppOutboundMentions({
+      chatJid: jid,
+      text,
+      participants: meta.mentionParticipants,
+    });
+  };
+
+  const applyOutboundMentionsToContent = async (
+    jid: string,
+    content: AnyMessageContent,
+  ): Promise<AnyMessageContent> => {
+    if ("text" in content && typeof content.text === "string") {
+      const resolved = await resolveOutboundMentionsForGroup(jid, content.text);
+      return addWhatsAppOutboundMentionsToContent(
+        { ...content, text: resolved.text } as AnyMessageContent,
+        resolved.mentionedJids,
+      );
+    }
+    const caption = (content as { caption?: unknown }).caption;
+    if (typeof caption === "string") {
+      const resolved = await resolveOutboundMentionsForGroup(jid, caption);
+      return addWhatsAppOutboundMentionsToContent(
+        { ...content, caption: resolved.text } as AnyMessageContent,
+        resolved.mentionedJids,
+      );
+    }
+    return content;
   };
 
   type NormalizedInboundMessage = {
@@ -487,8 +549,9 @@ export async function attachWebInboxToSocket(
       ? Number(msg.messageTimestamp) * 1000
       : undefined;
 
+    const accessCfg = options.loadConfig?.() ?? options.cfg;
     const access = await checkInboundAccessControl({
-      cfg: options.cfg,
+      cfg: accessCfg,
       accountId: options.accountId,
       from,
       selfE164: self.e164 ?? null,
@@ -570,24 +633,33 @@ export async function attachWebInboxToSocket(
     let mediaPath: string | undefined;
     let mediaType: string | undefined;
     let mediaFileName: string | undefined;
+    const saveInboundMedia = async (
+      inboundMedia: Awaited<ReturnType<typeof downloadInboundMedia>>,
+    ) => {
+      if (!inboundMedia) {
+        return;
+      }
+      const maxMb =
+        typeof options.mediaMaxMb === "number" && options.mediaMaxMb > 0 ? options.mediaMaxMb : 50;
+      const maxBytes = maxMb * 1024 * 1024;
+      const saved = await saveMediaBuffer(
+        inboundMedia.buffer,
+        inboundMedia.mimetype,
+        "inbound",
+        maxBytes,
+        inboundMedia.fileName,
+      );
+      mediaPath = saved.path;
+      mediaType = inboundMedia.mimetype;
+      mediaFileName = inboundMedia.fileName;
+    };
     try {
       const inboundMedia = await downloadInboundMedia(msg as proto.IWebMessageInfo, sock);
-      if (inboundMedia) {
-        const maxMb =
-          typeof options.mediaMaxMb === "number" && options.mediaMaxMb > 0
-            ? options.mediaMaxMb
-            : 50;
-        const maxBytes = maxMb * 1024 * 1024;
-        const saved = await saveMediaBuffer(
-          inboundMedia.buffer,
-          inboundMedia.mimetype,
-          "inbound",
-          maxBytes,
-          inboundMedia.fileName,
+      await saveInboundMedia(inboundMedia);
+      if (!mediaPath && replyContext) {
+        await saveInboundMedia(
+          await downloadQuotedInboundMedia(msg as proto.IWebMessageInfo, sock),
         );
-        mediaPath = saved.path;
-        mediaType = inboundMedia.mimetype;
-        mediaFileName = inboundMedia.fileName;
       }
     } catch (err) {
       logWhatsAppVerbose(options.verbose, `Inbound media download failed: ${String(err)}`);
@@ -622,13 +694,24 @@ export async function attachWebInboxToSocket(
       }
     };
     const reply = async (text: string, options?: MiscMessageGenerationOptions) => {
-      await sendTrackedMessage(chatJid, { text }, options);
+      const resolved = await resolveOutboundMentionsForGroup(chatJid, text);
+      const result = await sendTrackedMessage(
+        chatJid,
+        addWhatsAppOutboundMentionsToContent({ text: resolved.text }, resolved.mentionedJids),
+        options,
+      );
+      return normalizeWhatsAppSendResult(result, "text");
     };
     const sendMedia = async (
       payload: AnyMessageContent,
       options?: MiscMessageGenerationOptions,
     ) => {
-      await sendTrackedMessage(chatJid, payload, options);
+      const result = await sendTrackedMessage(
+        chatJid,
+        await applyOutboundMentionsToContent(chatJid, payload),
+        options,
+      );
+      return normalizeWhatsAppSendResult(result, "media");
     };
     const timestamp = inbound.messageTimestampMs;
     const mentionedJids = extractMentionedJids(msg.message as proto.IMessage | undefined);
@@ -726,11 +809,6 @@ export async function attachWebInboxToSocket(
       return;
     }
     for (const msg of upsert.messages ?? []) {
-      recordChannelActivity({
-        channel: "whatsapp",
-        accountId: options.accountId,
-        direction: "inbound",
-      });
       const inbound = await normalizeInboundMessage(msg);
       if (!inbound) {
         continue;
@@ -759,12 +837,11 @@ export async function attachWebInboxToSocket(
         continue;
       }
 
+      recordAcceptedInboundActivity(options.accountId);
       await enqueueInboundMessage(msg, inbound, enriched);
     }
   };
-  const handleConnectionUpdate = (
-    update: Partial<import("@whiskeysockets/baileys").ConnectionState>,
-  ) => {
+  const handleConnectionUpdate = (update: Partial<import("baileys").ConnectionState>) => {
     try {
       if (update.connection === "close") {
         if (options.socketRef?.current === sock) {
@@ -844,6 +921,8 @@ export async function attachWebInboxToSocket(
       },
     },
     defaultAccountId: options.accountId,
+    resolveOutboundMentions: ({ jid, text }) => resolveOutboundMentionsForGroup(jid, text),
+    authDir: options.authDir,
   });
 
   return {

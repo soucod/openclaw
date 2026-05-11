@@ -1,8 +1,9 @@
 import { resolveCommandAuthorizedFromAuthorizers } from "openclaw/plugin-sdk/command-auth-native";
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-types";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { isDangerousNameMatchingEnabled } from "openclaw/plugin-sdk/dangerous-name-runtime";
 import { resolveOpenProviderRuntimeGroupPolicy } from "openclaw/plugin-sdk/runtime-group-policy";
-import { normalizeOptionalString } from "openclaw/plugin-sdk/text-runtime";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { resolveDiscordAccountAllowFrom, resolveDiscordAccountDmPolicy } from "../accounts.js";
 import type { AutocompleteInteraction } from "../internal/discord.js";
 import {
   normalizeDiscordAllowList,
@@ -62,8 +63,9 @@ export function resolveDiscordNativeCommandAllowlistAccess(params: {
   return { configured: true, allowed: match.allowed } as const;
 }
 
-export function resolveDiscordGuildNativeCommandAuthorized(params: {
+export async function resolveDiscordGuildNativeCommandAuthorized(params: {
   cfg: OpenClawConfig;
+  accountId: string;
   discordConfig: DiscordConfig;
   useAccessGroups: boolean;
   commandsAllowFromAccess: ReturnType<typeof resolveDiscordNativeCommandAllowlistAccess>;
@@ -183,8 +185,13 @@ export async function resolveDiscordNativeAutocompleteAuthorized(params: {
     : [];
   const allowNameMatching = isDangerousNameMatchingEnabled(discordConfig);
   const useAccessGroups = cfg.commands?.useAccessGroups !== false;
+  const configuredDmAllowFrom =
+    resolveDiscordAccountAllowFrom({
+      cfg,
+      accountId,
+    }) ?? [];
   const { ownerAllowList, ownerAllowed: ownerOk } = resolveDiscordOwnerAccess({
-    allowFrom: discordConfig?.allowFrom ?? discordConfig?.dm?.allowFrom ?? [],
+    allowFrom: configuredDmAllowFrom,
     sender: {
       id: sender.id,
       name: sender.name,
@@ -249,7 +256,7 @@ export async function resolveDiscordNativeAutocompleteAuthorized(params: {
     }
   }
   const dmEnabled = discordConfig?.dm?.enabled ?? true;
-  const dmPolicy = discordConfig?.dmPolicy ?? discordConfig?.dm?.policy ?? "pairing";
+  const dmPolicy = resolveDiscordAccountDmPolicy({ cfg, accountId }) ?? "pairing";
   if (isDirectMessage) {
     if (!dmEnabled || dmPolicy === "disabled") {
       return false;
@@ -257,16 +264,17 @@ export async function resolveDiscordNativeAutocompleteAuthorized(params: {
     const dmAccess = await resolveDiscordDmCommandAccess({
       accountId,
       dmPolicy,
-      configuredAllowFrom: discordConfig?.allowFrom ?? discordConfig?.dm?.allowFrom ?? [],
+      configuredAllowFrom: configuredDmAllowFrom,
       sender: {
         id: sender.id,
         name: sender.name,
         tag: sender.tag,
       },
       allowNameMatching,
-      useAccessGroups,
+      cfg,
+      rest: interaction.client.rest,
     });
-    if (dmAccess.decision !== "allow") {
+    if (dmAccess.senderAccess.decision !== "allow") {
       return false;
     }
   }
@@ -284,6 +292,7 @@ export async function resolveDiscordNativeAutocompleteAuthorized(params: {
   if (!isDirectMessage) {
     return resolveDiscordGuildNativeCommandAuthorized({
       cfg,
+      accountId,
       discordConfig,
       useAccessGroups,
       commandsAllowFromAccess,

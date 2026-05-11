@@ -341,8 +341,6 @@ export function createAgentEventHandler({
           );
         }
       } else {
-        chatRunState.abortedRuns.delete(clientRunId);
-        chatRunState.abortedRuns.delete(evt.runId);
         clearBufferedChatState(clientRunId);
         if (chatLink) {
           chatRunState.registry.remove(evt.runId, clientRunId, sessionKey);
@@ -564,22 +562,27 @@ export function createAgentEventHandler({
   const resolveToolVerboseLevel = (runId: string, sessionKey?: string) => {
     const runContext = getAgentRunContext(runId);
     const runVerbose = normalizeVerboseLevel(runContext?.verboseLevel);
-    if (runVerbose) {
-      return runVerbose;
-    }
     if (!sessionKey) {
-      return "off";
+      return runVerbose ?? "off";
     }
     try {
       const { cfg, entry } = loadSessionEntry(sessionKey);
       const sessionVerbose = normalizeVerboseLevel(entry?.verboseLevel);
-      if (sessionVerbose) {
+      const sessionUpdatedAt = typeof entry?.updatedAt === "number" ? entry.updatedAt : undefined;
+      const sessionChangedAfterRunStarted =
+        sessionUpdatedAt !== undefined &&
+        runContext?.registeredAt !== undefined &&
+        sessionUpdatedAt >= runContext.registeredAt;
+      if (sessionVerbose && (!runVerbose || sessionChangedAfterRunStarted)) {
         return sessionVerbose;
+      }
+      if (runVerbose) {
+        return runVerbose;
       }
       const defaultVerbose = normalizeVerboseLevel(cfg.agents?.defaults?.verboseDefault);
       return defaultVerbose ?? "off";
     } catch {
-      return "off";
+      return runVerbose ?? "off";
     }
   };
 
@@ -610,8 +613,9 @@ export function createAgentEventHandler({
     const isToolEvent = evt.stream === "tool";
     const isItemEvent = evt.stream === "item";
     const toolVerbose = isToolEvent ? resolveToolVerboseLevel(evt.runId, sessionKey) : "off";
-    // Build tool payload: strip result/partialResult unless verbose=full
-    const toolPayload =
+    // Channel/node subscribers respect verbose; authenticated Control UI
+    // recipients need tool result payloads to render live tool cards.
+    const channelToolPayload =
       isToolEvent && toolVerbose !== "full"
         ? (() => {
             const data = evt.data ? { ...evt.data } : {};
@@ -622,7 +626,7 @@ export function createAgentEventHandler({
               : { ...eventForClients, data };
           })()
         : agentPayload;
-    if (last > 0 && evt.seq !== last + 1) {
+    if (last > 0 && evt.seq !== last + 1 && isControlUiVisible) {
       broadcast("agent", {
         runId: eventRunId,
         stream: "error",
@@ -649,10 +653,10 @@ export function createAgentEventHandler({
       // setting only controls whether tool details are sent as channel
       // messages to messaging surfaces (Telegram, Discord, etc.).
       const recipients = toolEventRecipients.get(evt.runId);
-      if (recipients && recipients.size > 0) {
+      if (isControlUiVisible && recipients && recipients.size > 0) {
         broadcastToConnIds(
           "agent",
-          sessionKey ? { ...toolPayload, ...buildSessionEventSnapshot(sessionKey) } : toolPayload,
+          sessionKey ? { ...agentPayload, ...buildSessionEventSnapshot(sessionKey) } : agentPayload,
           recipients,
         );
       }
@@ -661,12 +665,12 @@ export function createAgentEventHandler({
       // not know the runId in advance, so they cannot register as run-scoped
       // tool recipients. Mirror tool lifecycle onto a session-scoped event so
       // they can render live pending tool cards without polling history.
-      if (sessionKey) {
+      if (isControlUiVisible && sessionKey) {
         const sessionSubscribers = sessionEventSubscribers.getAll();
         if (sessionSubscribers.size > 0) {
           broadcastToConnIds(
             "session.tool",
-            { ...toolPayload, ...buildSessionEventSnapshot(sessionKey) },
+            { ...agentPayload, ...buildSessionEventSnapshot(sessionKey) },
             sessionSubscribers,
             { dropIfSlow: true },
           );
@@ -677,7 +681,9 @@ export function createAgentEventHandler({
       if (itemPhase === "start" && isControlUiVisible && sessionKey && !isAborted) {
         flushBufferedChatDeltaIfNeeded(sessionKey, clientRunId, evt.runId, evt.seq);
       }
-      broadcast("agent", agentPayload);
+      if (isControlUiVisible) {
+        broadcast("agent", agentPayload);
+      }
     }
 
     if (isControlUiVisible && sessionKey) {
@@ -687,7 +693,9 @@ export function createAgentEventHandler({
         nodeSendToSession(
           sessionKey,
           "agent",
-          isToolEvent ? { ...toolPayload, ...buildSessionEventSnapshot(sessionKey) } : agentPayload,
+          isToolEvent
+            ? { ...channelToolPayload, ...buildSessionEventSnapshot(sessionKey) }
+            : agentPayload,
         );
       }
       if (

@@ -1,8 +1,8 @@
 import { CHANNEL_APPROVAL_NATIVE_RUNTIME_CONTEXT_CAPABILITY } from "openclaw/plugin-sdk/approval-handler-adapter-runtime";
 import type { ChannelRuntimeSurface } from "openclaw/plugin-sdk/channel-contract";
 import { registerChannelRuntimeContext } from "openclaw/plugin-sdk/channel-runtime-context";
-import type { NativeCommandSpec } from "openclaw/plugin-sdk/command-auth";
-import type { DiscordAccountConfig, OpenClawConfig } from "openclaw/plugin-sdk/config-types";
+import type { NativeCommandSpec } from "openclaw/plugin-sdk/command-auth-native";
+import type { DiscordAccountConfig, OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
 import { isDiscordExecApprovalClientEnabled } from "../exec-approvals.js";
 import {
@@ -12,15 +12,9 @@ import {
 } from "../internal/discord.js";
 import { createDiscordVoiceCommand } from "../voice/command.js";
 import {
-  createAgentComponentButton,
-  createAgentSelectMenu,
-  createDiscordComponentButton,
-  createDiscordComponentChannelSelect,
-  createDiscordComponentMentionableSelect,
+  createAgentComponentControls,
+  createDiscordComponentControls,
   createDiscordComponentModal,
-  createDiscordComponentRoleSelect,
-  createDiscordComponentStringSelect,
-  createDiscordComponentUserSelect,
 } from "./agent-components.js";
 import {
   createDiscordExecApprovalButtonContext,
@@ -157,14 +151,8 @@ export function createDiscordProviderInteractionSurface(params: {
       runtime: params.runtime,
       token: params.token,
     };
-    components.push(createAgentComponentButton(componentContext));
-    components.push(createAgentSelectMenu(componentContext));
-    components.push(createDiscordComponentButton(componentContext));
-    components.push(createDiscordComponentStringSelect(componentContext));
-    components.push(createDiscordComponentUserSelect(componentContext));
-    components.push(createDiscordComponentRoleSelect(componentContext));
-    components.push(createDiscordComponentMentionableSelect(componentContext));
-    components.push(createDiscordComponentChannelSelect(componentContext));
+    components.push(...createAgentComponentControls.map((create) => create(componentContext)));
+    components.push(...createDiscordComponentControls.map((create) => create(componentContext)));
     modals.push(createDiscordComponentModal(componentContext));
   }
 

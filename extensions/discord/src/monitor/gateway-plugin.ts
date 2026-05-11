@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { Agent as HttpsAgent } from "node:https";
 import * as httpsProxyAgent from "https-proxy-agent";
-import type { DiscordAccountConfig } from "openclaw/plugin-sdk/config-types";
+import type { DiscordAccountConfig } from "openclaw/plugin-sdk/config-contracts";
 import {
   captureWsEvent,
   resolveEffectiveDebugProxyUrl,
@@ -10,7 +11,9 @@ import { danger } from "openclaw/plugin-sdk/runtime-env";
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
 import * as ws from "ws";
 import * as discordGateway from "../internal/gateway.js";
+import { createDiscordDnsLookup } from "../network-config.js";
 import { validateDiscordProxyUrl } from "../proxy-fetch.js";
+import { resolveDiscordVoiceEnabled } from "../voice/config.js";
 import { DISCORD_GATEWAY_TRANSPORT_ACTIVITY_EVENT } from "./gateway-handle.js";
 import {
   fetchDiscordGatewayInfoWithTimeout,
@@ -27,21 +30,36 @@ export {
 } from "./gateway-metadata.js";
 
 const DISCORD_GATEWAY_HANDSHAKE_TIMEOUT_MS = 30_000;
+const discordDnsLookup = createDiscordDnsLookup();
 
 type DiscordGatewayWebSocketCtor = new (
   url: string,
   options?: { agent?: unknown; handshakeTimeout?: number },
 ) => ws.WebSocket;
+type DiscordGatewayWebSocketAgent =
+  | InstanceType<typeof HttpsAgent>
+  | InstanceType<typeof httpsProxyAgent.HttpsProxyAgent<string>>;
 const registrationPromises = new WeakMap<discordGateway.GatewayPlugin, Promise<void>>();
+type DiscordGatewayClient = Parameters<discordGateway.GatewayPlugin["registerClient"]>[0];
+type GatewayPluginTestingOptions = {
+  registerClient?: (
+    plugin: discordGateway.GatewayPlugin,
+    client: DiscordGatewayClient,
+  ) => Promise<void>;
+  webSocketCtor?: DiscordGatewayWebSocketCtor;
+};
+type CreateDiscordGatewayPluginTestingOptions = GatewayPluginTestingOptions & {
+  HttpsProxyAgentCtor?: typeof httpsProxyAgent.HttpsProxyAgent;
+};
 type DiscordGatewayRegistrationState = {
-  client?: Parameters<discordGateway.GatewayPlugin["registerClient"]>[0];
+  client?: DiscordGatewayClient;
   ws?: unknown;
   isConnecting?: boolean;
 };
 
 function assignGatewayClient(
   plugin: discordGateway.GatewayPlugin,
-  client: Parameters<discordGateway.GatewayPlugin["registerClient"]>[0],
+  client: DiscordGatewayClient,
 ): void {
   (plugin as unknown as DiscordGatewayRegistrationState).client = client;
 }
@@ -52,14 +70,14 @@ function hasGatewaySocketStarted(plugin: discordGateway.GatewayPlugin): boolean 
 }
 
 type ResolveDiscordGatewayIntentsParams = {
-  intentsConfig?: import("openclaw/plugin-sdk/config-types").DiscordIntentsConfig;
+  intentsConfig?: import("openclaw/plugin-sdk/config-contracts").DiscordIntentsConfig;
   voiceEnabled?: boolean;
 };
 
 export function resolveDiscordGatewayIntents(params?: ResolveDiscordGatewayIntentsParams): number {
   const intentsConfig = params?.intentsConfig;
   const voiceEnabled = params?.voiceEnabled;
-  const voiceStatesEnabled = intentsConfig?.voiceStates ?? voiceEnabled ?? true;
+  const voiceStatesEnabled = intentsConfig?.voiceStates ?? voiceEnabled ?? false;
   let intents =
     discordGateway.GatewayIntents.Guilds |
     discordGateway.GatewayIntents.GuildMessages |
@@ -88,38 +106,18 @@ function createGatewayPlugin(params: {
   gatewayInfoTimeoutMs: number;
   fetchImpl: DiscordGatewayFetch;
   fetchInit?: DiscordGatewayFetchInit;
-  wsAgent?: InstanceType<typeof httpsProxyAgent.HttpsProxyAgent<string>>;
+  wsAgent?: DiscordGatewayWebSocketAgent;
   runtime?: RuntimeEnv;
-  testing?: {
-    registerClient?: (
-      plugin: discordGateway.GatewayPlugin,
-      client: Parameters<discordGateway.GatewayPlugin["registerClient"]>[0],
-    ) => Promise<void>;
-    webSocketCtor?: DiscordGatewayWebSocketCtor;
-  };
+  testing?: GatewayPluginTestingOptions;
 }): discordGateway.GatewayPlugin {
-  class SafeGatewayPlugin extends discordGateway.GatewayPlugin {
+  class OpenClawGatewayPlugin extends discordGateway.GatewayPlugin {
     private gatewayInfoUsedFallback = false;
 
     constructor() {
       super(params.options);
     }
 
-    public override connect(resume = false): void {
-      // Guard against stale heartbeat timers from an early reconnect race
-      // (openclaw/openclaw#65009, #64011, #63387).
-      if (this.heartbeatInterval !== undefined) {
-        clearInterval(this.heartbeatInterval);
-        this.heartbeatInterval = undefined;
-      }
-      if (this.firstHeartbeatTimeout !== undefined) {
-        clearTimeout(this.firstHeartbeatTimeout);
-        this.firstHeartbeatTimeout = undefined;
-      }
-      super.connect(resume);
-    }
-
-    override registerClient(client: Parameters<discordGateway.GatewayPlugin["registerClient"]>[0]) {
+    override registerClient(client: DiscordGatewayClient) {
       const registration = this.registerClientInternal(client);
       // Client construction starts plugin hooks without awaiting them. Mark the
       // promise handled immediately, then let startup await the original promise.
@@ -128,9 +126,7 @@ function createGatewayPlugin(params: {
       return registration;
     }
 
-    private async registerClientInternal(
-      client: Parameters<discordGateway.GatewayPlugin["registerClient"]>[0],
-    ) {
+    private async registerClientInternal(client: DiscordGatewayClient) {
       // Publish the client reference before the metadata fetch can yield, so an external
       // connect()->identify() cannot silently drop IDENTIFY (#52372).
       assignGatewayClient(this, client);
@@ -231,7 +227,21 @@ function createGatewayPlugin(params: {
     }
   }
 
-  return new SafeGatewayPlugin();
+  return new OpenClawGatewayPlugin();
+}
+
+function createDiscordGatewayMetadataFetch(debugCaptureEnabled: boolean): DiscordGatewayFetch {
+  return (input, init) =>
+    fetchDiscordGatewayMetadataDirect(
+      input,
+      init,
+      debugCaptureEnabled
+        ? false
+        : {
+            flowId: randomUUID(),
+            meta: { subsystem: "discord-gateway-metadata" },
+          },
+    );
 }
 
 export function waitForDiscordGatewayPluginRegistration(
@@ -246,18 +256,11 @@ export function waitForDiscordGatewayPluginRegistration(
 export function createDiscordGatewayPlugin(params: {
   discordConfig: DiscordAccountConfig;
   runtime: RuntimeEnv;
-  __testing?: {
-    HttpsProxyAgentCtor?: typeof httpsProxyAgent.HttpsProxyAgent;
-    webSocketCtor?: DiscordGatewayWebSocketCtor;
-    registerClient?: (
-      plugin: discordGateway.GatewayPlugin,
-      client: Parameters<discordGateway.GatewayPlugin["registerClient"]>[0],
-    ) => Promise<void>;
-  };
+  __testing?: CreateDiscordGatewayPluginTestingOptions;
 }): discordGateway.GatewayPlugin {
   const intents = resolveDiscordGatewayIntents({
     intentsConfig: params.discordConfig?.intents,
-    voiceEnabled: params.discordConfig?.voice?.enabled !== false,
+    voiceEnabled: resolveDiscordVoiceEnabled(params.discordConfig?.voice),
   });
   const proxy = resolveEffectiveDebugProxyUrl(params.discordConfig?.proxy);
   const debugProxySettings = resolveDebugProxySettings();
@@ -265,84 +268,35 @@ export function createDiscordGatewayPlugin(params: {
     configuredTimeoutMs: params.discordConfig?.gatewayInfoTimeoutMs,
     env: process.env,
   });
-  const options = {
-    reconnect: { maxAttempts: 50 },
-    intents,
-    // OpenClaw registers its own async interaction listener.
-    autoInteractions: false,
-  };
+  let fetchImpl = createDiscordGatewayMetadataFetch(debugProxySettings.enabled);
+  let wsAgent: DiscordGatewayWebSocketAgent = new HttpsAgent({
+    lookup: discordDnsLookup,
+  });
 
-  if (!proxy) {
-    return createGatewayPlugin({
-      options,
-      gatewayInfoTimeoutMs,
-      fetchImpl: async (input, init) => {
-        return await fetchDiscordGatewayMetadataDirect(
-          input,
-          init,
-          debugProxySettings.enabled
-            ? false
-            : {
-                flowId: randomUUID(),
-                meta: { subsystem: "discord-gateway-metadata" },
-              },
-        );
-      },
-      runtime: params.runtime,
-      testing: params.__testing
-        ? {
-            registerClient: params.__testing.registerClient,
-            webSocketCtor: params.__testing.webSocketCtor,
-          }
-        : undefined,
-    });
+  if (proxy) {
+    try {
+      validateDiscordProxyUrl(proxy);
+      const HttpsProxyAgentCtor =
+        params.__testing?.HttpsProxyAgentCtor ?? httpsProxyAgent.HttpsProxyAgent;
+      wsAgent = new HttpsProxyAgentCtor<string>(proxy);
+      params.runtime.log?.("discord: gateway proxy enabled");
+    } catch (err) {
+      params.runtime.error?.(danger(`discord: invalid gateway proxy: ${String(err)}`));
+      fetchImpl = (input, init) => fetchDiscordGatewayMetadataDirect(input, init, false);
+    }
   }
 
-  try {
-    validateDiscordProxyUrl(proxy);
-    const HttpsProxyAgentCtor =
-      params.__testing?.HttpsProxyAgentCtor ?? httpsProxyAgent.HttpsProxyAgent;
-    const wsAgent = new HttpsProxyAgentCtor<string>(proxy);
-
-    params.runtime.log?.("discord: gateway proxy enabled");
-
-    return createGatewayPlugin({
-      options,
-      gatewayInfoTimeoutMs,
-      fetchImpl: async (input, init) => {
-        return await fetchDiscordGatewayMetadataDirect(
-          input,
-          init,
-          debugProxySettings.enabled
-            ? false
-            : {
-                flowId: randomUUID(),
-                meta: { subsystem: "discord-gateway-metadata" },
-              },
-        );
-      },
-      wsAgent,
-      runtime: params.runtime,
-      testing: params.__testing
-        ? {
-            registerClient: params.__testing.registerClient,
-            webSocketCtor: params.__testing.webSocketCtor,
-          }
-        : undefined,
-    });
-  } catch (err) {
-    params.runtime.error?.(danger(`discord: invalid gateway proxy: ${String(err)}`));
-    return createGatewayPlugin({
-      options,
-      gatewayInfoTimeoutMs,
-      fetchImpl: (input, init) => fetchDiscordGatewayMetadataDirect(input, init, false),
-      runtime: params.runtime,
-      testing: params.__testing
-        ? {
-            registerClient: params.__testing.registerClient,
-            webSocketCtor: params.__testing.webSocketCtor,
-          }
-        : undefined,
-    });
-  }
+  return createGatewayPlugin({
+    options: {
+      reconnect: { maxAttempts: 50 },
+      intents,
+      // OpenClaw registers its own async interaction listener.
+      autoInteractions: false,
+    },
+    gatewayInfoTimeoutMs,
+    fetchImpl,
+    runtime: params.runtime,
+    testing: params.__testing,
+    ...(wsAgent ? { wsAgent } : {}),
+  });
 }

@@ -2,6 +2,8 @@
 
 import { nothing, render } from "lit";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { i18n } from "../../i18n/index.ts";
+import { createStorageMock } from "../../test-helpers/storage.ts";
 import type { AppViewState } from "../app-view-state.ts";
 import { type OpenClawModalDialog } from "../components/modal-dialog.ts";
 import type { ExecApprovalRequest } from "../controllers/exec-approval.ts";
@@ -48,12 +50,18 @@ function restoreDescriptor(name: "showModal" | "close", descriptor?: PropertyDes
 
 async function getRenderedDialog() {
   const modal = container.querySelector<OpenClawModalDialog>("openclaw-modal-dialog");
-  expect(modal).not.toBeNull();
-  await modal!.updateComplete;
+  expect(modal).toBeInstanceOf(HTMLElement);
+  if (!modal) {
+    throw new Error("Expected openclaw-modal-dialog");
+  }
+  await modal.updateComplete;
   await nextFrame();
-  const dialog = modal!.shadowRoot?.querySelector("dialog");
-  expect(dialog).not.toBeNull();
-  return { modal: modal!, dialog: dialog! };
+  const dialog = modal.shadowRoot?.querySelector("dialog");
+  expect(dialog).toBeInstanceOf(HTMLDialogElement);
+  if (!(dialog instanceof HTMLDialogElement)) {
+    throw new Error("Expected rendered dialog");
+  }
+  return { modal, dialog };
 }
 
 function dispatchEscape(target: EventTarget) {
@@ -101,17 +109,22 @@ function createExecState(
 }
 
 describe("approval and confirmation modals", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     installDialogPolyfill();
+    vi.stubGlobal("localStorage", createStorageMock());
+    await i18n.setLocale("en");
     container = document.createElement("div");
     document.body.append(container);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     render(nothing, container);
     container.remove();
+    await i18n.setLocale("en");
     restoreDescriptor("showModal", showModalDescriptor);
     restoreDescriptor("close", closeDescriptor);
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
@@ -132,6 +145,27 @@ describe("approval and confirmation modals", () => {
     expect(container.querySelector("#exec-approval-title")?.textContent).toContain(
       "Exec approval needed",
     );
+  });
+
+  it("renders command spans in exec approvals", async () => {
+    const request = createExecRequest();
+    request.request.command = 'ls | grep "stuff" | python -c \'print("hi")\'';
+    request.request.commandSpans = [
+      { startIndex: 0, endIndex: 2 },
+      { startIndex: 5, endIndex: 5 },
+      { startIndex: 8.5, endIndex: 10 },
+      { startIndex: 20, endIndex: 29 },
+      { startIndex: 30, endIndex: 200 },
+    ];
+
+    render(renderExecApprovalPrompt(createExecState({ execApprovalQueue: [request] })), container);
+
+    await getRenderedDialog();
+
+    const spans = [...container.querySelectorAll(".exec-approval-command-span")].map(
+      (span) => span.textContent,
+    );
+    expect(spans).toEqual(["ls", "python -c"]);
   });
 
   it("maps Escape to exec denial when approval is idle", async () => {
@@ -160,6 +194,48 @@ describe("approval and confirmation modals", () => {
     expect(handleExecApprovalDecision).not.toHaveBeenCalled();
   });
 
+  it("renders exec approval chrome from the active locale", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-29T00:00:00.000Z"));
+    await i18n.setLocale("zh-CN");
+    const active: ExecApprovalRequest = {
+      id: "approval-1",
+      kind: "exec",
+      request: {
+        command: "pnpm check:changed",
+        host: "gateway",
+        agentId: "main",
+        sessionKey: "main",
+        cwd: "/tmp/project",
+        resolvedPath: "/tmp/project",
+        security: "workspace-write",
+        ask: "on-request",
+      },
+      createdAtMs: Date.now(),
+      expiresAtMs: Date.now() + 61_000,
+    };
+    const queued: ExecApprovalRequest = {
+      ...active,
+      id: "approval-2",
+      createdAtMs: Date.now() + 1,
+      expiresAtMs: Date.now() + 62_000,
+    };
+
+    render(
+      renderExecApprovalPrompt(createExecState({ execApprovalQueue: [active, queued] })),
+      container,
+    );
+
+    expect(container.textContent).toContain("需要 Exec 审批");
+    expect(container.textContent).toContain("1m 后过期");
+    expect(container.textContent).toContain("2 个待处理");
+    expect(container.textContent).toContain("主机");
+    expect(container.textContent).toContain("代理");
+    expect(container.textContent).toContain("允许一次");
+    expect(container.textContent).toContain("始终允许");
+    expect(container.textContent).toContain("拒绝");
+  });
+
   it("uses the shared modal primitive for gateway URL confirmation and cancels on Escape", async () => {
     const handleGatewayUrlCancel = vi.fn();
     render(
@@ -172,7 +248,6 @@ describe("approval and confirmation modals", () => {
     );
 
     const { dialog } = await getRenderedDialog();
-    expect(container.querySelector("openclaw-modal-dialog")).not.toBeNull();
 
     dispatchEscape(dialog);
 
@@ -193,7 +268,6 @@ describe("approval and confirmation modals", () => {
     );
 
     const { dialog } = await getRenderedDialog();
-    expect(container.querySelector("openclaw-modal-dialog")).not.toBeNull();
 
     dispatchEscape(dialog);
 

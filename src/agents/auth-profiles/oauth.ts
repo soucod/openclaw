@@ -3,7 +3,7 @@ import {
   getOAuthProviders,
   type OAuthCredentials,
   type OAuthProvider,
-} from "@mariozechner/pi-ai/oauth";
+} from "@earendil-works/pi-ai/oauth";
 import { getRuntimeConfig } from "../../config/config.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { coerceSecretRef } from "../../config/types.secrets.js";
@@ -14,6 +14,7 @@ import {
 } from "../../plugins/provider-runtime.runtime.js";
 import { resolveSecretRefString, type SecretRefResolveCache } from "../../secrets/resolve.js";
 import { normalizeLowercaseStringOrEmpty } from "../../shared/string-coerce.js";
+import { normalizeOptionalSecretInput } from "../../utils/normalize-secret-input.js";
 import { refreshChutesTokens } from "../chutes-oauth.js";
 import { log } from "./constants.js";
 import { resolveTokenExpiryState } from "./credential-state.js";
@@ -93,9 +94,14 @@ function isProfileConfigCompatible(params: {
   return true;
 }
 
-async function buildOAuthApiKey(provider: string, credentials: OAuthCredential): Promise<string> {
+async function buildOAuthApiKey(
+  provider: string,
+  credentials: OAuthCredential,
+  context: { cfg?: OpenClawConfig },
+): Promise<string> {
   const formatted = await formatProviderAuthProfileApiKeyWithPlugin({
     provider,
+    config: context.cfg,
     context: credentials,
   });
   return typeof formatted === "string" && formatted.length > 0 ? formatted : credentials.access;
@@ -195,6 +201,7 @@ async function tryResolveOAuthProfile(
     profileId,
     credential: cred,
     agentDir: params.agentDir,
+    cfg,
   });
   if (!resolved) {
     return null;
@@ -254,7 +261,7 @@ async function resolveProfileSecretString(params: {
     }
   }
 
-  return resolvedValue;
+  return normalizeOptionalSecretInput(resolvedValue);
 }
 
 export async function resolveApiKeyForProfile(
@@ -333,6 +340,7 @@ export async function resolveApiKeyForProfile(
       agentDir: params.agentDir,
       profileId,
       credential: cred,
+      cfg,
     });
     if (!resolved) {
       return null;
