@@ -32,6 +32,17 @@ vi.mock("openclaw/plugin-sdk/ssrf-runtime", () => ({
   ssrfPolicyFromHttpBaseUrlAllowedHostname: () => undefined,
 }));
 
+const officialEndpointValidationCases = [
+  {
+    label: "voice validator",
+    isAccepted: () => isValidOpenAIVoice("kokoro-custom-voice", "https://api.openai.com/v1/"),
+  },
+  {
+    label: "model validator",
+    isAccepted: () => isValidOpenAIModel("kokoro-custom-model", "https://api.openai.com/v1/"),
+  },
+];
+
 describe("openai tts", () => {
   const proxyReset = installDebugProxyTestResetHooks();
   const originalFetch = globalThis.fetch;
@@ -59,10 +70,6 @@ describe("openai tts", () => {
       expect(isValidOpenAIVoice("alloy ")).toBe(false);
       expect(isValidOpenAIVoice(" alloy")).toBe(false);
     });
-
-    it("treats the default endpoint with trailing slash as the default endpoint", () => {
-      expect(isValidOpenAIVoice("kokoro-custom-voice", "https://api.openai.com/v1/")).toBe(false);
-    });
   });
 
   describe("isValidOpenAIModel", () => {
@@ -85,10 +92,15 @@ describe("openai tts", () => {
         expect(isValidOpenAIModel(testCase.model), testCase.model).toBe(testCase.expected);
       }
     });
+  });
 
-    it("treats the default endpoint with trailing slash as the default endpoint", () => {
-      expect(isValidOpenAIModel("kokoro-custom-model", "https://api.openai.com/v1/")).toBe(false);
-    });
+  describe("official OpenAI TTS endpoint validation", () => {
+    it.each(officialEndpointValidationCases)(
+      "$label treats the default endpoint with trailing slash as the default endpoint",
+      ({ isAccepted }) => {
+        expect(isAccepted()).toBe(false);
+      },
+    );
   });
 
   describe("resolveOpenAITtsInstructions", () => {
@@ -136,16 +148,12 @@ describe("openai tts", () => {
         timeoutMs: 5_000,
       });
 
-      expect(fetchMock).toHaveBeenCalledWith(
-        "https://api.openai.com/v1/audio/speech",
-        expect.objectContaining({
-          headers: expect.objectContaining({
-            originator: "openclaw",
-            version: "2026.3.22",
-            "User-Agent": "openclaw/2026.3.22",
-          }),
-        }),
-      );
+      const [url, init] = fetchMock.mock.calls[0] ?? [];
+      const headers = init?.headers as Record<string, string> | undefined;
+      expect(url).toBe("https://api.openai.com/v1/audio/speech");
+      expect(headers?.originator).toBe("openclaw");
+      expect(headers?.version).toBe("2026.3.22");
+      expect(headers?.["User-Agent"]).toBe("openclaw/2026.3.22");
     });
 
     it("sends instructions to custom OpenAI-compatible endpoints", async () => {
@@ -203,14 +211,12 @@ describe("openai tts", () => {
         throw new Error("expected JSON request body");
       }
       const body = JSON.parse(init.body) as Record<string, unknown>;
-      expect(body).toMatchObject({
-        model: "tts-1",
-        input: "hello",
-        voice: "custom-voice",
-        response_format: "mp3",
-        lang: "e",
-        speed: 1.2,
-      });
+      expect(body.model).toBe("tts-1");
+      expect(body.input).toBe("hello");
+      expect(body.voice).toBe("custom-voice");
+      expect(body.response_format).toBe("mp3");
+      expect(body.lang).toBe("e");
+      expect(body.speed).toBe(1.2);
       expect(Object.hasOwn(body, "__proto__")).toBe(false);
       expect(Object.hasOwn(body, "constructor")).toBe(false);
       expect(Object.hasOwn(body, "prototype")).toBe(false);

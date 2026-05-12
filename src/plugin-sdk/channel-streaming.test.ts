@@ -166,7 +166,8 @@ describe("channel-streaming", () => {
   });
 
   it("uses auto progress labels when no explicit label is configured", () => {
-    expect(DEFAULT_PROGRESS_DRAFT_LABELS.every((label) => label.endsWith("..."))).toBe(true);
+    const invalidLabels = DEFAULT_PROGRESS_DRAFT_LABELS.filter((label) => !label.endsWith("..."));
+    expect(invalidLabels).toStrictEqual([]);
     expect(resolveChannelProgressDraftLabel({ random: () => 0 })).toBe(
       DEFAULT_PROGRESS_DRAFT_LABELS[0],
     );
@@ -242,17 +243,17 @@ describe("channel-streaming", () => {
         entry: { streaming: { progress: { label: false } } },
         lines: line ? [line] : [],
       }),
-    ).toBe("🩹 1 modified; extensions/discord/src/monitor/message-handler.draft-prev…");
+    ).toBe("🩹 1 modified; extensions/discord/src/monitor/message-handler.draft-preview.ts");
   });
 
   it("bounds progress draft line length to reduce edit reflow", () => {
     expect(
       formatChannelProgressDraftText({
         entry: { streaming: { progress: { label: "Shelling" } } },
-        lines: ["x".repeat(80)],
+        lines: ["x".repeat(160)],
         formatLine: (line) => `\`${line}\``,
       }),
-    ).toBe(`Shelling\n• \`${"x".repeat(71)}…\``);
+    ).toBe(`Shelling\n• \`${"x".repeat(107)}…\``);
   });
 
   it("keeps compacted raw progress lines from leaking unmatched markdown backticks", () => {
@@ -273,7 +274,9 @@ describe("channel-streaming", () => {
       lines: line ? [line] : [],
     });
 
-    expect(text).toBe("Shelling\n🛠️ Exec: run node script…that/keeps/going/and/going/index…");
+    expect(text).toBe(
+      "Shelling\n🛠️ run node script…/some/really/deep/path/that/keeps/going/and/going/index…",
+    );
     expect(text.match(/`/g) ?? []).toHaveLength(0);
   });
 
@@ -322,14 +325,14 @@ describe("channel-streaming", () => {
         },
         { detailMode: "raw" },
       ),
-    ).toBe("🛠️ Exec: run tests, `pnpm test -- --watch=false`");
+    ).toBe("🛠️ run tests, `pnpm test -- --watch=false`");
     expect(
       formatChannelProgressDraftLine({
         event: "tool",
         name: "bash",
         args: { command: "sed -n '1,80p' extensions/discord/src/draft-stream.ts" },
       }),
-    ).toBe("🛠️ Bash: print lines 1-80 from extensions/discord/src/draft-stream.ts");
+    ).toBe("🛠️ print lines 1-80 from extensions/discord/src/draft-stream.ts");
     expect(
       formatChannelProgressDraftLine({
         event: "tool",
@@ -344,7 +347,7 @@ describe("channel-streaming", () => {
         name: "exec",
         progressText: "raw command output",
       }),
-    ).toBe("🛠️ Exec: raw command output");
+    ).toBe("🛠️ raw command output");
     expect(
       formatChannelProgressDraftLine(
         {
