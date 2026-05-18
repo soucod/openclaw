@@ -1,7 +1,20 @@
+import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync } from "node:fs";
 import { join, relative } from "node:path";
 
 function listContractTestFiles(rootDir = "src/channels/plugins/contracts") {
+  const result = spawnSync("git", ["ls-files", "--", rootDir], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  if (result.status === 0) {
+    return result.stdout
+      .split("\n")
+      .map((line) => line.trim().replaceAll("\\", "/"))
+      .filter((line) => line.endsWith(".test.ts"))
+      .toSorted((a, b) => a.localeCompare(b));
+  }
+
   if (!existsSync(rootDir)) {
     return [];
   }
@@ -39,7 +52,7 @@ function resolveContractFileWeight(file) {
 
 export function createChannelContractTestShards() {
   const rootDir = "src/channels/plugins/contracts";
-  const suffixes = ["a", "b", "c"];
+  const suffixes = ["a", "b"];
   const groups = Object.fromEntries(
     suffixes.map((suffix) => [`checks-fast-contracts-channels-${suffix}`, []]),
   );
