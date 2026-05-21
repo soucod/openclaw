@@ -13,6 +13,7 @@ import {
   readStringValue,
   resolveBrowserConfig,
   resolveProfile,
+  resolveRuntimeImageSanitization,
   wrapExternalContent,
 } from "./browser-tool.runtime.js";
 import { DEFAULT_BROWSER_ACTION_TIMEOUT_MS } from "./browser/constants.js";
@@ -114,7 +115,7 @@ function resolveActProxyTimeoutMs(request: BrowserActRequest): number | undefine
   return candidateTimeouts.length ? Math.max(...candidateTimeouts) : undefined;
 }
 
-export const __testing = {
+export const testing = {
   setDepsForTest(
     overrides: Partial<{
       browserAct: typeof browserAct;
@@ -463,6 +464,7 @@ export async function executeSnapshotAction(params: {
         path: snapshot.imagePath,
         extraText: wrappedSnapshot,
         details: safeDetails,
+        imageSanitization: resolveRuntimeImageSanitization(),
       });
     }
     return {
@@ -602,3 +604,4 @@ export async function executeActAction(params: {
     throw err;
   }
 }
+export { testing as __testing };
