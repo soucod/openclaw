@@ -220,6 +220,92 @@ describe("tui-event-handlers: handleAgentEvent", () => {
     expect(tui.requestRender).toHaveBeenCalledTimes(1);
   });
 
+  it("shows running for a system-injected run that never went through submit", () => {
+    const { state, tui, setActivityStatus, handleAgentEvent } = createHandlersHarness({
+      state: { activeChatRunId: null },
+    });
+
+    handleAgentEvent({
+      runId: "run-bridge",
+      stream: "lifecycle",
+      sessionKey: state.currentSessionKey,
+      data: { phase: "start" },
+    });
+
+    expect(setActivityStatus).toHaveBeenCalledWith("running");
+    expect(state.activeChatRunId).toBe("run-bridge");
+    expect(tui.requestRender).toHaveBeenCalled();
+  });
+
+  it("does not adopt a system-injected lifecycle start from another session", () => {
+    const { state, tui, setActivityStatus, handleAgentEvent } = createHandlersHarness({
+      state: { activeChatRunId: null },
+    });
+
+    handleAgentEvent({
+      runId: "run-other",
+      stream: "lifecycle",
+      sessionKey: "agent:other:other",
+      data: { phase: "start" },
+    });
+
+    expect(setActivityStatus).not.toHaveBeenCalled();
+    expect(state.activeChatRunId).toBeNull();
+    expect(tui.requestRender).not.toHaveBeenCalled();
+  });
+
+  it("does not let a system-injected run steal a concurrent active run", () => {
+    const { state, setActivityStatus, handleAgentEvent } = createHandlersHarness({
+      state: { activeChatRunId: "run-user" },
+    });
+
+    handleAgentEvent({
+      runId: "run-bridge",
+      stream: "lifecycle",
+      sessionKey: state.currentSessionKey,
+      data: { phase: "start" },
+    });
+    handleAgentEvent({
+      runId: "run-bridge",
+      stream: "lifecycle",
+      sessionKey: state.currentSessionKey,
+      data: { phase: "finishing" },
+    });
+    handleAgentEvent({
+      runId: "run-bridge",
+      stream: "lifecycle",
+      sessionKey: state.currentSessionKey,
+      data: { phase: "end" },
+    });
+
+    expect(state.activeChatRunId).toBe("run-user");
+    expect(setActivityStatus).not.toHaveBeenCalledWith("running");
+    expect(setActivityStatus).not.toHaveBeenCalledWith("finishing context");
+    expect(setActivityStatus).not.toHaveBeenCalledWith("idle");
+  });
+
+  it("promotes a remaining system-injected run when the active run finishes", () => {
+    const { state, setActivityStatus, handleAgentEvent, handleChatEvent } = createHandlersHarness({
+      state: { activeChatRunId: "run-user" },
+    });
+
+    handleAgentEvent({
+      runId: "run-bridge",
+      stream: "lifecycle",
+      sessionKey: state.currentSessionKey,
+      data: { phase: "start" },
+    });
+    handleChatEvent({
+      runId: "run-user",
+      sessionKey: state.currentSessionKey,
+      state: "final",
+      message: { content: [{ type: "text", text: "done" }], stopReason: "stop" },
+    });
+
+    expect(state.activeChatRunId).toBe("run-bridge");
+    expect(setActivityStatus).toHaveBeenLastCalledWith("running");
+  });
+
   it("renders terminal lifecycle errors after retry grace and clears the active run", () => {
     vi.useFakeTimers();
     const { state, chatLog, tui, setActivityStatus, loadHistory, handleAgentEvent } =
@@ -969,6 +1055,31 @@ describe("tui-event-handlers: handleAgentEvent", () => {
     expect(state.activeChatRunId).toBeNull();
     expect(isLocalRunId("run-gateway")).toBe(false);
     expect(loadHistory).not.toHaveBeenCalled();
+  });
+
+  it("keeps pending user text after run binding until history catches up", () => {
+    const pendingUsers = new Map([["run-gateway", "queued hello"]]);
+    const chatLog = {
+      ...createMockChatLog(),
+      countPendingUsers: () => pendingUsers.size,
+      render: (_width: number) => Array.from(pendingUsers.values()),
+    };
+    const { state, noteLocalRunId, handleChatEvent } = createHandlersHarness({
+      chatLog: chatLog as unknown as HandlerChatLog,
+      state: { activeChatRunId: null, pendingOptimisticUserMessage: true },
+    });
+    noteLocalRunId("run-gateway");
+
+    handleChatEvent({
+      runId: "run-gateway",
+      sessionKey: state.currentSessionKey,
+      state: "delta",
+      message: { content: "working" },
+    });
+
+    expect(state.pendingOptimisticUserMessage).toBe(false);
+    expect(chatLog.countPendingUsers()).toBe(1);
+    expect(chatLog.render(120).join("\n")).toContain("queued hello");
   });
 
   it("does not bind unknown gateway run ids while an optimistic message is pending", () => {

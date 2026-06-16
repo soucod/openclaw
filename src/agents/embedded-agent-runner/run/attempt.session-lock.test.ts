@@ -1,4 +1,5 @@
 // Coverage for embedded attempt session-file ownership and write locks.
+import { appendFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -9,6 +10,7 @@ import {
   runWithOwnedSessionTranscriptWritePublication,
   withOwnedSessionTranscriptWrites,
 } from "../../../config/sessions/transcript-write-context.js";
+import { guardSessionManager } from "../../session-tool-result-guard-wrapper.js";
 import {
   SessionWriteLockStaleError,
   SessionWriteLockTimeoutError,
@@ -17,6 +19,7 @@ import {
   acquireSessionWriteLock,
   resetSessionWriteLockStateForTest,
 } from "../../session-write-lock.js";
+import { SessionManager } from "../../sessions/session-manager.js";
 import {
   acquireEmbeddedAttemptSessionFileOwner,
   createEmbeddedAttemptSessionLockController,
@@ -53,7 +56,75 @@ async function createTempSessionFile(): Promise<string> {
   return sessionFile;
 }
 
+function cloneBigIntStatWith(
+  stat: Awaited<ReturnType<typeof fs.stat>>,
+  fields: Partial<Awaited<ReturnType<typeof fs.stat>>>,
+): Awaited<ReturnType<typeof fs.stat>> {
+  return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, fields) as Awaited<
+    ReturnType<typeof fs.stat>
+  >;
+}
+
 describe("embedded attempt session lock lifecycle", () => {
+  it("recognizes an unchanged session file trusted by the previous prompt release", async () => {
+    const sessionFile = await createTempSessionFile();
+    const options = { ...lockOptions, sessionFile };
+    const first = await createEmbeddedAttemptSessionLockController({
+      acquireSessionWriteLock,
+      lockOptions: options,
+    });
+
+    expect(await first.readTrustedCurrentSessionFileSnapshot()).toBeUndefined();
+    await first.releaseForPrompt();
+    await first.dispose();
+
+    const second = await createEmbeddedAttemptSessionLockController({
+      acquireSessionWriteLock,
+      lockOptions: options,
+    });
+    expect(await second.readTrustedCurrentSessionFileSnapshot()).toBeDefined();
+    await second.dispose();
+  });
+
+  it("does not trust a session file changed after the previous prompt release", async () => {
+    const sessionFile = await createTempSessionFile();
+    const options = { ...lockOptions, sessionFile };
+    const first = await createEmbeddedAttemptSessionLockController({
+      acquireSessionWriteLock,
+      lockOptions: options,
+    });
+    await first.releaseForPrompt();
+    await first.dispose();
+    await fs.appendFile(sessionFile, '{"type":"message","id":"external"}\n', "utf8");
+
+    const second = await createEmbeddedAttemptSessionLockController({
+      acquireSessionWriteLock,
+      lockOptions: options,
+    });
+    expect(await second.readTrustedCurrentSessionFileSnapshot()).toBeUndefined();
+    await second.dispose();
+  });
+
+  it("publishes a known owned append for the next attempt", async () => {
+    const sessionFile = await createTempSessionFile();
+    const options = { ...lockOptions, sessionFile };
+    const first = await createEmbeddedAttemptSessionLockController({
+      acquireSessionWriteLock,
+      lockOptions: options,
+    });
+    await fs.appendFile(sessionFile, '{"type":"message","id":"owned"}\n', "utf8");
+    first.refreshAfterOwnedSessionWrite();
+    await first.releaseForPrompt();
+    await first.dispose();
+
+    const second = await createEmbeddedAttemptSessionLockController({
+      acquireSessionWriteLock,
+      lockOptions: options,
+    });
+    expect(await second.readTrustedCurrentSessionFileSnapshot()).toBeDefined();
+    await second.dispose();
+  });
+
   it("serializes embedded attempts that share a session file owner", async () => {
     const sessionFile = await createTempSessionFile();
     const firstOwner = await acquireEmbeddedAttemptSessionFileOwner({ sessionFile });
@@ -831,6 +902,152 @@ describe("embedded attempt session lock lifecycle", () => {
     expect(release).toHaveBeenCalledTimes(2);
   });
 
+  it("allows ctime-only fingerprint drift while the prompt lock is released", async () => {
+    const sessionFile = await createTempSessionFile();
+    const release = vi.fn(async () => {});
+    const acquireSessionWriteLockLocalCtimeDrift = vi.fn(async () => ({ release }));
+    const controller = await createEmbeddedAttemptSessionLockController({
+      acquireSessionWriteLock: acquireSessionWriteLockLocalCtimeDrift,
+      lockOptions: { ...lockOptions, sessionFile },
+    });
+
+    await controller.releaseForPrompt();
+
+    const stableStat = await fs.stat(sessionFile, { bigint: true });
+    const driftedStat = cloneBigIntStatWith(stableStat, {
+      ctimeNs: stableStat.ctimeNs + 1_000_000n,
+    });
+    const statSpy = vi.spyOn(fs, "stat").mockImplementation(async (target, options) => {
+      if (target === sessionFile && options?.bigint === true) {
+        return driftedStat;
+      }
+      throw new Error(`unexpected stat call for ${String(target)}`);
+    });
+
+    try {
+      await expect(controller.withSessionWriteLock(() => "finalize")).resolves.toBe("finalize");
+    } finally {
+      statSpy.mockRestore();
+    }
+    expect(controller.hasSessionTakeover()).toBe(false);
+    expect(acquireSessionWriteLockLocalCtimeDrift).toHaveBeenCalledTimes(2);
+    expect(release).toHaveBeenCalledTimes(2);
+  });
+
+  it("trusts owned writes after accepting ctime-only fingerprint drift", async () => {
+    const sessionFile = await createTempSessionFile();
+    const release = vi.fn(async () => {});
+    const acquireSessionWriteLockLocalOwnedAfterDrift = vi.fn(async () => ({ release }));
+    const controller = await createEmbeddedAttemptSessionLockController({
+      acquireSessionWriteLock: acquireSessionWriteLockLocalOwnedAfterDrift,
+      lockOptions: { ...lockOptions, sessionFile },
+    });
+
+    await controller.releaseForPrompt();
+
+    const stableStat = await fs.stat(sessionFile, { bigint: true });
+    const driftedStat = cloneBigIntStatWith(stableStat, {
+      ctimeNs: stableStat.ctimeNs + 1_000_000n,
+    });
+    const appendedText = '{"type":"message","id":"owned-after-drift"}\n';
+    const changedStat = cloneBigIntStatWith(stableStat, {
+      ctimeNs: stableStat.ctimeNs + 2_000_000n,
+      mtimeNs: stableStat.mtimeNs + 1_000_000n,
+      size: stableStat.size + BigInt(Buffer.byteLength(appendedText)),
+    });
+    let currentStat = driftedStat;
+    const statSpy = vi.spyOn(fs, "stat").mockImplementation(async (target, options) => {
+      if (target === sessionFile && options?.bigint === true) {
+        return currentStat;
+      }
+      throw new Error(`unexpected stat call for ${String(target)}`);
+    });
+
+    try {
+      await expect(
+        controller.withSessionWriteLock(
+          async () => {
+            currentStat = changedStat;
+            await fs.appendFile(sessionFile, appendedText, "utf8");
+          },
+          { publishOwnedWrite: true },
+        ),
+      ).resolves.toBeUndefined();
+      await expect(controller.withSessionWriteLock(() => "finalize")).resolves.toBe("finalize");
+    } finally {
+      statSpy.mockRestore();
+    }
+    expect(controller.hasSessionTakeover()).toBe(false);
+    expect(acquireSessionWriteLockLocalOwnedAfterDrift).toHaveBeenCalledTimes(3);
+    expect(release).toHaveBeenCalledTimes(3);
+  });
+
+  it("allows ctime-only fingerprint drift for large transcript snapshots", async () => {
+    const sessionFile = await createTempSessionFile();
+    await fs.writeFile(sessionFile, Buffer.alloc(8 * 1024 * 1024 + 1, "x"));
+    const release = vi.fn(async () => {});
+    const acquireSessionWriteLockLocalLargeCtimeDrift = vi.fn(async () => ({ release }));
+    const controller = await createEmbeddedAttemptSessionLockController({
+      acquireSessionWriteLock: acquireSessionWriteLockLocalLargeCtimeDrift,
+      lockOptions: { ...lockOptions, sessionFile },
+    });
+
+    await controller.releaseForPrompt();
+
+    const stableStat = await fs.stat(sessionFile, { bigint: true });
+    const driftedStat = cloneBigIntStatWith(stableStat, {
+      ctimeNs: stableStat.ctimeNs + 1_000_000n,
+    });
+    const statSpy = vi.spyOn(fs, "stat").mockImplementation(async (target, options) => {
+      if (target === sessionFile && options?.bigint === true) {
+        return driftedStat;
+      }
+      throw new Error(`unexpected stat call for ${String(target)}`);
+    });
+
+    try {
+      await expect(controller.withSessionWriteLock(() => "finalize")).resolves.toBe("finalize");
+    } finally {
+      statSpy.mockRestore();
+    }
+    expect(controller.hasSessionTakeover()).toBe(false);
+  });
+
+  it("rejects same-size transcript rewrites with restored mtime", async () => {
+    const sessionFile = await createTempSessionFile();
+    const release = vi.fn(async () => {});
+    const acquireSessionWriteLockLocalSameSizeRewrite = vi.fn(async () => ({ release }));
+    const controller = await createEmbeddedAttemptSessionLockController({
+      acquireSessionWriteLock: acquireSessionWriteLockLocalSameSizeRewrite,
+      lockOptions: { ...lockOptions, sessionFile },
+    });
+
+    await controller.releaseForPrompt();
+
+    const stableStat = await fs.stat(sessionFile, { bigint: true });
+    await fs.writeFile(sessionFile, '{"type":"sessioN"}\n', "utf8");
+    const driftedStat = cloneBigIntStatWith(stableStat, {
+      ctimeNs: stableStat.ctimeNs + 1_000_000n,
+    });
+    const statSpy = vi.spyOn(fs, "stat").mockImplementation(async (target, options) => {
+      if (target === sessionFile && options?.bigint === true) {
+        return driftedStat;
+      }
+      throw new Error(`unexpected stat call for ${String(target)}`);
+    });
+
+    try {
+      await expect(controller.withSessionWriteLock(() => "finalize")).rejects.toBeInstanceOf(
+        EmbeddedAttemptSessionTakeoverError,
+      );
+    } finally {
+      statSpy.mockRestore();
+    }
+    expect(controller.hasSessionTakeover()).toBe(true);
+    expect(acquireSessionWriteLockLocalSameSizeRewrite).toHaveBeenCalledTimes(2);
+    expect(release).toHaveBeenCalledTimes(2);
+  });
+
   it("still rejects external edits after the prompt stream lock is reacquired", async () => {
     const sessionFile = await createTempSessionFile();
     const release = vi.fn(async () => {});
@@ -887,6 +1104,90 @@ describe("embedded attempt session lock lifecycle", () => {
     expect(release).toHaveBeenCalledTimes(3);
   });
 
+  it("authorizes entry-cache advancement only under the exact trusted file lock", async () => {
+    const sessionFile = await createTempSessionFile();
+    const release = vi.fn(async () => {});
+    const acquireSessionWriteLockLocal = vi.fn(async () => ({ release }));
+    const controller = await createEmbeddedAttemptSessionLockController({
+      acquireSessionWriteLock: acquireSessionWriteLockLocal,
+      lockOptions: { ...lockOptions, sessionFile },
+    });
+
+    await controller.releaseForPrompt();
+    const stat = await fs.stat(sessionFile, { bigint: true });
+    const snapshot = {
+      dev: stat.dev,
+      ino: stat.ino,
+      size: stat.size,
+      mtimeNs: stat.mtimeNs,
+      ctimeNs: stat.ctimeNs,
+    };
+
+    expect(controller.canAdvanceSessionEntryCache(snapshot)).toBe(false);
+    await expect(
+      controller.withSessionWriteLock(() => {
+        expect(controller.canAdvanceSessionEntryCache(snapshot)).toBe(true);
+        return "locked";
+      }),
+    ).resolves.toBe("locked");
+    expect(controller.canAdvanceSessionEntryCache(snapshot)).toBe(false);
+  });
+
+  it("publishes an exact owned snapshot only while the write lock is active", async () => {
+    const sessionFile = await createTempSessionFile();
+    const controller = await createEmbeddedAttemptSessionLockController({
+      acquireSessionWriteLock: vi.fn(async () => ({
+        release: vi.fn(async () => {}),
+      })),
+      lockOptions: { ...lockOptions, sessionFile },
+    });
+    const readSnapshot = async () => {
+      const stat = await fs.stat(sessionFile, { bigint: true });
+      return {
+        dev: stat.dev,
+        ino: stat.ino,
+        size: stat.size,
+        mtimeNs: stat.mtimeNs,
+        ctimeNs: stat.ctimeNs,
+      };
+    };
+    const initialSnapshot = await readSnapshot();
+
+    expect(controller.publishOwnedSessionFileSnapshot(initialSnapshot)).toBe(false);
+    await controller.withSessionWriteLock(async () => {
+      expect(controller.publishOwnedSessionFileSnapshot(initialSnapshot)).toBe(true);
+      await fs.appendFile(sessionFile, '{"type":"message","id":"owned"}\n', "utf8");
+      expect(controller.publishOwnedSessionFileSnapshot(initialSnapshot)).toBe(false);
+      expect(controller.publishOwnedSessionFileSnapshot(await readSnapshot())).toBe(true);
+    });
+    expect(controller.publishOwnedSessionFileSnapshot(await readSnapshot())).toBe(false);
+    await controller.dispose();
+  });
+
+  it("publishes only an unchanged repair-validated snapshot while retaining the lock", async () => {
+    const sessionFile = await createTempSessionFile();
+    const acquireSessionWriteLockLocal = vi.fn(async () => ({
+      release: vi.fn(async () => {}),
+    }));
+    const controller = await createEmbeddedAttemptSessionLockController({
+      acquireSessionWriteLock: acquireSessionWriteLockLocal,
+      lockOptions: { ...lockOptions, sessionFile },
+    });
+    const stat = await fs.stat(sessionFile, { bigint: true });
+    const snapshot = {
+      dev: stat.dev,
+      ino: stat.ino,
+      size: stat.size,
+      mtimeNs: stat.mtimeNs,
+      ctimeNs: stat.ctimeNs,
+    };
+
+    expect(controller.publishValidatedSessionFileSnapshot(snapshot)).toBe(true);
+    await fs.appendFile(sessionFile, '{"type":"message","id":"external"}\n', "utf8");
+    expect(controller.publishValidatedSessionFileSnapshot(snapshot)).toBe(false);
+    await controller.dispose();
+  });
+
   it("refreshes the prompt fence after an owned session manager append", async () => {
     const sessionFile = await createTempSessionFile();
     const release = vi.fn(async () => {});
@@ -902,6 +1203,273 @@ describe("embedded attempt session lock lifecycle", () => {
 
     await expect(controller.withSessionWriteLock(() => "finalize")).resolves.toBe("finalize");
     expect(controller.hasSessionTakeover()).toBe(false);
+  });
+
+  it("refreshes the prompt fence after an owned session manager compaction append", async () => {
+    const sessionFile = await createTempSessionFile();
+    const release = vi.fn(async () => {});
+    const acquireSessionWriteLockLocal2 = vi.fn(async () => ({ release }));
+    const controller = await createEmbeddedAttemptSessionLockController({
+      acquireSessionWriteLock: acquireSessionWriteLockLocal2,
+      lockOptions: { ...lockOptions, sessionFile },
+    });
+    const sessionManager = guardSessionManager(SessionManager.open(sessionFile), {
+      withCompactionPersistence: (append, validateAppend) =>
+        controller.withOwnedSessionFileWrite(append, validateAppend),
+    });
+    const firstKeptEntryId = sessionManager.appendMessage({
+      role: "user",
+      content: "old question",
+      timestamp: 1,
+    });
+    sessionManager.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "old answer" }],
+      api: "messages",
+      provider: "openclaw",
+      model: "session-lock-test",
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "stop",
+      timestamp: 2,
+    });
+
+    await controller.releaseForPrompt();
+    sessionManager.appendCompaction("threshold summary", firstKeptEntryId, 160_001);
+
+    await expect(controller.withSessionWriteLock(() => "finalize")).resolves.toBe("finalize");
+    expect(controller.hasSessionTakeover()).toBe(false);
+  });
+
+  it("still rejects unowned external compaction appends before the prompt stream lock is reacquired", async () => {
+    const sessionFile = await createTempSessionFile();
+    const release = vi.fn(async () => {});
+    const acquireSessionWriteLockLocal1 = vi.fn(async () => ({ release }));
+    const controller = await createEmbeddedAttemptSessionLockController({
+      acquireSessionWriteLock: acquireSessionWriteLockLocal1,
+      lockOptions: { ...lockOptions, sessionFile },
+    });
+
+    await controller.releaseForPrompt();
+    await fs.appendFile(
+      sessionFile,
+      JSON.stringify({
+        type: "compaction",
+        id: "external-compaction",
+        parentId: "session",
+        timestamp: new Date().toISOString(),
+        summary: "external summary",
+        firstKeptEntryId: "session",
+        tokensBefore: 160_001,
+      }) + "\n",
+      "utf8",
+    );
+
+    await expect(controller.withSessionWriteLock(() => "finalize")).rejects.toBeInstanceOf(
+      EmbeddedAttemptSessionTakeoverError,
+    );
+    expect(controller.hasSessionTakeover()).toBe(true);
+  });
+
+  it("still rejects an external edit that happens before an owned session manager compaction append", async () => {
+    const sessionFile = await createTempSessionFile();
+    const release = vi.fn(async () => {});
+    const acquireSessionWriteLockLocal0 = vi.fn(async () => ({ release }));
+    const controller = await createEmbeddedAttemptSessionLockController({
+      acquireSessionWriteLock: acquireSessionWriteLockLocal0,
+      lockOptions: { ...lockOptions, sessionFile },
+    });
+    const sessionManager = guardSessionManager(SessionManager.open(sessionFile), {
+      withCompactionPersistence: (append, validateAppend) =>
+        controller.withOwnedSessionFileWrite(append, validateAppend),
+    });
+    const firstKeptEntryId = sessionManager.appendMessage({
+      role: "user",
+      content: "old question",
+      timestamp: 1,
+    });
+    sessionManager.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "old answer" }],
+      api: "messages",
+      provider: "openclaw",
+      model: "session-lock-test",
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "stop",
+      timestamp: 2,
+    });
+
+    await controller.releaseForPrompt();
+    await fs.appendFile(sessionFile, '{"type":"message","id":"external-edit"}\n', "utf8");
+    sessionManager.appendCompaction("threshold summary", firstKeptEntryId, 160_001);
+
+    await expect(controller.withSessionWriteLock(() => "finalize")).rejects.toBeInstanceOf(
+      EmbeddedAttemptSessionTakeoverError,
+    );
+    expect(controller.hasSessionTakeover()).toBe(true);
+  });
+
+  it("still rejects an external edit interleaved inside an owned session manager compaction append", async () => {
+    const sessionFile = await createTempSessionFile();
+    const release = vi.fn(async () => {});
+    const acquireSessionWriteLockLocal30 = vi.fn(async () => ({ release }));
+    const controller = await createEmbeddedAttemptSessionLockController({
+      acquireSessionWriteLock: acquireSessionWriteLockLocal30,
+      lockOptions: { ...lockOptions, sessionFile },
+    });
+    const sessionManager = guardSessionManager(SessionManager.open(sessionFile), {
+      withCompactionPersistence: (append, validateAppend) =>
+        controller.withOwnedSessionFileWrite(() => {
+          appendFileSync(sessionFile, '{"type":"message","id":"external-edit"}\n', "utf8");
+          return append();
+        }, validateAppend),
+    });
+    const firstKeptEntryId = sessionManager.appendMessage({
+      role: "user",
+      content: "old question",
+      timestamp: 1,
+    });
+    sessionManager.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "old answer" }],
+      api: "messages",
+      provider: "openclaw",
+      model: "session-lock-test",
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "stop",
+      timestamp: 2,
+    });
+
+    await controller.releaseForPrompt();
+    sessionManager.appendCompaction("threshold summary", firstKeptEntryId, 160_001);
+
+    await expect(controller.withSessionWriteLock(() => "finalize")).rejects.toBeInstanceOf(
+      EmbeddedAttemptSessionTakeoverError,
+    );
+    expect(controller.hasSessionTakeover()).toBe(true);
+  });
+
+  it("allows owned session manager compaction after a later controller advances the prompt fence", async () => {
+    const sessionFile = await createTempSessionFile();
+    const firstController = await createEmbeddedAttemptSessionLockController({
+      acquireSessionWriteLock: vi.fn(async () => ({ release: vi.fn(async () => {}) })),
+      lockOptions: { ...lockOptions, sessionFile },
+    });
+    await firstController.releaseForPrompt();
+    await firstController.dispose();
+
+    const release = vi.fn(async () => {});
+    const acquireSessionWriteLockLocal29 = vi.fn(async () => ({ release }));
+    const secondController = await createEmbeddedAttemptSessionLockController({
+      acquireSessionWriteLock: acquireSessionWriteLockLocal29,
+      lockOptions: { ...lockOptions, sessionFile },
+    });
+    const sessionManager = guardSessionManager(SessionManager.open(sessionFile), {
+      withCompactionPersistence: (append, validateAppend) =>
+        secondController.withOwnedSessionFileWrite(append, validateAppend),
+    });
+    const firstKeptEntryId = await secondController.withSessionWriteLock(() => {
+      const entryId = sessionManager.appendMessage({
+        role: "user",
+        content: "new question",
+        timestamp: 1,
+      });
+      sessionManager.appendMessage({
+        role: "assistant",
+        content: [{ type: "text", text: "new answer" }],
+        api: "messages",
+        provider: "openclaw",
+        model: "session-lock-test",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: "stop",
+        timestamp: 2,
+      });
+      return entryId;
+    });
+
+    await secondController.releaseForPrompt();
+    sessionManager.appendCompaction("threshold summary", firstKeptEntryId, 160_001);
+
+    await expect(secondController.withSessionWriteLock(() => "finalize")).resolves.toBe("finalize");
+    expect(secondController.hasSessionTakeover()).toBe(false);
+  });
+
+  it("allows owned session manager compaction after another controller publishes an owned write", async () => {
+    const sessionFile = await createTempSessionFile();
+    const firstController = await createEmbeddedAttemptSessionLockController({
+      acquireSessionWriteLock: vi.fn(async () => ({ release: vi.fn(async () => {}) })),
+      lockOptions: { ...lockOptions, sessionFile },
+    });
+    const sessionManager = guardSessionManager(SessionManager.open(sessionFile), {
+      withCompactionPersistence: (append, validateAppend) =>
+        firstController.withOwnedSessionFileWrite(append, validateAppend),
+    });
+    const firstKeptEntryId = sessionManager.appendMessage({
+      role: "user",
+      content: "old question",
+      timestamp: 1,
+    });
+    sessionManager.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "old answer" }],
+      api: "messages",
+      provider: "openclaw",
+      model: "session-lock-test",
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "stop",
+      timestamp: 2,
+    });
+    await firstController.releaseForPrompt();
+
+    const secondController = await createEmbeddedAttemptSessionLockController({
+      acquireSessionWriteLock: vi.fn(async () => ({ release: vi.fn(async () => {}) })),
+      lockOptions: { ...lockOptions, sessionFile },
+    });
+    await secondController.releaseForPrompt();
+    await secondController.withSessionWriteLock(
+      async () => {
+        await fs.appendFile(sessionFile, '{"type":"message","id":"owned-other"}\n', "utf8");
+      },
+      { publishOwnedWrite: true },
+    );
+    sessionManager.appendCompaction("threshold summary", firstKeptEntryId, 160_001);
+
+    await expect(firstController.withSessionWriteLock(() => "finalize")).resolves.toBe("finalize");
+    expect(firstController.hasSessionTakeover()).toBe(false);
   });
 
   it("allows post-prompt writes after the prompt context publishes an owned transcript write", async () => {

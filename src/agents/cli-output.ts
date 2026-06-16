@@ -8,6 +8,10 @@ import { normalizeStringEntries } from "@openclaw/normalization-core/string-norm
 import type { CliBackendConfig } from "../config/types.js";
 import { extractBalancedJsonFragments } from "../shared/balanced-json.js";
 import { isRecord } from "../utils.js";
+import type {
+  MessagingToolSend,
+  MessagingToolSourceReplyPayload,
+} from "./embedded-agent-messaging.types.js";
 
 type CliUsage = {
   input?: number;
@@ -24,6 +28,12 @@ export type CliOutput = {
   sessionId?: string;
   usage?: CliUsage;
   finalPromptText?: string;
+  didSendViaMessagingTool?: boolean;
+  didDeliverSourceReplyViaMessageTool?: boolean;
+  messagingToolSentTexts?: string[];
+  messagingToolSentMediaUrls?: string[];
+  messagingToolSentTargets?: MessagingToolSend[];
+  messagingToolSourceReplyPayloads?: MessagingToolSourceReplyPayload[];
 };
 
 /** Incremental assistant text emitted while parsing a streaming CLI response. */
@@ -53,7 +63,8 @@ function isClaudeCliProvider(providerId: string): boolean {
   return normalizeLowercaseStringOrEmpty(providerId) === "claude-cli";
 }
 
-function usesClaudeStreamJsonDialect(params: {
+/** Returns whether JSONL output carries correlated Claude-style tool events. */
+export function supportsCliJsonlToolEvents(params: {
   backend: CliBackendConfig;
   providerId: string;
 }): boolean {
@@ -67,7 +78,7 @@ function isClaudeStreamJsonResult(params: {
   providerId: string;
   parsed: Record<string, unknown>;
 }): boolean {
-  return usesClaudeStreamJsonDialect(params) && params.parsed.type === "result";
+  return supportsCliJsonlToolEvents(params) && params.parsed.type === "result";
 }
 
 function extractJsonObjectCandidates(raw: string): string[] {
@@ -368,7 +379,7 @@ function parseClaudeCliJsonlResult(params: {
   sessionId?: string;
   usage?: CliUsage;
 }): CliOutput | null {
-  if (!usesClaudeStreamJsonDialect(params)) {
+  if (!supportsCliJsonlToolEvents(params)) {
     return null;
   }
   if (
@@ -395,7 +406,7 @@ function parseClaudeCliStreamingDelta(params: {
   sessionId?: string;
   usage?: CliUsage;
 }): CliStreamingDelta | null {
-  if (!usesClaudeStreamJsonDialect(params)) {
+  if (!supportsCliJsonlToolEvents(params)) {
     return null;
   }
   if (params.parsed.type !== "stream_event" || !isRecord(params.parsed.event)) {
@@ -510,7 +521,7 @@ function dispatchClaudeCliStreamingToolEvent(params: {
   onToolUseStart?: (delta: CliToolUseStartDelta) => void;
   onToolResult?: (delta: CliToolResultDelta) => void;
 }): void {
-  if (!usesClaudeStreamJsonDialect(params)) {
+  if (!supportsCliJsonlToolEvents(params)) {
     return;
   }
   const tracker = params.tracker;
@@ -624,7 +635,6 @@ function dispatchClaudeCliStreamingToolEvent(params: {
   }
 }
 
-/** Creates an incremental JSONL parser for CLI streaming responses and tool events. */
 /** Creates a stateful parser for streaming JSONL CLI backend output. */
 export function createCliJsonlStreamingParser(params: {
   backend: CliBackendConfig;
@@ -632,14 +642,46 @@ export function createCliJsonlStreamingParser(params: {
   onAssistantDelta: (delta: CliStreamingDelta) => void;
   onToolUseStart?: (delta: CliToolUseStartDelta) => void;
   onToolResult?: (delta: CliToolResultDelta) => void;
+  onCommentaryText?: (text: string) => void;
 }) {
   let lineBuffer = "";
   let assistantText = "";
+  let pendingClaudeText = "";
   let sessionId: string | undefined;
   let usage: CliUsage | undefined;
   let output: CliOutput | null = null;
   const texts: string[] = [];
   const toolTracker = createToolUseTracker();
+  // Classification is keyed on consumer presence so reclassified pre-tool text
+  // always has a destination; a separate enable flag let it be dropped (#92092).
+  const classifyClaudeCommentary =
+    Boolean(params.onCommentaryText) && supportsCliJsonlToolEvents(params);
+
+  const flushPendingClaudeAssistantText = () => {
+    if (!pendingClaudeText) {
+      return;
+    }
+    const delta = pendingClaudeText;
+    pendingClaudeText = "";
+    assistantText = `${assistantText}${delta}`;
+    params.onAssistantDelta({
+      text: assistantText,
+      delta,
+      sessionId,
+      usage,
+    });
+  };
+
+  const flushPendingClaudeCommentaryText = () => {
+    if (!pendingClaudeText) {
+      return;
+    }
+    const text = pendingClaudeText.trim();
+    pendingClaudeText = "";
+    if (text) {
+      params.onCommentaryText?.(text);
+    }
+  };
 
   const handleParsedRecord = (parsed: Record<string, unknown>) => {
     sessionId = pickCliSessionId(parsed, params.backend) ?? sessionId;
@@ -655,6 +697,10 @@ export function createCliJsonlStreamingParser(params: {
       }) || !usage;
     if (shouldUseUsage) {
       usage = nextUsage ?? usage;
+    }
+
+    if (classifyClaudeCommentary && parsed.type === "result") {
+      flushPendingClaudeAssistantText();
     }
 
     const result = parseClaudeCliJsonlResult({
@@ -674,6 +720,19 @@ export function createCliJsonlStreamingParser(params: {
       const type = normalizeLowercaseStringOrEmpty(item.type);
       if (!type || type.includes("message")) {
         texts.push(item.text);
+      }
+    }
+
+    if (classifyClaudeCommentary && parsed.type === "stream_event" && isRecord(parsed.event)) {
+      const evt = parsed.event;
+      if (
+        evt.type === "content_block_start" &&
+        isRecord(evt.content_block) &&
+        isClaudeToolUseBlockType(evt.content_block.type)
+      ) {
+        flushPendingClaudeCommentaryText();
+      } else if (evt.type === "content_block_start" || evt.type === "message_stop") {
+        flushPendingClaudeAssistantText();
       }
     }
 
@@ -697,6 +756,10 @@ export function createCliJsonlStreamingParser(params: {
       usage,
     });
     if (!delta) {
+      return;
+    }
+    if (classifyClaudeCommentary) {
+      pendingClaudeText = `${pendingClaudeText}${delta.delta}`;
       return;
     }
     assistantText = delta.text;
@@ -741,6 +804,9 @@ export function createCliJsonlStreamingParser(params: {
     },
     finish() {
       flushLines(true);
+      if (classifyClaudeCommentary) {
+        flushPendingClaudeAssistantText();
+      }
     },
     getOutput() {
       if (output) {
