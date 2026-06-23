@@ -139,6 +139,8 @@ import {
   type OpenClawExecPolicyForCodexAppServer,
 } from "./config.js";
 import {
+  type CodexProjectedContextRange,
+  fitCodexProjectedContextForTurnStart,
   projectContextEngineAssemblyForCodex,
   resolveCodexContextEngineProjectionMaxChars,
   resolveCodexContextEngineProjectionReserveTokens,
@@ -149,7 +151,6 @@ import {
   filterCodexDynamicToolsForAllowlist,
   formatCodexDynamicToolBuildStageSummary,
   includeForcedCodexDynamicToolAllow,
-  isCodexNativeExecutionBlockedByNodeExecHost,
   resolveCodexAppServerHookChannelId,
   resolveCodexMessageToolProvider,
   resolveOpenClawCodingToolsSessionKeys,
@@ -179,6 +180,7 @@ import {
 import {
   filterCodexDynamicTools,
   resolveCodexDynamicToolsLoadingForModel,
+  resolveCodexDynamicToolsLoadingForRuntime,
 } from "./dynamic-tool-profile.js";
 import { createCodexDynamicToolBridge } from "./dynamic-tools.js";
 import { handleCodexAppServerElicitationRequest } from "./elicitation-bridge.js";
@@ -207,6 +209,7 @@ import {
   readCodexDynamicToolCallParams,
 } from "./protocol-validators.js";
 import {
+  flattenCodexDynamicToolFunctions,
   isJsonObject,
   type CodexSandboxPolicy,
   type CodexTurnEnvironmentParams,
@@ -217,6 +220,7 @@ import {
   type JsonObject,
   type JsonValue,
 } from "./protocol.js";
+import { resolveCodexProviderWebSearchSupport } from "./provider-capabilities.js";
 import { releaseCodexSandboxExecServerEnvironment } from "./sandbox-exec-server.js";
 import {
   clearCodexAppServerBinding,
@@ -234,6 +238,7 @@ import {
   buildTurnCollaborationMode,
   buildTurnStartParams,
   codexDynamicToolsFingerprint,
+  resolveCodexAppServerThreadModelSelection,
   type CodexAppServerThreadLifecycleBinding,
   type CodexContextEngineThreadBootstrapProjection,
 } from "./thread-lifecycle.js";
@@ -261,6 +266,7 @@ import {
   refreshCodexUsageLimitPromptError,
 } from "./usage-limit-error.js";
 import { createCodexUserInputBridge } from "./user-input-bridge.js";
+import { resolveCodexWebSearchPlan } from "./web-search.js";
 
 const CODEX_NATIVE_HOOK_RELAY_RENEW_INTERVAL_MS = 60_000;
 const CODEX_APP_SERVER_PROJECTED_CHARS_PER_TOKEN = 4;
@@ -629,18 +635,12 @@ export async function runCodexAppServerAttempt(
         startOptions: appServer.start,
       });
   preDynamicStartupStages.mark("auth-cache");
-  const nodeExecBlocksNativeExecution = isCodexNativeExecutionBlockedByNodeExecHost(params, {
-    agentId: sessionAgentId,
-    runtimeSessionKey: sandboxSessionKey,
-    sandbox,
-  });
-  preDynamicStartupStages.mark("native-exec-policy");
   const bundleMcpThreadConfig = await loadCodexBundleMcpThreadConfig({
     workspaceDir: effectiveWorkspace,
     cfg: params.config,
     toolsEnabled: supportsModelTools(params.model),
     disableTools: params.disableTools,
-    toolsAllow: nodeExecBlocksNativeExecution ? [] : params.toolsAllow,
+    toolsAllow: params.toolsAllow,
   });
   preDynamicStartupStages.mark("bundle-mcp");
   const sandboxExecServerEnabled = isCodexSandboxExecServerEnabled(pluginConfig);
@@ -650,6 +650,31 @@ export async function runCodexAppServerAttempt(
     sandboxExecServerEnabled,
   });
   preDynamicStartupStages.mark("native-tool-surface");
+  const nativeProviderWebSearchSupport =
+    resolveCodexWebSearchPlan({
+      config: params.config,
+      disableTools: params.disableTools,
+      nativeToolSurfaceEnabled,
+    }).kind === "native-hosted"
+      ? await resolveCodexProviderWebSearchSupport({
+          clientFactory: attemptClientFactory,
+          appServer,
+          authProfileId: startupAuthProfileId,
+          agentDir,
+          config: params.config,
+          modelProviderOverride: resolveCodexAppServerThreadModelSelection({
+            provider: params.provider,
+            model: params.modelId,
+            binding: startupBinding,
+            authProfileId: startupAuthProfileId,
+            authProfileStore: params.authProfileStore,
+            agentDir,
+            config: params.config,
+          }).modelProvider,
+          signal: runAbortController.signal,
+        })
+      : "unsupported";
+  preDynamicStartupStages.mark("provider-capabilities");
   for (const diagnostic of bundleMcpThreadConfig.diagnostics) {
     embeddedAgentLog.warn(`bundle-mcp: ${diagnostic.pluginId}: ${diagnostic.message}`);
   }
@@ -716,6 +741,8 @@ export async function runCodexAppServerAttempt(
           ...(onCodexToolOutcome ? { onToolOutcome: onCodexToolOutcome } : {}),
         }
       : params;
+  let persistentWebSearchAllowed: boolean | undefined;
+  let webSearchAllowed = false;
   const tools = await buildDynamicTools({
     params: dynamicToolParams,
     resolvedWorkspace,
@@ -724,6 +751,7 @@ export async function runCodexAppServerAttempt(
     sandboxSessionKey,
     sandbox,
     nativeToolSurfaceEnabled,
+    nativeProviderWebSearchSupport,
     runAbortController,
     sessionAgentId,
     pluginConfig,
@@ -732,6 +760,12 @@ export async function runCodexAppServerAttempt(
       yieldDetected = true;
     },
     onCodexAppServerEvent: (event) => emitCodexAppServerEvent(params, event),
+    onPersistentWebSearchPolicyResolved: (allowed) => {
+      persistentWebSearchAllowed = allowed;
+    },
+    onWebSearchPolicyResolved: (allowed) => {
+      webSearchAllowed = allowed;
+    },
   });
   const registeredTools = await buildDynamicTools({
     params: dynamicToolParams,
@@ -741,11 +775,13 @@ export async function runCodexAppServerAttempt(
     sandboxSessionKey,
     sandbox,
     nativeToolSurfaceEnabled,
+    nativeProviderWebSearchSupport,
     runAbortController,
     sessionAgentId,
     pluginConfig,
     profilerEnabled,
     forceHeartbeatTool: true,
+    ignoreDisableMessageTool: true,
     ignoreRuntimePlan: true,
     onYieldDetected: () => {
       yieldDetected = true;
@@ -756,8 +792,10 @@ export async function runCodexAppServerAttempt(
     tools,
     registeredTools,
     signal: runAbortController.signal,
-    loading: resolveCodexDynamicToolsLoadingForModel(pluginConfig, params.modelId),
-    directToolNames: shouldForceMessageTool(params) ? ["message"] : [],
+    loading: resolveCodexDynamicToolsLoadingForRuntime(pluginConfig, params.modelId, {
+      connectionClass: appServer.connectionClass,
+    }),
+    directToolNames: resolveCodexDynamicToolDirectNames(params),
     hookContext: {
       agentId: sessionAgentId,
       config: params.config,
@@ -823,6 +861,12 @@ export async function runCodexAppServerAttempt(
       sessionKey: contextSessionKey,
       sessionFile: activeSessionFile,
       runtimeContext: buildActiveContextEngineRuntimeContext(),
+      contextEngineHostSupport: CODEX_APP_SERVER_CONTEXT_ENGINE_HOST,
+      providerId: params.provider,
+      requestedModelId: params.requestedModelId,
+      modelId: params.modelId,
+      fallbackReason: params.fallbackReason,
+      degradedReason: params.degradedReason,
       runMaintenance: runHarnessContextEngineMaintenance,
       config: params.config,
       warn: (message) => embeddedAgentLog.warn(message),
@@ -854,8 +898,15 @@ export async function runCodexAppServerAttempt(
     skillsPrompt: params.skillsSnapshot?.prompt,
   });
   let promptText = params.prompt;
+  let promptContextRange: CodexProjectedContextRange | undefined;
   let developerInstructions = baseDeveloperInstructions;
   let prePromptMessageCount = historyMessages.length;
+  const codexContextProjectionMaxChars = resolveCodexContextEngineProjectionMaxChars({
+    contextTokenBudget: params.contextTokenBudget,
+    reserveTokens: resolveCodexContextEngineProjectionReserveTokens({
+      config: params.config,
+    }),
+  });
   let contextEngineProjection: CodexContextEngineThreadBootstrapProjection | undefined;
   let precomputedStaleBindingContinuityProjectionApplied = false;
   let staleBindingContinuityForcedFreshStart = false;
@@ -866,8 +917,10 @@ export async function runCodexAppServerAttempt(
       assembledMessages: historyMessages,
       originalHistoryMessages: historyMessages,
       prompt: params.prompt,
+      maxRenderedContextChars: codexContextProjectionMaxChars,
     });
     promptText = projection.promptText;
+    promptContextRange = projection.promptContextRange;
     prePromptMessageCount = projection.prePromptMessageCount;
   };
   const applyActiveContextEngineProjection = async (
@@ -883,10 +936,17 @@ export async function runCodexAppServerAttempt(
       messages: historyMessages,
       tokenBudget: params.contextTokenBudget,
       availableTools: new Set(
-        toolBridge.availableSpecs.map((tool) => tool.name).filter(isNonEmptyString),
+        flattenCodexDynamicToolFunctions(toolBridge.availableSpecs)
+          .map((tool) => tool.name)
+          .filter(isNonEmptyString),
       ),
       citationsMode: params.config?.memory?.citations,
       modelId: params.modelId,
+      contextEngineHostSupport: CODEX_APP_SERVER_CONTEXT_ENGINE_HOST,
+      providerId: params.provider,
+      requestedModelId: params.requestedModelId,
+      fallbackReason: params.fallbackReason,
+      degradedReason: params.degradedReason,
       prompt: params.prompt,
     });
     if (!assembled) {
@@ -900,12 +960,7 @@ export async function runCodexAppServerAttempt(
       originalHistoryMessages: historyMessages,
       prompt: params.prompt,
       systemPromptAddition: assembled.systemPromptAddition,
-      maxRenderedContextChars: resolveCodexContextEngineProjectionMaxChars({
-        contextTokenBudget: params.contextTokenBudget,
-        reserveTokens: resolveCodexContextEngineProjectionReserveTokens({
-          config: params.config,
-        }),
-      }),
+      maxRenderedContextChars: codexContextProjectionMaxChars,
       toolPayloadMode: contextEngineProjection ? "preserve" : "elide",
     });
     const projectionDecision = contextEngineProjection
@@ -937,6 +992,7 @@ export async function runCodexAppServerAttempt(
       developerInstructionAdditionChars: projection.developerInstructionAddition?.length ?? 0,
     });
     promptText = projectionDecision.project ? projection.promptText : params.prompt;
+    promptContextRange = projectionDecision.project ? projection.promptContextRange : undefined;
     developerInstructions = joinPresentSections(
       baseDeveloperInstructions,
       projection.developerInstructionAddition,
@@ -965,12 +1021,31 @@ export async function runCodexAppServerAttempt(
       messages: codexModelInputHistoryMessages,
       ctx: hookContext,
     });
+  const resolveShiftedPromptContextRange = (
+    prompt: string,
+    turnPromptText: string,
+  ): CodexProjectedContextRange | undefined => {
+    if (!promptContextRange || !prompt.endsWith(promptText) || !turnPromptText.endsWith(prompt)) {
+      return undefined;
+    }
+    const promptTextOffset = prompt.length - promptText.length;
+    const turnPromptOffset = turnPromptText.length - prompt.length + promptTextOffset;
+    return {
+      start: turnPromptOffset + promptContextRange.start,
+      end: turnPromptOffset + promptContextRange.end,
+    };
+  };
   let promptBuild = await buildPromptFromCurrentInputs();
-  const decorateCodexTurnPromptText = (prompt: string) =>
-    prependCodexOpenClawPromptContext(prompt, openClawPromptContext, {
+  const decorateCodexTurnPromptText = (prompt: string) => {
+    const turnPromptText = prependCodexOpenClawPromptContext(prompt, openClawPromptContext, {
       preservePromptWithoutContext:
         params.bootstrapContextMode === "lightweight" && params.bootstrapContextRunKind === "cron",
     });
+    return fitCodexProjectedContextForTurnStart({
+      promptText: turnPromptText,
+      contextRange: resolveShiftedPromptContextRange(prompt, turnPromptText),
+    });
+  };
   let codexTurnPromptText = decorateCodexTurnPromptText(promptBuild.prompt);
   const buildCodexTurnCollaborationDeveloperInstructions = () =>
     buildTurnCollaborationMode(params, {
@@ -1039,8 +1114,10 @@ export async function runCodexAppServerAttempt(
       assembledMessages: newerVisibleMessages,
       originalHistoryMessages: historyMessages,
       prompt: params.prompt,
+      maxRenderedContextChars: codexContextProjectionMaxChars,
     });
     promptText = projection.promptText;
+    promptContextRange = projection.promptContextRange;
     prePromptMessageCount = projection.prePromptMessageCount;
     return true;
   };
@@ -1117,6 +1194,11 @@ export async function runCodexAppServerAttempt(
     staleBindingContinuityForcedFreshStart =
       precomputedStaleBindingContinuityProjectionApplied &&
       !inactiveThreadBootstrapBindingForcedFreshStart;
+    if (staleBindingContinuityForcedFreshStart) {
+      // Once the native thread id is discarded, Codex no longer owns the
+      // pre-binding history; rebuild from the mirrored transcript.
+      applyFreshThreadContinuityProjection();
+    }
     if (activeContextEngine) {
       contextEngineProjection = undefined;
       try {
@@ -1269,10 +1351,13 @@ export async function runCodexAppServerAttempt(
       effectiveWorkspace,
       effectiveCwd,
       dynamicTools: toolBridge.specs,
+      persistentWebSearchAllowed,
+      webSearchAllowed,
       developerInstructions: promptBuild.developerInstructions,
       buildFinalConfigPatch: buildNativeHookRelayFinalConfigPatch,
       bundleMcpThreadConfig,
       nativeToolSurfaceEnabled,
+      nativeProviderWebSearchSupport,
       sandboxExecServerEnabled,
       sandbox,
       contextEngineProjection,
@@ -1310,7 +1395,7 @@ export async function runCodexAppServerAttempt(
     threadId: thread.threadId,
     authProfileId: startupAuthProfileId,
     workspaceDir: effectiveWorkspace,
-    toolCount: toolBridge.specs.length,
+    toolCount: flattenCodexDynamicToolFunctions(toolBridge.specs).length,
   });
   recordCodexTrajectoryContext(trajectoryRecorder, {
     attempt: params,
@@ -2759,6 +2844,12 @@ export async function runCodexAppServerAttempt(
           lastCallUsage: result.attemptUsage,
           promptCache: result.promptCache,
         }),
+        contextEngineHostSupport: CODEX_APP_SERVER_CONTEXT_ENGINE_HOST,
+        providerId: params.provider,
+        requestedModelId: params.requestedModelId,
+        modelId: params.modelId,
+        fallbackReason: params.fallbackReason,
+        degradedReason: params.degradedReason,
         runMaintenance: runHarnessContextEngineMaintenance,
         config: params.config,
         warn: (message) => embeddedAgentLog.warn(message),
@@ -3132,6 +3223,13 @@ function handleApprovalRequest(params: {
   });
 }
 
+function resolveCodexDynamicToolDirectNames(params: EmbeddedRunAttemptParams): string[] {
+  if (params.sourceReplyDeliveryMode !== "message_tool_only") {
+    return [];
+  }
+  return ["message"];
+}
+
 export const testing = {
   buildCodexNativeHookRelayId,
   buildDeveloperInstructions,
@@ -3145,6 +3243,7 @@ export const testing = {
   resolveOpenClawCodingToolsSessionKeys,
   shouldEnableCodexAppServerNativeToolSurface,
   shouldForceMessageTool,
+  resolveCodexDynamicToolDirectNames,
   hasPendingDynamicToolTerminalDiagnostic,
   toTranscriptToolResultForTests: toTranscriptToolResult,
   withCodexStartupTimeout,
