@@ -8,13 +8,18 @@ import ai.openclaw.app.GatewayConnectionDisplay
 import ai.openclaw.app.GatewayConnectionProblem
 import ai.openclaw.app.GatewayCronJobSummary
 import ai.openclaw.app.GatewayExecApprovalSummary
+import ai.openclaw.app.GatewayTalkSetupReadiness
+import ai.openclaw.app.GatewayTalkSetupState
 import ai.openclaw.app.GatewayUsageProviderSummary
 import ai.openclaw.app.LocationMode
 import ai.openclaw.app.MainViewModel
 import ai.openclaw.app.NotificationPackageFilterMode
 import ai.openclaw.app.SensitiveFeatureConfig
 import ai.openclaw.app.chat.ChatPendingToolCall
+import ai.openclaw.app.gatewayTalkSetupDescription
+import ai.openclaw.app.gatewayTalkSetupStatusText
 import ai.openclaw.app.hasPhotoReadPermission
+import ai.openclaw.app.isReady
 import ai.openclaw.app.loadAndroidLicenseNotices
 import ai.openclaw.app.node.DeviceNotificationListenerService
 import ai.openclaw.app.photoReadPermissionsForRequest
@@ -135,6 +140,7 @@ internal enum class SettingsRoute {
   Channels,
   Dreaming,
   Canvas,
+  Terminal,
   Notifications,
   PhoneCapabilities,
   Gateway,
@@ -167,6 +173,7 @@ internal fun SettingsDetailScreen(
     SettingsRoute.Channels -> ChannelsSettingsScreen(viewModel = viewModel, onBack = onBack)
     SettingsRoute.Dreaming -> DreamingSettingsScreen(viewModel = viewModel, onBack = onBack)
     SettingsRoute.Canvas -> CanvasSettingsScreen(viewModel = viewModel, onBack = onBack)
+    SettingsRoute.Terminal -> TerminalSettingsScreen(viewModel = viewModel, onBack = onBack)
     SettingsRoute.Notifications -> NotificationSettingsScreen(viewModel = viewModel, onBack = onBack)
     SettingsRoute.PhoneCapabilities -> PhoneCapabilitiesScreen(viewModel = viewModel, onBack = onBack)
     SettingsRoute.Gateway -> GatewaySettingsScreen(viewModel = viewModel, onBack = onBack)
@@ -407,14 +414,16 @@ private fun VoiceSettingsScreen(
   onBack: () -> Unit,
 ) {
   val speakerEnabled by viewModel.speakerEnabled.collectAsState()
-  val micEnabled by viewModel.micEnabled.collectAsState()
-  val talkModeEnabled by viewModel.talkModeEnabled.collectAsState()
+  val isConnected by viewModel.isConnected.collectAsState()
+  val talkSetupReadiness by viewModel.talkSetupReadiness.collectAsState()
+
+  LaunchedEffect(isConnected) {
+    if (isConnected) viewModel.refreshTalkSetupReadiness()
+  }
 
   SettingsDetailFrame(title = "Talk Provider Setup", subtitle = "Configure voice, transport, and playback.", icon = Icons.Default.Mic, onBack = onBack) {
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-      VoiceSetupPanel(
-        voiceActive = micEnabled || talkModeEnabled,
-      )
+      VoiceSetupPanel(talkSetupReadiness)
       Text(text = "Audio Test", style = ClawTheme.type.section, color = ClawTheme.colors.text)
       Text(text = "Check that OpenClaw can speak clearly on this phone.", style = ClawTheme.type.body, color = ClawTheme.colors.textMuted)
       SettingsWaveformPanel(active = speakerEnabled, onClick = ::playVoiceSetupTone)
@@ -433,31 +442,27 @@ private fun VoiceSettingsScreen(
 
 @Composable
 private fun VoiceSetupPanel(
-  voiceActive: Boolean,
+  readiness: GatewayTalkSetupReadiness,
 ) {
   Column(verticalArrangement = Arrangement.spacedBy(9.dp)) {
-    VoiceSetupActionRow(
-      title = "Realtime Provider",
-      subtitle = "Gateway voice relay",
-      icon = Icons.Default.GraphicEq,
-      statusText = if (voiceActive) "Live" else "Ready",
-      ready = true,
-    )
-    VoiceSetupActionRow(
-      title = "Voice",
-      subtitle = "Voice input",
-      icon = Icons.Default.Mic,
-      statusText = "Configured",
-      ready = true,
-    )
-    VoiceSetupActionRow(
-      title = "Transport",
-      subtitle = "Socket relay",
-      icon = Icons.Default.Bolt,
-      statusText = "Configured",
-      ready = true,
-    )
+    VoiceSetupReadinessRow(title = "Realtime Talk", state = readiness.realtimeTalk, icon = Icons.Default.GraphicEq)
+    VoiceSetupReadinessRow(title = "Dictation", state = readiness.dictation, icon = Icons.Default.Mic)
   }
+}
+
+@Composable
+private fun VoiceSetupReadinessRow(
+  title: String,
+  state: GatewayTalkSetupState,
+  icon: ImageVector,
+) {
+  VoiceSetupActionRow(
+    title = title,
+    subtitle = gatewayTalkSetupDescription(state),
+    icon = icon,
+    statusText = gatewayTalkSetupStatusText(state),
+    ready = state.isReady,
+  )
 }
 
 @Composable
@@ -971,10 +976,16 @@ private fun GatewaySettingsScreen(
     ClawPanel {
       Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Text(text = "Pair New Gateway", style = ClawTheme.type.section, color = ClawTheme.colors.text)
-        Text(text = "Clear this phone's saved gateway access and scan a fresh setup code.", style = ClawTheme.type.body, color = ClawTheme.colors.textMuted)
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-          ClawSecondaryButton(text = "Pair New Gateway", onClick = viewModel::pairNewGateway, modifier = Modifier.weight(1f), icon = Icons.Default.QrCode2)
-          ClawSecondaryButton(text = "Setup Code", onClick = { showSetupCodeHelp = !showSetupCodeHelp }, modifier = Modifier.weight(1f), icon = Icons.Default.Info)
+        Text(
+          text = "Clear this phone's saved gateway access and scan a fresh setup code.",
+          style = ClawTheme.type.body,
+          color = ClawTheme.colors.textMuted,
+          maxLines = 2,
+          overflow = TextOverflow.Ellipsis,
+        )
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+          ClawSecondaryButton(text = "Pair New Gateway", onClick = viewModel::pairNewGateway, modifier = Modifier.fillMaxWidth(), icon = Icons.Default.QrCode2)
+          ClawSecondaryButton(text = "Setup Code", onClick = { showSetupCodeHelp = !showSetupCodeHelp }, modifier = Modifier.fillMaxWidth(), icon = Icons.Default.Info)
         }
         if (showSetupCodeHelp) {
           Text(
@@ -989,18 +1000,18 @@ private fun GatewaySettingsScreen(
       Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text(text = "Connection Setup", style = ClawTheme.type.section, color = ClawTheme.colors.text)
         ClawTextField(value = setupCode, onValueChange = { setupCode = it }, placeholder = "Setup code")
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
           ClawTextField(value = hostInput, onValueChange = { hostInput = it }, placeholder = "Host", modifier = Modifier.weight(1f))
-          ClawTextField(value = portInput, onValueChange = { portInput = it }, placeholder = "Port", modifier = Modifier.weight(0.55f))
+          ClawTextField(value = portInput, onValueChange = { portInput = it }, placeholder = "Port", modifier = Modifier.weight(0.62f))
         }
         ClawSegmentedControl(
           options = listOf("Local", "TLS"),
           selected = if (tlsInput) "TLS" else "Local",
           onSelect = { selected -> tlsInput = selected == "TLS" },
         )
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
           ClawTextField(value = tokenInput, onValueChange = { tokenInput = it }, placeholder = "Token", modifier = Modifier.weight(1f))
-          ClawTextField(value = bootstrapTokenInput, onValueChange = { bootstrapTokenInput = it }, placeholder = "Bootstrap", modifier = Modifier.weight(1f))
+          ClawTextField(value = bootstrapTokenInput, onValueChange = { bootstrapTokenInput = it }, placeholder = "Bootstrap", modifier = Modifier.weight(1.05f))
         }
         ClawTextField(value = passwordInput, onValueChange = { passwordInput = it }, placeholder = "Password")
         validationText?.let {
@@ -1684,8 +1695,23 @@ internal fun SettingsMetricPanel(rows: List<SettingsMetric>) {
   ClawPanel(contentPadding = PaddingValues(horizontal = 14.dp, vertical = 4.dp)) {
     ClawSeparatedColumn(items = rows) { row ->
       Row(modifier = Modifier.fillMaxWidth().heightIn(min = 50.dp).padding(horizontal = 0.dp, vertical = 7.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text(text = row.title, style = ClawTheme.type.body, color = ClawTheme.colors.text, modifier = Modifier.weight(1f), maxLines = 1)
-        Text(text = row.value, style = ClawTheme.type.caption.copy(fontSize = 13.sp, lineHeight = 17.sp), color = ClawTheme.colors.textMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text(
+          text = row.title,
+          style = ClawTheme.type.body,
+          color = ClawTheme.colors.text,
+          modifier = Modifier.weight(0.9f),
+          maxLines = 1,
+          overflow = TextOverflow.Ellipsis,
+        )
+        Text(
+          text = row.value,
+          style = ClawTheme.type.caption.copy(fontSize = 13.sp, lineHeight = 17.sp),
+          color = ClawTheme.colors.textMuted,
+          modifier = Modifier.weight(1.1f),
+          maxLines = 1,
+          overflow = TextOverflow.Ellipsis,
+          textAlign = TextAlign.End,
+        )
       }
     }
   }

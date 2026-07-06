@@ -7,8 +7,6 @@ import {
 } from "openclaw/plugin-sdk/plugin-state-test-runtime";
 import { setReplyPayloadMetadata } from "openclaw/plugin-sdk/reply-payload-testing";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { buildInboundUserContextPrefix } from "../../../src/auto-reply/reply/inbound-meta.js";
-import { buildReplyPromptEnvelopeBase } from "../../../src/auto-reply/reply/prompt-prelude.js";
 import { resolveAutoTopicLabelConfig as resolveAutoTopicLabelConfigRuntime } from "./auto-topic-label-config.js";
 import type { TelegramBotDeps } from "./bot-deps.js";
 import {
@@ -28,8 +26,6 @@ import type { TelegramRuntime } from "./runtime.types.js";
 type DispatchReplyWithBufferedBlockDispatcherArgs = Parameters<
   TelegramBotDeps["dispatchReplyWithBufferedBlockDispatcher"]
 >[0];
-type RoomEventPromptContext = Parameters<typeof buildInboundUserContextPrefix>[0] &
-  Parameters<typeof buildReplyPromptEnvelopeBase>[0]["ctx"];
 
 const createTelegramDraftStream = vi.hoisted(() => vi.fn());
 const dispatchReplyWithBufferedBlockDispatcher = vi.hoisted(() =>
@@ -425,23 +421,6 @@ describe("dispatchTelegramMessage draft streaming", () => {
     expect(calls.length).toBeGreaterThan(0);
     const preview = calls[calls.length - 1][0] as { text?: string };
     expect(preview.text).toBe(barText);
-  }
-
-  function renderRoomEventPromptText(ctx: RoomEventPromptContext): string {
-    const inboundUserContext = buildInboundUserContextPrefix(ctx);
-    return (
-      buildReplyPromptEnvelopeBase({
-        ctx,
-        sessionCtx: ctx,
-        baseBody: ctx.BodyForAgent ?? ctx.Body ?? ctx.RawBody ?? "",
-        hasUserBody: true,
-        inboundUserContext,
-        isBareSessionReset: false,
-        startupAction: "new",
-        inboundEventKind: "room_event",
-        sourceReplyDeliveryMode: "message_tool_only",
-      }).currentInboundContext?.text ?? ""
-    );
   }
 
   function createContext(overrides?: Partial<TelegramMessageContext>): TelegramMessageContext {
@@ -1275,12 +1254,14 @@ describe("dispatchTelegramMessage draft streaming", () => {
     const dispatchParams = mockCallArg(
       dispatchReplyWithBufferedBlockDispatcher,
     ) as DispatchReplyWithBufferedBlockDispatcherArgs;
-    const promptText = renderRoomEventPromptText(dispatchParams.ctx as RoomEventPromptContext);
-    expect(promptText).toContain("[OpenClaw room event]");
-    expect(promptText).toContain("Current event:\n#27787 Cara: ambient current");
-    expect(promptText).not.toContain("persisted recovered ambient");
-    expect(promptText).not.toContain("Chat history since last reply");
+    expect(dispatchParams.ctx).toMatchObject({
+      BodyForAgent: "ambient current",
+      InboundEventKind: "room_event",
+      MessageSid: "27787",
+      SenderName: "Cara",
+    });
     expect(dispatchParams.ctx.InboundHistory).toBeUndefined();
+    expect(dispatchParams.ctx.UntrustedStructuredContext).toBeUndefined();
   });
 
   it("moves recovered user-request history out of the original topic", async () => {
@@ -2785,6 +2766,59 @@ describe("dispatchTelegramMessage draft streaming", () => {
     expect(deliverReplies).toHaveBeenCalledTimes(1);
   });
 
+  it("sends an error fallback when dispatch fails after only partial output", async () => {
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(async ({ dispatcherOptions }) => {
+      await dispatcherOptions.deliver({ text: "partial answer" }, { kind: "block" });
+      throw new Error("dispatch failed after partial output");
+    });
+
+    await dispatchWithContext({
+      context: createContext({
+        ctxPayload: createDirectSessionPayload(),
+      }),
+      streamMode: "off",
+    });
+
+    expect(deliverReplies).toHaveBeenCalledTimes(2);
+    expectDeliveredReply(0, { text: "partial answer" });
+    expectDeliveredReply(
+      0,
+      {
+        text: "Something went wrong while processing your request. Please try again.",
+      },
+      1,
+    );
+  });
+
+  it("returns retryable when dispatch fails after partial output and the fallback is not delivered", async () => {
+    deliverReplies.mockResolvedValueOnce({ delivered: true });
+    deliverReplies.mockResolvedValueOnce({ delivered: false });
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(async ({ dispatcherOptions }) => {
+      await dispatcherOptions.deliver({ text: "partial answer" }, { kind: "block" });
+      throw new Error("dispatch failed after partial output");
+    });
+
+    const result = await dispatchWithContext({
+      context: createContext({
+        ctxPayload: createDirectSessionPayload(),
+      }),
+      retryDispatchErrors: true,
+      streamMode: "off",
+    });
+
+    expect(result).toMatchObject({ kind: "failed-retryable" });
+    expect((result as { error?: unknown }).error).toBeInstanceOf(Error);
+    expect(deliverReplies).toHaveBeenCalledTimes(2);
+    expectDeliveredReply(0, { text: "partial answer" });
+    expectDeliveredReply(
+      0,
+      {
+        text: "Something went wrong while processing your request. Please try again.",
+      },
+      1,
+    );
+  });
+
   it("returns retryable when spooled replay suppresses fallback after non-silent delivery skip", async () => {
     dispatchReplyWithBufferedBlockDispatcher.mockImplementation(async ({ dispatcherOptions }) => {
       dispatcherOptions.onSkip?.({ text: "final answer" }, { kind: "final", reason: "empty" });
@@ -4101,6 +4135,37 @@ describe("dispatchTelegramMessage draft streaming", () => {
         "<b>Shelling</b>\n<b>🛠️ Exec</b>\n🧠 <i>Checking files</i>",
       ),
     );
+  });
+
+  it("renders CLI thinking token progress in the Telegram progress draft", async () => {
+    const draftStream = createSequencedDraftStream(2001);
+    createTelegramDraftStream.mockReturnValue(draftStream);
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(
+      async ({ dispatcherOptions, replyOptions }) => {
+        await replyOptions?.onReplyStart?.();
+        await replyOptions?.onAssistantMessageStart?.();
+        await replyOptions?.onReasoningProgress?.({ progressTokens: 50 });
+        await replyOptions?.onReasoningProgress?.({ progressTokens: 200 });
+        await dispatcherOptions.deliver({ text: "Done" }, { kind: "final" });
+        return { queuedFinal: true };
+      },
+    );
+
+    await dispatchWithContext({
+      context: createContext(),
+      streamMode: "progress",
+      telegramCfg: { streaming: { mode: "progress", progress: { label: "Shelling" } } },
+    });
+
+    expect(createTelegramDraftStream).toHaveBeenCalledTimes(1);
+    expect(draftStream.updatePreview).toHaveBeenLastCalledWith(
+      telegramProgressPreview(
+        "Shelling\n\n🧠 Thinking… (~200 tokens)",
+        "<b>Shelling</b>\n<b>🧠 Thinking… (~200 tokens)</b>",
+      ),
+    );
+    expectWindowCollapsedTo(draftStream, "🧠 1 thought · ⏱️ 1s");
+    expectDeliveredReply(0, { text: "Done" });
   });
 
   it("renders model markdown in streamed reasoning and commentary lanes", async () => {

@@ -575,6 +575,7 @@ export function buildInboundUserContextPrefix(
     e164: normalizePromptMetadataString(ctx.SenderE164),
     is_bot: typeof ctx.SenderIsBot === "boolean" ? ctx.SenderIsBot : undefined,
   };
+  const botUsername = normalizePromptMetadataString(ctx.BotUsername);
 
   // Keep volatile conversation/message identifiers in the user-role block so the system
   // prompt stays byte-stable across task-scoped sessions and reply turns.
@@ -605,6 +606,10 @@ export function buildInboundUserContextPrefix(
     topic_name: normalizePromptMetadataString(ctx.TopicName) ?? undefined,
     is_forum: ctx.IsForum === true ? true : undefined,
     ...buildConversationMentionMetadataPayload(ctx, isDirect),
+    explicit_bot_mention_note:
+      ctx.ExplicitlyMentionedBot === true && botUsername
+        ? `The incoming message explicitly mentions your channel identity @${botUsername}. Treat that mention as addressed to you, even if your persona name differs.`
+        : undefined,
     has_reply_context:
       replyChainPayload.length > 0 || sanitizePromptBody(ctx.ReplyToBody) ? true : undefined,
     has_forwarded_context: normalizePromptMetadataString(ctx.ForwardedFrom) ? true : undefined,
@@ -687,21 +692,31 @@ export function buildInboundUserContextPrefix(
   }
 
   if (boundedHistory.length > 0 && !chatWindowCoversHistory) {
-    blocks.push(
-      formatUntrustedJsonBlock(
-        "Chat history since last reply (untrusted, for context):",
-        boundedHistory.map((entry) => {
-          const media = buildInboundHistoryMediaPromptPayload(entry.media);
-          return {
-            sender: sanitizePromptBody(entry.sender),
-            timestamp_ms: entry.timestamp,
-            message_id: normalizePromptMetadataString(entry.messageId),
-            body: sanitizePromptBody(entry.body),
-            media: media.length > 0 ? media : undefined,
-          };
-        }),
-      ),
-    );
+    const historyLines = boundedHistory.flatMap((entry) => {
+      const mediaTypes = [
+        ...new Set(
+          buildInboundHistoryMediaPromptPayload(entry.media)
+            .map((media) => media["content_type"])
+            .filter((value): value is string => typeof value === "string"),
+        ),
+      ];
+      const line = formatChatWindowMessage(
+        {
+          message_id: entry.messageId,
+          sender: entry.sender,
+          timestamp_ms: entry.timestamp,
+          body: entry.body,
+          media_type: mediaTypes.length > 0 ? mediaTypes.join(", ") : undefined,
+        },
+        envelope,
+      );
+      return line ? [line] : [];
+    });
+    if (historyLines.length > 0) {
+      blocks.push(
+        ["Chat history since last reply (untrusted, for context):", ...historyLines].join("\n"),
+      );
+    }
   }
 
   if (currentMessageContext) {

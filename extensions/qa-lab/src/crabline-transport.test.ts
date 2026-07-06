@@ -71,7 +71,8 @@ describe("crabline transport", () => {
       });
 
       try {
-        await transport.sendNativeCommand({
+        expect(transport.sendNativeCommand).toBeTypeOf("function");
+        await transport.sendNativeCommand?.({
           command: "stop",
           conversation: { id: "alice", kind: "direct" },
           senderId: "alice",
@@ -103,6 +104,67 @@ describe("crabline transport", () => {
     });
   });
 
+  it("observes Telegram preview edits through the shared transport adapter", async () => {
+    await withTempDir("qa-crabline-transport-", async (outputDir) => {
+      const transport = await createQaCrablineTransportAdapter({
+        outputDir,
+        selection: createSelection(),
+        state: createQaBusState(),
+      });
+
+      try {
+        const manifest = JSON.parse(
+          await fs.readFile(path.join(outputDir, OPENCLAW_CRABLINE_MANIFEST_PATH), "utf8"),
+        ) as {
+          botToken: string;
+          endpoints: { apiRoot: string };
+        };
+        const postTelegram = async (method: string, body: Record<string, unknown>) => {
+          const response = await fetch(
+            `${manifest.endpoints.apiRoot}/bot${manifest.botToken}/${method}`,
+            {
+              body: JSON.stringify(body),
+              headers: { "content-type": "application/json" },
+              method: "POST",
+            },
+          );
+          expect(response.ok).toBe(true);
+          return (await response.json()) as { result: { message_id: number } };
+        };
+        const sent = await postTelegram("sendMessage", {
+          chat_id: "-1001234567890",
+          message_thread_id: 42,
+          text: "preview text",
+        });
+        expect(transport.state.searchMessages({ query: "preview text" })).toEqual([
+          expect.objectContaining({ text: "preview text" }),
+        ]);
+        await postTelegram("editMessageText", {
+          chat_id: "-1001234567890",
+          message_id: sent.result.message_id,
+          text: "final marker",
+        });
+
+        expect(transport.waitForOutboundSequence).toBeTypeOf("function");
+        await expect(
+          transport.waitForOutboundSequence!({
+            conversationId: "-1001234567890",
+            finalSettleMs: 0,
+            finalTextIncludes: "final marker",
+            minimumPreviewEvents: 1,
+            threadId: "42",
+            timeoutMs: 1_000,
+          }),
+        ).resolves.toMatchObject({
+          events: [{ kind: "sent" }, { kind: "edited" }],
+          final: { text: "final marker", threadId: "42" },
+        });
+      } finally {
+        await transport.cleanup?.();
+      }
+    });
+  });
+
   it("configures OpenClaw's Slack plugin against a Crabline local provider server", async () => {
     await withTempDir("qa-crabline-transport-", async (outputDir) => {
       const transport = await createQaCrablineTransportAdapter({
@@ -114,6 +176,8 @@ describe("crabline transport", () => {
       try {
         expect(transport.id).toBe("crabline");
         expect(transport.requiredPluginIds).toEqual(["slack"]);
+        expect(transport.sendNativeCommand).toBeUndefined();
+        expect(transport.waitForOutboundSequence).toBeUndefined();
         expect(transport.createGatewayConfig({ baseUrl: "http://127.0.0.1:1" })).toMatchObject({
           channels: {
             slack: {

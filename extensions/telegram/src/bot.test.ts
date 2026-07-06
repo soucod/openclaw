@@ -310,6 +310,7 @@ describe("createTelegramBot", () => {
         can_read_all_group_messages: false,
         can_manage_bots: false,
         supports_inline_queries: false,
+        supports_join_request_queries: false,
         can_connect_to_business: false,
         has_main_web_app: false,
         has_topics_enabled: false,
@@ -2107,6 +2108,7 @@ describe("createTelegramBot", () => {
       () => "telegram:default:42",
     );
     telegramBotDepsForTest.readAmbientTranscriptWatermark = vi.fn(() => ({
+      sessionId: "session-current",
       messageId: "502",
       timestampMs: 1_736_380_860_000,
       updatedAt: 1_736_380_900_000,
