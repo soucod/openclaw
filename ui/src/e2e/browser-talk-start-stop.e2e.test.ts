@@ -1,4 +1,6 @@
 // Control UI E2E tests cover browser Talk start and stop through a real page.
+import { mkdir } from "node:fs/promises";
+import path from "node:path";
 import { chromium, type Page } from "playwright";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
@@ -59,6 +61,10 @@ async function installTalkBrowserFixtures(page: Page) {
         return { connect() {}, disconnect() {} };
       }
 
+      createGain() {
+        return { connect() {}, disconnect() {}, gain: { value: 1 } };
+      }
+
       createScriptProcessor() {
         const processor = { connect() {}, disconnect() {}, onaudioprocess: null };
         state.inputProcessor = processor;
@@ -90,6 +96,14 @@ async function installTalkBrowserFixtures(page: Page) {
       value: state,
     });
   });
+}
+
+async function captureComposerProof(page: Page, fileName: string) {
+  const artifactDir = path.join(process.cwd(), ".artifacts", "control-ui-e2e", "voice-controls");
+  await mkdir(artifactDir, { recursive: true });
+  await page
+    .locator(".agent-chat__composer-shell")
+    .screenshot({ path: path.join(artifactDir, fileName) });
 }
 
 async function installBlockedMicrophoneFixture(page: Page) {
@@ -141,23 +155,18 @@ describeControlUiE2e("Control UI browser Talk", () => {
 
     try {
       await page.emulateMedia({ reducedMotion: "reduce" });
-      await page.goto(`${server.baseUrl}chat`);
-      await page.setViewportSize({ width: 320, height: 720 });
-      await expect
-        .poll(() => page.getByRole("button", { name: "Microphone input" }).count())
-        .toBe(0);
-      const settings = page.getByRole("button", { name: "Chat settings" });
-      await settings.click();
-      const settingsDialog = page.getByRole("dialog", { name: "Chat settings" });
-      const microphoneSelect = settingsDialog.locator('[data-talk-select="microphone"] select');
+      // The microphone picker lives on the Settings appearance page; the
+      // selection persists and applies to talk sessions started from chat.
+      await page.goto(`${server.baseUrl}settings/appearance`);
+      const microphoneSelect = page.locator("[data-settings-microphone]");
       await expect
         .poll(async () =>
           (await microphoneSelect.locator("option").allTextContents()).map((label) => label.trim()),
         )
         .toEqual(["System default", "Built-in Microphone", "USB Audio Interface"]);
       await microphoneSelect.selectOption("usb");
-      await settings.click();
-      await expect.poll(() => settingsDialog.isVisible()).toBe(false);
+      await page.goto(`${server.baseUrl}chat`);
+      await page.setViewportSize({ width: 320, height: 720 });
       await page.getByRole("button", { name: "Start voice input" }).click();
 
       const createRequest = await gateway.waitForRequest("talk.client.create");
@@ -173,7 +182,16 @@ describeControlUiE2e("Control UI browser Talk", () => {
               ).openclawTalkE2eState?.constraints,
           ),
         )
-        .toEqual([{ audio: { deviceId: { exact: "usb" } } }]);
+        .toEqual([
+          {
+            audio: {
+              autoGainControl: true,
+              deviceId: { exact: "usb" },
+              echoCancellation: true,
+              noiseSuppression: true,
+            },
+          },
+        ]);
       await expect
         .poll(async () =>
           (await gateway.getSocketUrls()).filter((url) => url.includes("BidiGenerateContent")),
@@ -185,6 +203,17 @@ describeControlUiE2e("Control UI browser Talk", () => {
       await expect
         .poll(() => page.locator('.agent-chat__voice-activity[data-status="connecting"]').count())
         .toBe(1);
+      // The level meter renders inside the stop-voice pill button, not as a
+      // separate floating row above the composer.
+      await expect
+        .poll(() =>
+          page.locator('button[aria-label="Stop voice input"] .agent-chat__voice-activity').count(),
+        )
+        .toBe(1);
+      // Phone widths keep the pill wide enough for the 7-bar meter instead of
+      // collapsing it to the generic 44px square control size.
+      const pillBox = await page.getByRole("button", { name: "Stop voice input" }).boundingBox();
+      expect(pillBox?.width ?? 0).toBeGreaterThanOrEqual(60);
       await expect
         .poll(() =>
           page
@@ -206,7 +235,7 @@ describeControlUiE2e("Control UI browser Talk", () => {
         .toBe(1);
       await expect.poll(() => page.locator(".agent-chat__talk-status-text").count()).toBe(0);
       await expect
-        .poll(() => page.locator('[role="status"] .agent-chat__sr-only').textContent())
+        .poll(() => page.locator('[role="status"].agent-chat__voice-status').textContent())
         .toBe("Listening...");
       const reducedMotionTransform = await page
         .locator(".agent-chat__voice-activity-bar")
@@ -281,6 +310,126 @@ describeControlUiE2e("Control UI browser Talk", () => {
     }
   });
 
+  it("keeps stop-voice and stop-run controls visually distinct while both are active", async () => {
+    const browser = await chromium.launch({ executablePath: chromiumExecutablePath });
+    const context = await browser.newContext({ permissions: ["microphone"] });
+    const page = await context.newPage();
+    const gateway = await installMockGateway(page, {
+      deferredMethods: ["chat.send"],
+      methodResponses: {
+        "talk.client.create": {
+          provider: "google",
+          transport: "provider-websocket",
+          protocol: "google-live-bidi",
+          // Fake harness token, assembled so secret scanners do not flag it.
+          clientSecret: ["auth_tokens", "browser-talk-e2e"].join("/"),
+          websocketUrl:
+            "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained",
+          audio: {
+            inputEncoding: "pcm16",
+            inputSampleRateHz: 16_000,
+            outputEncoding: "pcm16",
+            outputSampleRateHz: 24_000,
+          },
+        },
+      },
+    });
+    await installTalkBrowserFixtures(page);
+
+    try {
+      await page.goto(`${server.baseUrl}chat`);
+      await page.setViewportSize({ width: 1366, height: 900 });
+
+      await page.getByRole("button", { name: "Start voice input" }).click();
+      await gateway.waitForRequest("talk.client.create");
+      await gateway.deliverLatest({ setupComplete: {} });
+      const stopVoice = page.getByRole("button", { name: "Stop voice input" });
+      await expect.poll(() => stopVoice.isVisible()).toBe(true);
+      await page.evaluate(() => {
+        const state = (
+          window as Window & {
+            openclawTalkE2eState?: {
+              inputProcessor?: {
+                onaudioprocess?: (event: {
+                  inputBuffer: { getChannelData: () => Float32Array };
+                }) => void;
+              };
+              meterLevel?: number;
+            };
+          }
+        ).openclawTalkE2eState;
+        if (state) {
+          state.meterLevel = 0.25;
+        }
+        state?.inputProcessor?.onaudioprocess?.({
+          inputBuffer: { getChannelData: () => new Float32Array(4096).fill(0.25) },
+        });
+      });
+      await expect
+        .poll(async () =>
+          Number(await page.locator(".agent-chat__voice-activity").getAttribute("data-level")),
+        )
+        .toBeGreaterThan(0);
+      await captureComposerProof(page, "01-voice-live-listening.png");
+
+      // Enter-sends while voice is active; the deferred chat.send keeps the
+      // run abortable so both stop controls render side by side.
+      const textarea = page.locator(".agent-chat__input textarea");
+      await textarea.fill("Keep working on the report");
+      await textarea.press("Enter");
+      const sendRequest = await gateway.waitForRequest("chat.send");
+      const runId =
+        typeof sendRequest.params === "object" &&
+        sendRequest.params !== null &&
+        "idempotencyKey" in sendRequest.params
+          ? String(sendRequest.params.idempotencyKey)
+          : "";
+      await gateway.resolveDeferred("chat.send", { runId, status: "started" });
+      await gateway.emitGatewayEvent("chat", {
+        deltaText: "Working on it.",
+        message: {
+          content: [{ text: "Working on it.", type: "text" }],
+          role: "assistant",
+          timestamp: Date.now(),
+        },
+        runId,
+        sessionKey: "main",
+        state: "delta",
+      });
+      const stopRun = page.getByRole("button", { name: "Stop generating" });
+      await expect.poll(() => stopRun.isVisible()).toBe(true);
+      await expect.poll(() => stopVoice.isVisible()).toBe(true);
+
+      expect(
+        await stopVoice.evaluate((node) => node.classList.contains("chat-send-btn--voice-live")),
+      ).toBe(true);
+      expect(
+        await stopVoice.evaluate((node) => node.classList.contains("chat-send-btn--stop")),
+      ).toBe(false);
+      expect(await stopVoice.locator(".agent-chat__voice-activity").count()).toBe(1);
+      expect(await page.locator(".chat-send-btn--stop").count()).toBe(1);
+      await captureComposerProof(page, "02-voice-plus-run-stop.png");
+
+      await page.emulateMedia({ colorScheme: "dark" });
+      await expect
+        .poll(() => page.evaluate(() => document.documentElement.dataset.themeMode))
+        .toBe("dark");
+      await captureComposerProof(page, "03-voice-plus-run-stop-dark.png");
+
+      await stopVoice.hover();
+      await captureComposerProof(page, "04-voice-live-hover-stop-glyph.png");
+
+      // Stopping voice must leave the run (and its stop control) untouched.
+      await stopVoice.click();
+      await expect.poll(() => stopVoice.count()).toBe(0);
+      await expect.poll(() => stopRun.isVisible()).toBe(true);
+      expect(await gateway.getRequests("chat.abort")).toHaveLength(0);
+    } finally {
+      await context.close();
+      await browser.close();
+    }
+  });
+
   it("renders streamed relay assistant transcript deltas as readable text", async () => {
     const browser = await chromium.launch({ executablePath: chromiumExecutablePath });
     const context = await browser.newContext({ permissions: ["microphone"] });
@@ -310,7 +459,24 @@ describeControlUiE2e("Control UI browser Talk", () => {
       await page.setViewportSize({ width: 1366, height: 900 });
       await page.getByRole("button", { name: "Start voice input" }).click();
       await gateway.waitForRequest("talk.client.create");
+      // The request is recorded before its mock response is delivered. Wait for
+      // microphone setup before probing relay readiness below.
+      await expect
+        .poll(() =>
+          page.evaluate(
+            () =>
+              (
+                window as Window & {
+                  openclawTalkE2eState?: { constraints: unknown[] };
+                }
+              ).openclawTalkE2eState?.constraints.length,
+          ),
+        )
+        .toBe(1);
       await gateway.emitGatewayEvent("talk.event", { relaySessionId, type: "ready" });
+      await expect
+        .poll(() => page.locator('.agent-chat__voice-activity[data-status="listening"]').count())
+        .toBe(1);
       await gateway.emitGatewayEvent("talk.event", {
         relaySessionId,
         type: "transcript",
@@ -318,6 +484,11 @@ describeControlUiE2e("Control UI browser Talk", () => {
         text: "Hey, what model are you using?",
         final: true,
       });
+      await expect
+        .poll(() =>
+          page.locator(".agent-chat__voice-turn--user .agent-chat__voice-turn-text").textContent(),
+        )
+        .toBe("Hey, what model are you using?");
       // Assistant audio transcripts stream as verbatim fragments that can split
       // words ("I","'m"," Chat","G","PT"); regression coverage for #102556 where
       // the merge injected spaces mid-word and the turn collapsed while streaming.
@@ -358,31 +529,15 @@ describeControlUiE2e("Control UI browser Talk", () => {
 
     try {
       await page.setViewportSize({ width: 320, height: 720 });
-      await page.goto(`${server.baseUrl}chat`);
-      await page.getByRole("button", { name: "Chat settings" }).click();
+      await page.goto(`${server.baseUrl}settings/appearance`);
+      await page.getByRole("button", { name: "Refresh: Microphone input" }).click();
 
-      const settingsDialog = page.getByRole("dialog", { name: "Chat settings" });
-      await settingsDialog.getByRole("button", { name: "Refresh: Microphone input" }).click();
-      const permissionAlert = settingsDialog.getByRole("alert");
+      const permissionAlert = page.getByRole("alert");
       await expect.poll(() => permissionAlert.isVisible()).toBe(true);
-
-      const [settingsBounds, alertBounds] = await Promise.all([
-        settingsDialog.boundingBox(),
-        permissionAlert.boundingBox(),
-      ]);
-      expect(settingsBounds).not.toBeNull();
+      const alertBounds = await permissionAlert.boundingBox();
       expect(alertBounds).not.toBeNull();
-      expect(settingsBounds?.width ?? 0).toBeGreaterThanOrEqual(280);
-      expect(settingsBounds?.x ?? 0).toBeGreaterThanOrEqual(8);
-      expect((settingsBounds?.x ?? 0) + (settingsBounds?.width ?? 0)).toBeLessThanOrEqual(312);
-      expect(alertBounds?.x ?? 0).toBeGreaterThanOrEqual(settingsBounds?.x ?? 0);
-      expect((alertBounds?.x ?? 0) + (alertBounds?.width ?? 0)).toBeLessThanOrEqual(
-        (settingsBounds?.x ?? 0) + (settingsBounds?.width ?? 0),
-      );
-      expect(alertBounds?.y ?? 0).toBeGreaterThanOrEqual(settingsBounds?.y ?? 0);
-      expect((alertBounds?.y ?? 0) + (alertBounds?.height ?? 0)).toBeLessThanOrEqual(
-        (settingsBounds?.y ?? 0) + (settingsBounds?.height ?? 0),
-      );
+      expect(alertBounds?.x ?? 0).toBeGreaterThanOrEqual(0);
+      expect((alertBounds?.x ?? 0) + (alertBounds?.width ?? 0)).toBeLessThanOrEqual(320);
       await expect
         .poll(() => permissionAlert.textContent())
         .toContain("Microphone access is blocked.");

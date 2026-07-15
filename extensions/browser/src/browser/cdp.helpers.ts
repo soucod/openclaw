@@ -16,6 +16,8 @@ import {
   type SsrFPolicy,
   resolvePinnedHostnameWithPolicy,
 } from "../infra/net/ssrf.js";
+import { rawDataToString } from "../infra/ws.js";
+import { redactToolPayloadText } from "../logging/redact.js";
 import {
   getDirectAgentForCdp,
   withManagedProxyForCdpUrl,
@@ -26,6 +28,8 @@ import { BrowserCdpEndpointBlockedError } from "./errors.js";
 import { resolveBrowserRateLimitMessage } from "./rate-limit-message.js";
 import { withExactHostnamePolicy } from "./ssrf-policy-helpers.js";
 import { normalizeBrowserTimerDelayMs } from "./timer-delay.js";
+
+const CDP_URL_IN_TEXT_RE = /\b(?:https?|wss?):\/\/[^\s"'<>`]+/gi;
 
 export { isLoopbackHost };
 export { parseBrowserHttpUrl, redactCdpUrl };
@@ -171,22 +175,6 @@ function decodeUrlUserInfo(value: string): string {
   }
 }
 
-function rawCdpMessageToString(data: WebSocket.RawData): string {
-  if (typeof data === "string") {
-    return data;
-  }
-  if (Buffer.isBuffer(data)) {
-    return data.toString("utf8");
-  }
-  if (Array.isArray(data)) {
-    return Buffer.concat(data).toString("utf8");
-  }
-  if (ArrayBuffer.isView(data)) {
-    return Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString("utf8");
-  }
-  return Buffer.from(data).toString("utf8");
-}
-
 /** Merge URL basic-auth credentials into headers without overriding explicit auth. */
 export function getHeadersWithAuth(url: string, headers: Record<string, string> = {}) {
   const mergedHeaders = { ...headers };
@@ -210,7 +198,8 @@ export function getHeadersWithAuth(url: string, headers: Record<string, string> 
   return mergedHeaders;
 }
 
-function stripUrlCredentials(url: string): string {
+/** Remove URL userinfo after callers have converted it to an Authorization header. */
+export function stripCdpUrlCredentials(url: string): string {
   try {
     const parsed = new URL(url);
     if (!parsed.username && !parsed.password) {
@@ -222,6 +211,12 @@ function stripUrlCredentials(url: string): string {
   } catch {
     return url;
   }
+}
+
+/** Redact CDP URLs and credential-shaped text before dependency errors leave Browser. */
+export function redactCdpErrorText(text: string): string {
+  const redactedUrls = text.replace(CDP_URL_IN_TEXT_RE, (match) => redactCdpUrl(match) ?? match);
+  return redactToolPayloadText(redactedUrls);
 }
 
 /** Append a JSON endpoint path to a CDP HTTP base URL. */
@@ -312,11 +307,7 @@ function createCdpSender(ws: WebSocket, opts?: { commandTimeoutMs?: number }) {
       p.reject(err);
     }
     pending.clear();
-    try {
-      ws.close();
-    } catch {
-      // ignore
-    }
+    ws.close();
   };
 
   ws.on("error", (err) => {
@@ -330,7 +321,7 @@ function createCdpSender(ws: WebSocket, opts?: { commandTimeoutMs?: number }) {
 
   ws.on("message", (data) => {
     try {
-      const parsed = JSON.parse(rawCdpMessageToString(data)) as CdpResponse;
+      const parsed = JSON.parse(rawDataToString(data)) as CdpResponse;
       if (typeof parsed.id !== "number") {
         return;
       }
@@ -393,9 +384,9 @@ export async function fetchCdpChecked(
   };
   try {
     const headers = getHeadersWithAuth(url, (init?.headers as Record<string, string>) || {});
-    const fetchUrl = stripUrlCredentials(url);
+    const fetchUrl = stripCdpUrlCredentials(url);
     const res = await withManagedProxyForCdpUrl(fetchUrl, () =>
-      withNoProxyForCdpUrl(url, async () => {
+      withNoProxyForCdpUrl(fetchUrl, async () => {
         const parsedUrl = new URL(fetchUrl);
         // Loopback CDP is an OpenClaw control plane, not page navigation. Allow
         // its exact host while preserving the caller's policy for remote hosts.
@@ -451,12 +442,12 @@ export function openCdpWebSocket(
     typeof opts?.handshakeTimeoutMs === "number" && Number.isFinite(opts.handshakeTimeoutMs)
       ? Math.max(1, Math.floor(opts.handshakeTimeoutMs))
       : CDP_WS_HANDSHAKE_TIMEOUT_MS;
-  const agent = getDirectAgentForCdp(wsUrl);
-  const bypassUrl = stripUrlCredentials(wsUrl);
+  const connectionUrl = stripCdpUrlCredentials(wsUrl);
+  const agent = getDirectAgentForCdp(connectionUrl);
   return withManagedProxyForCdpUrl(
-    bypassUrl,
+    connectionUrl,
     () =>
-      new WebSocket(wsUrl, {
+      new WebSocket(connectionUrl, {
         handshakeTimeout: handshakeTimeoutMs,
         ...(Object.keys(headers).length ? { headers } : {}),
         ...(agent ? { agent } : {}),
@@ -553,11 +544,6 @@ export async function withCdpSocket<T>(
       // non-Error wrap is defensive and structurally unreachable.
       /* c8 ignore next */
       closeWithError(err instanceof Error ? err : new Error(String(err)));
-      try {
-        ws.close();
-      } catch {
-        // ignore
-      }
       if (attempt >= maxHandshakeRetries || !shouldRetryCdpHandshakeError(err)) {
         throw err;
       }
@@ -573,11 +559,7 @@ export async function withCdpSocket<T>(
       closeWithError(err instanceof Error ? err : new Error(String(err)));
       throw err;
     } finally {
-      try {
-        ws.close();
-      } catch {
-        // ignore
-      }
+      ws.close();
     }
   }
 

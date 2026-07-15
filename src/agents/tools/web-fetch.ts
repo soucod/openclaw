@@ -62,7 +62,7 @@ const WEB_FETCH_PROGRESS_THRESHOLD_MS = 5_000;
 const WEB_FETCH_PROGRESS_TEXT = "Fetching page content...";
 const DEFAULT_ERROR_MAX_CHARS = 4_000;
 const DEFAULT_ERROR_MAX_BYTES = 64_000;
-export const WEB_FETCH_SPILL_MAX_CHARS = 2_000_000;
+const WEB_FETCH_SPILL_MAX_CHARS = 2_000_000;
 const DEFAULT_FETCH_USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 
@@ -253,7 +253,7 @@ function formatWebFetchTerminalPresentation(result: unknown): { text: string } |
 
 function wrapWebFetchContent(value: string, maxChars: number): WebFetchWrappedContent {
   if (maxChars <= 0) {
-    return { text: "", truncated: true, rawLength: 0, wrappedLength: 0 };
+    return { text: "", truncated: true, rawLength: value.length, wrappedLength: 0 };
   }
   const includeWarning = maxChars >= WEB_FETCH_WRAPPER_WITH_WARNING_OVERHEAD;
   const wrapperOverhead = includeWarning
@@ -267,7 +267,7 @@ function wrapWebFetchContent(value: string, maxChars: number): WebFetchWrappedCo
     return {
       text: truncatedWrapper.text,
       truncated: true,
-      rawLength: 0,
+      rawLength: value.length,
       wrappedLength: truncatedWrapper.text.length,
     };
   }
@@ -289,7 +289,7 @@ function wrapWebFetchContent(value: string, maxChars: number): WebFetchWrappedCo
   return {
     text: wrappedText,
     truncated: truncated.truncated,
-    rawLength: truncated.text.length,
+    rawLength: value.length,
     wrappedLength: wrappedText.length,
   };
 }
@@ -337,7 +337,7 @@ async function spillWebFetchContent(
     visible = wrapWebFetchContent(value, maxChars - footer.length);
     text = `${visible.text}${footer}`;
   } else if (compactFooter.length <= maxChars) {
-    visible = { ...wrapped, text: "", rawLength: 0, wrappedLength: 0 };
+    visible = { ...wrapped, text: "", wrappedLength: 0 };
     text = compactFooter;
   }
   return {
@@ -454,6 +454,10 @@ async function normalizeProviderWebFetchPayload(params: {
     params.maxChars,
     payload.truncated === true,
   );
+  const providerRawLength =
+    typeof payload.rawLength === "number" && Number.isFinite(payload.rawLength)
+      ? Math.max(0, Math.floor(payload.rawLength))
+      : wrapped.rawLength;
   const url = params.requestedUrl;
   const finalUrl = normalizeProviderFinalUrl(payload.finalUrl) ?? url;
   const status =
@@ -486,7 +490,7 @@ async function normalizeProviderWebFetchPayload(params: {
     },
     truncated: wrapped.truncated,
     length: wrapped.wrappedLength,
-    rawLength: wrapped.rawLength,
+    rawLength: providerRawLength,
     wrappedLength: wrapped.wrappedLength,
     ...(wrapped.fullOutputPath ? { fullOutputPath: wrapped.fullOutputPath } : {}),
     ...(wrapped.spilledChars !== undefined ? { spilledChars: wrapped.spilledChars } : {}),
@@ -645,7 +649,7 @@ async function runWebFetch(params: WebFetchRuntimeParams): Promise<Record<string
     throwIfFetchAborted(params.signal);
     const body = bodyResult.text;
     const responseTruncatedWarning = bodyResult.truncated
-      ? `Response body truncated after ${params.maxResponseBytes} bytes.`
+      ? `Response body incomplete after ${bodyResult.bytesRead} bytes.`
       : undefined;
 
     let title: string | undefined;
@@ -781,8 +785,7 @@ export function createWebFetchTool(options?: {
   const tool: AnyAgentTool = {
     label: "Web Fetch",
     name: "web_fetch",
-    description:
-      "Fetch URL and extract readable markdown/text. Lightweight page access; no browser automation.",
+    description: "Fetch URL; extract readable markdown/text. Lightweight; no browser automation.",
     parameters: WebFetchSchema,
     execute: async (_toolCallId, args, signal, onUpdate) => {
       const { config, preferRuntimeProviders, runtimeWebFetch } = resolveWebFetchToolRuntimeContext(
@@ -879,3 +882,4 @@ export function createWebFetchTool(options?: {
     formatWebFetchTerminalPresentation(result),
   );
 }
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

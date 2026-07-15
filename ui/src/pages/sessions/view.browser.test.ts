@@ -30,13 +30,14 @@ function readUiCss(): string {
     "ui/src/styles/layout.css",
     "ui/src/styles/layout.mobile.css",
     "ui/src/styles/components.css",
+    "ui/src/styles/settings.css",
     "ui/src/styles/sessions.css",
   ];
   return files.map((file) => readStyleSheet(file)).join("\n");
 }
 
 function sessionsTableHtml() {
-  const headers = ["", "Key", "Kind", "Status", "Runtime", "Updated", "Tokens", "Actions"];
+  const headers = ["", "Key", "Kind", "Status", "Updated", "Tokens", "Actions"];
   const overviewTiles = [
     ["3", "Sessions"],
     ["1", "Live"],
@@ -58,9 +59,11 @@ function sessionsTableHtml() {
     )
     .join("");
   return `
-    <section class="card">
-      <div class="sessions-overview">${overviewTiles}</div>
-      <div class="data-table-wrapper">
+    <div class="settings-page settings-page--wide">
+      <div class="settings-group">
+        <div class="sessions-overview">${overviewTiles}</div>
+      </div>
+      <div class="settings-group">
         <div class="data-table-container">
           <table class="data-table sessions-table">
             <thead>
@@ -75,12 +78,12 @@ function sessionsTableHtml() {
                             ? "data-table-key-col"
                             : index === 3
                               ? "session-status-col"
-                              : index === 4
-                                ? "session-runtime-col"
-                                : index === 7
-                                  ? "session-actions-col"
-                                  : ""
-                      }">${header}</th>`,
+                              : index === 6
+                                ? "session-actions-col"
+                                : ""
+                      }">${
+                        index === 6 ? `<span class="sessions-sr-only">${header}</span>` : header
+                      }</th>`,
                   )
                   .join("")}
               </tr>
@@ -104,14 +107,13 @@ function sessionsTableHtml() {
                     </div>
                   </div>
                 </td>
-                <td><span class="data-table-badge data-table-badge--direct">direct</span></td>
+                <td><span class="session-kind session-kind--direct">direct</span></td>
                 <td class="session-status-col">
-                  <span class="session-status-badge session-status-badge--live" aria-label="Status: Live">
-                    <span class="session-status-badge__dot" aria-hidden="true"></span>
-                    <span class="session-status-badge__label">Live</span>
+                  <span class="settings-status settings-status--ok">
+                    <span class="settings-status__dot"></span>
+                    Live
                   </span>
                 </td>
-                <td class="session-runtime-cell"><span class="mono">claude-cli (fallback none)</span></td>
                 <td>now</td>
                 <td class="session-token-cell">
                   <div class="session-tokens">
@@ -124,7 +126,7 @@ function sessionsTableHtml() {
                 <td class="session-actions-cell">
                   <div class="session-actions">
                     <button class="session-details-toggle" type="button" aria-expanded="true">
-                      <span class="session-compaction-count">1</span>
+                      <span class="settings-count session-compaction-count">1</span>
                       <svg viewBox="0 0 24 24"><path d="m6 9 6 6 6-6" /></svg>
                     </button>
                     <button class="icon-btn" aria-label="Open session menu" aria-haspopup="menu">
@@ -134,7 +136,7 @@ function sessionsTableHtml() {
                 </td>
               </tr>
               <tr class="session-details-row">
-                <td colspan="8">
+                <td colspan="7">
                   <div class="session-details-panel">
                     <div class="session-details-panel__hero">
                       <div>
@@ -142,11 +144,11 @@ function sessionsTableHtml() {
                         <div class="session-details-panel__title">agent:main:main</div>
                       </div>
                       <div class="session-details-panel__badges">
-                        <span class="session-status-badge session-status-badge--live" aria-label="Status: Live">
-                          <span class="session-status-badge__dot" aria-hidden="true"></span>
-                          <span class="session-status-badge__label">Live</span>
+                        <span class="settings-status settings-status--ok">
+                          <span class="settings-status__dot"></span>
+                          Live
                         </span>
-                        <span class="data-table-badge data-table-badge--direct">direct</span>
+                        <span class="session-kind session-kind--direct">direct</span>
                       </div>
                     </div>
                     <div class="session-details-section">
@@ -154,15 +156,15 @@ function sessionsTableHtml() {
                       <div class="session-overrides-grid">
                         <label class="session-override-field">
                           <span class="session-override-field__label">Label</span>
-                          <input class="session-override-field__control" value="triage" />
+                          <input class="settings-input" value="triage" />
                         </label>
                         <label class="session-override-field">
                           <span class="session-override-field__label">Thinking</span>
-                          <select class="session-override-field__control"><option>Default</option></select>
+                          <select class="settings-select"><option>Default</option></select>
                         </label>
                         <label class="session-override-field">
                           <span class="session-override-field__label">Fast</span>
-                          <select class="session-override-field__control"><option>on</option></select>
+                          <select class="settings-select"><option>on</option></select>
                         </label>
                       </div>
                     </div>
@@ -197,7 +199,7 @@ function sessionsTableHtml() {
           </table>
         </div>
       </div>
-    </section>
+    </div>
   `;
 }
 
@@ -244,10 +246,8 @@ describeBrowserLayout("sessions responsive browser layout", () => {
         const container = document.querySelector(".data-table-container");
         const actions = document.querySelector(".session-actions");
         const trigger = document.querySelector(".session-details-toggle");
-        const status = document.querySelector(".session-status-badge");
-        const statusLabel = document.querySelector(".session-status-badge__label");
-        const runtime = document.querySelector(".session-runtime-cell .mono");
-        const kind = document.querySelector(".data-table-badge");
+        const status = document.querySelector(".settings-status");
+        const kind = document.querySelector(".session-kind");
         const key = document.querySelector(".session-key-cell .session-link");
         const details = document.querySelector(".session-details-panel");
         if (
@@ -255,8 +255,6 @@ describeBrowserLayout("sessions responsive browser layout", () => {
           !(actions instanceof HTMLElement) ||
           !(trigger instanceof HTMLElement) ||
           !(status instanceof HTMLElement) ||
-          !(statusLabel instanceof HTMLElement) ||
-          !(runtime instanceof HTMLElement) ||
           !(kind instanceof HTMLElement) ||
           !(key instanceof HTMLElement)
         ) {
@@ -265,15 +263,16 @@ describeBrowserLayout("sessions responsive browser layout", () => {
         const containerRect = container.getBoundingClientRect();
         const actionsRect = actions.getBoundingClientRect();
         const statusRect = status.getBoundingClientRect();
+        const statusStyle = getComputedStyle(status);
         return {
           bodyOverflow: document.documentElement.scrollWidth - window.innerWidth,
           checkpointCount: trigger.querySelector(".session-compaction-count")?.textContent?.trim(),
           statusText: status.textContent?.trim(),
-          runtimeText: runtime.textContent?.trim(),
           keyWhiteSpace: getComputedStyle(key).whiteSpace,
           kindWhiteSpace: getComputedStyle(kind).whiteSpace,
-          statusWhiteSpace: getComputedStyle(status).whiteSpace,
-          runtimeWhiteSpace: getComputedStyle(runtime).whiteSpace,
+          statusWhiteSpace: statusStyle.whiteSpace,
+          statusBorderStyle: statusStyle.borderTopStyle,
+          statusBackgroundColor: statusStyle.backgroundColor,
           hasDetails: details !== null,
           actionsVisible:
             actionsRect.left >= containerRect.left && actionsRect.right <= containerRect.right,
@@ -285,11 +284,12 @@ describeBrowserLayout("sessions responsive browser layout", () => {
       expect(metrics.bodyOverflow).toBeLessThanOrEqual(1);
       expect(metrics.checkpointCount).toBe("1");
       expect(metrics.statusText).toBe("Live");
-      expect(metrics.runtimeText).toBe("claude-cli (fallback none)");
       expect(metrics.keyWhiteSpace).toBe("nowrap");
       expect(metrics.kindWhiteSpace).toBe("nowrap");
       expect(metrics.statusWhiteSpace).toBe("nowrap");
-      expect(metrics.runtimeWhiteSpace).toBe("nowrap");
+      // Status is a plain dot + label; pill chrome must not come back.
+      expect(metrics.statusBorderStyle).toBe("none");
+      expect(metrics.statusBackgroundColor).toBe("rgba(0, 0, 0, 0)");
       expect(metrics.hasDetails).toBe(true);
       expect(metrics.actionsVisible).toBe(true);
       expect(metrics.statusVisible).toBe(true);

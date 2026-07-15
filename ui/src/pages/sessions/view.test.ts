@@ -40,6 +40,9 @@ function buildProps(result: SessionsListResult): SessionsProps {
     showArchived: false,
     basePath: "",
     searchQuery: "",
+    transcriptSearchAvailable: true,
+    transcriptSearchQuery: "",
+    transcriptSearch: { status: "idle" },
     agentIdentityById: {},
     sortColumn: "updated",
     sortDir: "desc",
@@ -57,6 +60,9 @@ function buildProps(result: SessionsListResult): SessionsProps {
     onFiltersChange: () => undefined,
     onClearFilters: () => undefined,
     onSearchChange: () => undefined,
+    onTranscriptSearchChange: () => undefined,
+    onTranscriptSearch: () => undefined,
+    onClearTranscriptSearch: () => undefined,
     onSortChange: () => undefined,
     onGroupByChange: () => undefined,
     onAssignCategory: () => undefined,
@@ -90,18 +96,122 @@ function sessionTableHeaders(container: HTMLElement): Array<string | undefined> 
   return Array.from(container.querySelectorAll("thead th")).map((cell) => cell.textContent?.trim());
 }
 
-const SESSION_TABLE_HEADERS = [
-  "",
-  "Key",
-  "Kind",
-  "Status",
-  "Runtime",
-  "Updated",
-  "Tokens",
-  "Actions",
-];
+const SESSION_TABLE_HEADERS = ["", "Key", "Kind", "Status", "Updated", "Tokens", "Actions"];
 
 describe("sessions view", () => {
+  it("keeps transcript search distinct from the loaded-roster filter", async () => {
+    const container = document.createElement("div");
+    const onTranscriptSearchChange = vi.fn();
+    const onTranscriptSearch = vi.fn();
+    render(
+      renderSessions({
+        ...buildProps(buildMultiResult([])),
+        searchQuery: "agent label",
+        transcriptSearchQuery: "  exact phrase  ",
+        onTranscriptSearchChange,
+        onTranscriptSearch,
+      }),
+      container,
+    );
+    await Promise.resolve();
+
+    const rosterFilter = container.querySelector<HTMLInputElement>(
+      '.sessions-filter-bar input[type="text"]',
+    );
+    const transcriptInput = container.querySelector<HTMLInputElement>(
+      '.sessions-transcript-search input[type="search"]',
+    );
+    expect(rosterFilter?.value).toBe("agent label");
+    expect(transcriptInput?.value).toBe("  exact phrase  ");
+
+    transcriptInput!.value = "different words";
+    transcriptInput!.dispatchEvent(new Event("input", { bubbles: true }));
+    expect(onTranscriptSearchChange).toHaveBeenCalledWith("different words");
+    expect(onTranscriptSearch).not.toHaveBeenCalled();
+
+    container
+      .querySelector(".sessions-transcript-search__form")
+      ?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    expect(onTranscriptSearch).toHaveBeenCalledOnce();
+  });
+
+  it("renders transcript provenance and opens the matching session", async () => {
+    const container = document.createElement("div");
+    const onNavigateToChat = vi.fn();
+    render(
+      renderSessions({
+        ...buildProps(
+          buildMultiResult([
+            {
+              key: "agent:main:launch",
+              kind: "direct",
+              label: "Launch planning",
+              updatedAt: Date.parse("2026-07-12T12:00:00.000Z"),
+            },
+          ]),
+        ),
+        transcriptSearchQuery: "launch code",
+        transcriptSearch: {
+          status: "results",
+          results: [
+            {
+              sessionKey: "agent:main:launch",
+              sessionId: "session-launch",
+              messageId: "message-1",
+              role: "assistant",
+              timestamp: Date.parse("2026-07-12T12:00:00.000Z"),
+              snippet: "The <launch code> is ready.",
+              score: 1,
+            },
+          ],
+          indexing: true,
+          truncated: true,
+        },
+        onNavigateToChat,
+      }),
+      container,
+    );
+    await Promise.resolve();
+
+    const result = container.querySelector<HTMLButtonElement>(
+      ".sessions-transcript-search__result",
+    );
+    expect(result?.textContent).toContain("Launch planning");
+    expect(result?.textContent).toContain("Assistant");
+    expect(result?.textContent).toContain("The <launch code> is ready.");
+    expect(result?.querySelector("launch")).toBeNull();
+    expect(container.textContent).toContain("The transcript index is still updating");
+    expect(container.textContent).toContain("Showing the first 25 matches.");
+
+    result?.click();
+    expect(onNavigateToChat).toHaveBeenCalledWith("agent:main:launch");
+  });
+
+  it("disables transcript search when the Gateway does not advertise it", async () => {
+    const container = document.createElement("div");
+    const onTranscriptSearch = vi.fn();
+    render(
+      renderSessions({
+        ...buildProps(buildMultiResult([])),
+        transcriptSearchAvailable: false,
+        transcriptSearchQuery: "hidden",
+        onTranscriptSearch,
+      }),
+      container,
+    );
+    await Promise.resolve();
+
+    expect(
+      container.querySelector<HTMLInputElement>('.sessions-transcript-search input[type="search"]')
+        ?.disabled,
+    ).toBe(true);
+    expect(container.textContent).toContain("Transcript search requires a newer Gateway.");
+    container
+      .querySelector(".sessions-transcript-search__form")
+      ?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    expect(onTranscriptSearch).not.toHaveBeenCalled();
+  });
+
   it("renders an explicit archived-session toggle", async () => {
     const container = document.createElement("div");
     const onFiltersChange = vi.fn();
@@ -594,7 +704,7 @@ describe("sessions view", () => {
     );
     await Promise.resolve();
 
-    const badge = container.querySelector(".data-table-badge--cron");
+    const badge = container.querySelector(".session-kind--cron");
     expect(badge?.textContent?.trim()).toBe("cron");
   });
 
@@ -639,7 +749,7 @@ describe("sessions view", () => {
     await Promise.resolve();
 
     expect(sessionTableHeaders(container)).toEqual(SESSION_TABLE_HEADERS);
-    const badges = Array.from(container.querySelectorAll(".session-status-badge"));
+    const badges = Array.from(container.querySelectorAll(".settings-status"));
     expect(badges.map((badge) => badge.textContent?.trim())).toEqual([
       "Live",
       "Idle",
@@ -647,17 +757,16 @@ describe("sessions view", () => {
       "Done",
     ]);
     expect(badges.map((badge) => [...badge.classList])).toEqual([
-      ["session-status-badge", "session-status-badge--live"],
-      ["session-status-badge", "session-status-badge--idle"],
-      ["session-status-badge", "session-status-badge--failed"],
-      ["session-status-badge", "session-status-badge--done"],
+      ["settings-status", "settings-status--ok"],
+      ["settings-status"],
+      ["settings-status", "settings-status--danger"],
+      ["settings-status", "settings-status--ok"],
     ]);
-    expect(badges.map((badge) => badge.getAttribute("aria-label"))).toEqual([
-      "Status: Live",
-      "Status: Idle",
-      "Status: Failed",
-      "Status: Done",
-    ]);
+    expect(
+      badges.map(
+        (badge) => (badge.parentElement as (HTMLElement & { content: string }) | null)?.content,
+      ),
+    ).toEqual(["Status: Live", "Status: Idle", "Status: Failed", "Status: Done"]);
   });
 
   it("renders session goals in the status cell and search index", async () => {
@@ -691,17 +800,21 @@ describe("sessions view", () => {
     );
     await Promise.resolve();
 
-    const chip = container.querySelector(".session-goal-chip");
-    expect(chip?.textContent?.replace(/\s+/g, " ").trim()).toBe(
-      "Pursuing goal (12k/50k) Ship the web goal indicator",
-    );
-    expect(chip?.getAttribute("aria-label")).toBe(
+    const statuses = container.querySelectorAll(".session-status-stack .settings-status");
+    const goal = statuses[1];
+    expect(goal?.textContent?.replace(/\s+/g, " ").trim()).toBe("Pursuing goal (12k/50k)");
+    // The wrapper span exposes the objective to keyboard/screen-reader users.
+    const wrapper = goal?.parentElement;
+    expect(wrapper?.getAttribute("tabindex")).toBe("0");
+    expect(wrapper?.getAttribute("aria-label")).toBe(
       "Pursuing goal (12k/50k): Ship the web goal indicator",
     );
+    const tooltip = wrapper?.parentElement as (HTMLElement & { content: string }) | null;
+    expect(tooltip?.content).toBe("Pursuing goal (12k/50k): Ship the web goal indicator");
     expect(container.querySelectorAll("tbody tr")).toHaveLength(1);
   });
 
-  it("renders and filters the session runtime", async () => {
+  it("filters by agent runtime and surfaces it in the details drawer", async () => {
     const container = document.createElement("div");
     render(
       renderSessions({
@@ -722,20 +835,22 @@ describe("sessions view", () => {
           ]),
         ),
         searchQuery: "fallback none",
+        expandedSessionKey: "agent:main:claude",
       }),
       container,
     );
     await Promise.resolve();
 
     expect(sessionTableHeaders(container)).toEqual(SESSION_TABLE_HEADERS);
-    expect(container.querySelector(".session-runtime-cell")?.textContent?.trim()).toBe(
-      "claude-cli (fallback none)",
-    );
+    // The roster no longer has a Runtime column; the drawer carries it.
+    expect(container.querySelector(".session-runtime-cell")).toBeNull();
     const rows = container.querySelectorAll("tbody tr.session-data-row");
     expect(rows).toHaveLength(1);
     expect(rows[0]?.querySelector(".session-key-cell")?.textContent?.trim()).toBe(
       "agent:main:claude",
     );
+    const stats = readSessionDetailStats(container);
+    expect(stats.get("Runtime")).toBe("claude-cli (fallback none)");
   });
 
   it("does not filter terminal sessions as live when active-run flags are stale", async () => {
@@ -951,13 +1066,14 @@ describe("sessions view", () => {
       Array.from(details?.querySelectorAll(".session-details-panel__badges > *") ?? []).map(
         (badge) => badge.textContent?.replace(/\s+/g, " ").trim(),
       ),
-    ).toEqual(["Live", "Goal blocked (24k used) Finish the compaction details", "direct"]);
+    ).toEqual(["Live", "Goal blocked (24k used)", "direct"]);
 
     const stats = readSessionDetailStats(details ?? container);
     expect(stats.get("Status")).toBe("running");
     expect(stats.get("Model")).toBe("gpt-5.5");
     expect(stats.get("Provider")).toBe("openai");
-    expect(stats.get("Runtime")).toBe("2m 5s");
+    expect(stats.get("Runtime")).toBe("pi");
+    expect(stats.get("Run duration")).toBe("2m 5s");
     expect(stats.get("Tokens")).toBe("123456 / 200000");
     expect(stats.get("Compaction")).toBe("1 Checkpoint");
     expect(stats.get("Goal")).toBe(
@@ -1209,6 +1325,31 @@ describe("sessions view", () => {
     expect(emptyCell?.querySelector("button")).toBeNull();
   });
 
+  it.each([
+    { activeMinutes: "60minutes", limit: "1e2", filtered: false },
+    { activeMinutes: "+30", limit: "060", filtered: true },
+  ])("keeps numeric-filter empty state consistent: $activeMinutes / $limit", async (testCase) => {
+    const container = document.createElement("div");
+    render(
+      renderSessions({
+        ...buildProps(buildMultiResult([])),
+        activeMinutes: testCase.activeMinutes,
+        limit: testCase.limit,
+        includeGlobal: true,
+        includeUnknown: true,
+        showArchived: true,
+      }),
+      container,
+    );
+    await Promise.resolve();
+
+    const emptyState = container.querySelector(".data-table-empty-state");
+    expect(emptyState?.firstElementChild?.textContent?.trim()).toBe(
+      testCase.filtered ? "No sessions match your filters." : "No sessions found.",
+    );
+    expect(emptyState?.querySelector("button") !== null).toBe(testCase.filtered);
+  });
+
   it("summarizes loaded sessions in the overview tiles", async () => {
     const container = document.createElement("div");
     render(
@@ -1410,3 +1551,4 @@ describe("sessions view", () => {
     expect(container.querySelector(".sessions-overview")).toBeNull();
   });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

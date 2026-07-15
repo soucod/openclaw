@@ -165,7 +165,7 @@ function requiresToolCallThoughtSignature(modelId: string): boolean {
 }
 
 function supportsMultimodalFunctionResponse(modelId: string): boolean {
-  const match = normalizeLowercaseStringOrEmpty(modelId).match(/^gemini(?:-live)?-(\d+)/);
+  const match = normalizeLowercaseStringOrEmpty(modelId).match(/(?:^|\/)gemini(?:-live)?-(\d+)/);
   if (!match) {
     return true;
   }
@@ -1497,3 +1497,4 @@ export function createGoogleGenerativeAiTransportStreamFn(): StreamFn {
 export function createGoogleVertexTransportStreamFn(): StreamFn {
   return createGoogleTransportStreamFn("google-vertex");
 }
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */
