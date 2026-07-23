@@ -288,12 +288,22 @@ test("lists and patches session store via sessions.* RPC", async () => {
   expect(pinned.ok).toBe(true);
   expect(pinned.payload?.entry.pinnedAt).toEqual(expect.any(Number));
 
+  const iconPatched = await directSessionReq<{
+    entry: { icon?: string };
+  }>("sessions.patch", {
+    key: "agent:main:subagent:one",
+    icon: "name:spark",
+  });
+  expect(iconPatched.ok).toBe(true);
+  expect(iconPatched.payload?.entry.icon).toBe("name:spark");
+
   const pinnedList = await directSessionReq<{
-    sessions: Array<{ key: string; pinned?: boolean }>;
+    sessions: Array<{ key: string; pinned?: boolean; icon?: string }>;
   }>("sessions.list", {});
   expect(pinnedList.payload?.sessions[0]).toMatchObject({
     key: "agent:main:subagent:one",
     pinned: true,
+    icon: "name:spark",
   });
 
   const archived = await directSessionReq<{
@@ -429,33 +439,24 @@ test("lists and patches session store via sessions.* RPC", async () => {
   expect(spawnedOnly.ok).toBe(true);
   expect(spawnedOnly.payload?.sessions.map((s) => s.key)).toEqual(["agent:main:subagent:one"]);
 
-  const spawnedPatched = await directSessionReq<{
-    ok: true;
-    entry: { spawnedBy?: string };
-  }>("sessions.patch", {
-    key: "agent:main:subagent:two",
+  for (const [field, value] of Object.entries({
     spawnedBy: "agent:main:main",
-  });
-  expect(spawnedPatched.ok).toBe(true);
-  expect(spawnedPatched.payload?.entry.spawnedBy).toBe("agent:main:main");
-
-  const acpPatched = await directSessionReq<{
-    ok: true;
-    entry: { spawnedBy?: string; spawnDepth?: number };
-  }>("sessions.patch", {
-    key: "agent:main:acp:child",
-    spawnedBy: "agent:main:main",
+    spawnedWorkspaceDir: "/tmp/subagent-workspace",
+    spawnedCwd: "/tmp/task-repo",
     spawnDepth: 1,
-  });
-  expect(acpPatched.ok).toBe(true);
-  expect(acpPatched.payload?.entry.spawnedBy).toBe("agent:main:main");
-  expect(acpPatched.payload?.entry.spawnDepth).toBe(1);
-
-  const spawnedPatchedInvalidKey = await directSessionReq("sessions.patch", {
-    key: "agent:main:main",
-    spawnedBy: "agent:main:main",
-  });
-  expect(spawnedPatchedInvalidKey.ok).toBe(false);
+    subagentRole: "leaf",
+    subagentControlScope: "none",
+  })) {
+    const rejected = await directSessionReq("sessions.patch", {
+      key: "agent:main:subagent:two",
+      [field]: value,
+    });
+    expect(rejected.ok, field).toBe(false);
+    expect(rejected.error, field).toMatchObject({
+      code: "INVALID_REQUEST",
+      message: expect.stringContaining(`unexpected property '${field}'`),
+    });
+  }
 
   const cleaned = await directSessionReq<{
     applied: true;
@@ -582,13 +583,15 @@ test("lists and patches session store via sessions.* RPC", async () => {
   const entryAfterReset = loadSessionEntry({ sessionKey: "agent:main:main", storePath });
   expect(entryAfterReset?.lastAccountId).toBe("work");
   expect(entryAfterReset?.lastThreadId).toBe("1737500000.123456");
+  // Retained history: reset rotates the live session id but keeps the old
+  // generation's transcript rows in SQLite.
   await expect(
     loadTranscriptRows({
       sessionId: "sess-main",
       sessionKey: "agent:main:main",
       storePath,
     }),
-  ).resolves.toEqual([]);
+  ).resolves.toHaveLength(3);
 
   const badThinking = await directSessionReq("sessions.patch", {
     key: "agent:main:main",

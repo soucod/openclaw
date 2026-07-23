@@ -9,7 +9,6 @@ import {
   upsertAcpSessionMeta,
   writeAcpSessionMetaForMigration,
 } from "../acp/runtime/session-meta.js";
-import { retireSessionMcpRuntime } from "../agents/agent-bundle-mcp-tools.js";
 import {
   listAgentIds,
   resolveAgentWorkspaceDir,
@@ -17,7 +16,6 @@ import {
 } from "../agents/agent-scope.js";
 import { clearBootstrapSnapshot } from "../agents/bootstrap-cache.js";
 import { clearAllCliSessions } from "../agents/cli-session.js";
-import { abortEmbeddedAgentRun, waitForEmbeddedAgentRunEnd } from "../agents/embedded-agent.js";
 import { resetRegisteredAgentHarnessSessions } from "../agents/harness/registry.js";
 import { resolveSessionModelRef } from "../agents/session-model-ref.js";
 import { resolveSessionPlacementResetBlock } from "../agents/session-placement-admission.js";
@@ -37,6 +35,12 @@ import {
 } from "../config/sessions.js";
 import { rebindCliSessionReseedReceiptsForReset } from "../config/sessions/cli-session-binding.js";
 import { resolveResetPreservedSelection } from "../config/sessions/reset-preserved-selection.js";
+import { sessionEntryForkedFromParent } from "../config/sessions/session-entry-lineage.js";
+import {
+  buildSessionCreationStamp,
+  type SessionCreatedActor,
+  type SessionCreatedVia,
+} from "../config/sessions/session-entry-provenance.js";
 import { formatSqliteSessionFileMarker } from "../config/sessions/sqlite-marker.js";
 import type { SessionAcpMeta } from "../config/sessions/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
@@ -64,7 +68,10 @@ import {
   runExclusiveSessionLifecycleMutation,
   SESSION_WORK_ADMISSION_DRAIN_TIMEOUT_MS,
 } from "../sessions/session-lifecycle-admission.js";
-import { handleSessionStateSessionReset } from "../sessions/session-state-events.js";
+import {
+  handleSessionStateSessionReset,
+  recordSessionCreated,
+} from "../sessions/session-state-events.js";
 import {
   forgetActiveSessionForShutdown,
   listActiveSessionsForShutdown,
@@ -82,6 +89,8 @@ import {
   resolveGatewaySessionStoreTarget,
   resolveSessionStoreKey,
 } from "./session-utils.js";
+
+const mcpRunEndWatchers = new Map<string, Promise<void>>();
 
 const ACP_RUNTIME_CLEANUP_TIMEOUT_MS = 15_000;
 
@@ -335,6 +344,13 @@ async function ensureSessionRuntimeCleanup(params: {
   sessionId?: string;
   assertCurrent?: () => void;
 }) {
+  // Session lifecycle mutation owns this heavy runtime edge; read-only gateway
+  // commands such as status must not load the embedded-agent barrel.
+  const [embeddedAgent, mcpTools] = await Promise.all([
+    import("../agents/embedded-agent.js"),
+    import("../agents/agent-bundle-mcp-tools.js"),
+  ]);
+  params.assertCurrent?.();
   const closeTrackedBrowserTabs = async () => {
     params.assertCurrent?.();
     const closeKeys = new Set<string>([
@@ -367,22 +383,67 @@ async function ensureSessionRuntimeCleanup(params: {
     await closeTrackedBrowserTabs();
     return undefined;
   }
+  const sessionId = params.sessionId;
   params.assertCurrent?.();
-  abortEmbeddedAgentRun(params.sessionId);
-  const ended = await waitForEmbeddedAgentRunEnd(params.sessionId, 15_000);
-  params.assertCurrent?.();
-  clearBootstrapSnapshot(params.target.canonicalKey);
-  if (ended) {
-    params.assertCurrent?.();
-    await retireSessionMcpRuntime({
-      sessionId: params.sessionId,
+  const retireMcpRuntime = async (retainAcrossReuse: boolean) => {
+    await mcpTools.retireSessionMcpRuntime({
+      sessionId,
       reason: "gateway-session-cleanup",
-      onError: (error, sessionId) => {
+      preserveActiveLeases: true,
+      retainAcrossReuse,
+      onError: (error, retiredSessionId) => {
         logVerbose(
-          `sessions cleanup: failed to dispose bundle MCP runtime for ${sessionId}: ${String(error)}`,
+          `sessions cleanup: failed to dispose bundle MCP runtime for ${retiredSessionId}: ${String(error)}`,
         );
       },
     });
+  };
+  const ensureMcpRetirementWatcher = () => {
+    if (mcpRunEndWatchers.has(sessionId)) {
+      return;
+    }
+    const watcherRef: { current?: Promise<void> } = {};
+    const watcher = (async () => {
+      while (await embeddedAgent.waitForEmbeddedAgentRunEnd(sessionId, null)) {
+        // A replacement can register after the wait promise settles but before
+        // this continuation runs. Keep the required retirement armed for it.
+        if (embeddedAgent.isEmbeddedAgentRunActive(sessionId)) {
+          continue;
+        }
+        if (mcpRunEndWatchers.get(sessionId) === watcherRef.current) {
+          mcpRunEndWatchers.delete(sessionId);
+        }
+        await retireMcpRuntime(false);
+        return;
+      }
+    })();
+    watcherRef.current = watcher;
+    mcpRunEndWatchers.set(sessionId, watcher);
+    void watcher
+      .catch((error: unknown) => {
+        logVerbose(`sessions cleanup: failed to disarm deferred MCP retirement: ${String(error)}`);
+      })
+      .finally(() => {
+        if (mcpRunEndWatchers.get(sessionId) === watcher) {
+          mcpRunEndWatchers.delete(sessionId);
+        }
+      });
+  };
+  // Register against the run being stopped before abort or any await allows a
+  // later embedded or reply-backed run to replace it in the active registry.
+  ensureMcpRetirementWatcher();
+  embeddedAgent.abortEmbeddedAgentRun(sessionId);
+  // Mark cleanup before waiting so the timeout path cannot strand MCP children.
+  // Active tool/app leases keep in-flight work alive until their final release.
+  await retireMcpRuntime(true);
+  const ended = await embeddedAgent.waitForEmbeddedAgentRunEnd(sessionId, 15_000);
+  params.assertCurrent?.();
+  // A stopping run can create or reuse its runtime while we wait. Retire again
+  // after a clean stop; otherwise keep the required marker armed for late work.
+  await retireMcpRuntime(!ended);
+  params.assertCurrent?.();
+  clearBootstrapSnapshot(params.target.canonicalKey);
+  if (ended) {
     params.assertCurrent?.();
     await closeTrackedBrowserTabs();
     return undefined;
@@ -856,6 +917,8 @@ export async function performGatewaySessionReset(params: {
   clearSpawnedCwd?: boolean;
   reason: "new" | "reset";
   commandSource: string;
+  /** Trusted provenance for a reset that materializes a previously missing row. */
+  creation?: { via: SessionCreatedVia; actor?: SessionCreatedActor };
   assertCurrent?: () => void;
   onCommitted?: (commit: { key: string; sessionId: string }) => void;
 }): Promise<
@@ -1109,6 +1172,7 @@ export async function performGatewaySessionReset(params: {
           })
         : undefined;
 
+      let createdNewEntry = false;
       const lifecycle = await resetSessionEntryLifecycle({
         agentId: target.agentId,
         storePath,
@@ -1117,6 +1181,7 @@ export async function performGatewaySessionReset(params: {
           storeKeys: target.storeKeys,
         },
         buildNextEntry: ({ currentEntry, primaryKey }) => {
+          createdNewEntry = currentEntry === undefined;
           if (!isResetLifecycleCurrent() && currentEntry?.sessionId !== entry?.sessionId) {
             // A newer owner already replaced or removed the session while cleanup
             // targeted the old id. Preserve that newer state instead of resetting it.
@@ -1136,6 +1201,15 @@ export async function performGatewaySessionReset(params: {
             sessionId: nextSessionId,
             storePath,
           });
+          const creationStamp = currentEntry
+            ? {
+                createdVia: currentEntry.createdVia,
+                createdActor: currentEntry.createdActor,
+                createdAt: currentEntry.createdAt,
+              }
+            : params.creation
+              ? buildSessionCreationStamp(params.creation)
+              : {};
           const nextEntry: SessionEntry = {
             sessionId: nextSessionId,
             sessionFile,
@@ -1168,6 +1242,7 @@ export async function performGatewaySessionReset(params: {
                 : currentEntry?.execCwd,
             responseUsage: currentEntry?.responseUsage,
             pinnedAt: currentEntry?.pinnedAt,
+            icon: currentEntry?.icon,
             // Resets should keep the user's explicit selection, but clear any
             // temporary fallback model that was pinned during the previous run.
             ...resetPreservedSelection,
@@ -1190,7 +1265,10 @@ export async function performGatewaySessionReset(params: {
               ? undefined
               : (params.worktree ?? currentEntry?.worktree),
             parentSessionKey: currentEntry?.parentSessionKey,
-            forkedFromParent: currentEntry?.forkedFromParent,
+            ...creationStamp,
+            forkSource: currentEntry?.forkSource,
+            previousSessionId: currentEntry?.sessionId,
+            forkedFromParent: sessionEntryForkedFromParent(currentEntry) ? true : undefined,
             spawnDepth: currentEntry?.spawnDepth,
             subagentRole: currentEntry?.subagentRole,
             subagentControlScope: currentEntry?.subagentControlScope,
@@ -1236,6 +1314,13 @@ export async function performGatewaySessionReset(params: {
           return nextEntry;
         },
         afterEntryMutation: async (mutation) => {
+          if (createdNewEntry) {
+            recordSessionCreated({
+              sessionKey: target.canonicalKey ?? params.key,
+              agentId,
+              entry: mutation.nextEntry,
+            });
+          }
           let committedAcpResetState: { sessionKey: string; meta: SessionAcpMeta } | undefined;
           if (deferredAcpResetState) {
             const identity = deferredAcpResetState.meta.identity;

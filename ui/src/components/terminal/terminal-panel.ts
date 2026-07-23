@@ -1,4 +1,7 @@
-import type { GhosttyTerminalController } from "@openclaw/libterminal/browser";
+import type {
+  createTerminalDefaultColorQueryResponder,
+  GhosttyTerminalController,
+} from "@openclaw/libterminal/browser";
 // Dockable operator terminal panel for the Control UI shell.
 //
 // Renders a VS Code-style shell dock (bottom by default, or right) with session
@@ -10,6 +13,7 @@ import { property, state } from "lit/decorators.js";
 import { t } from "../../i18n/index.ts";
 import { OpenClawLitElement } from "../../lit/openclaw-element.ts";
 import { createDockPanelLayout, type DockPanelSide } from "../dock-panel-layout.ts";
+import { panelTabStripStyles } from "../panel-tab-strip.ts";
 import {
   isTerminalPanelShortcut,
   TERMINAL_PANEL_TOGGLE_EVENT,
@@ -41,13 +45,14 @@ import {
   type TerminalTabReadinessState,
 } from "./terminal-tab-readiness.ts";
 import { TerminalTaskQueue } from "./terminal-task-queue.ts";
-import { terminalTheme } from "./terminal-theme.ts";
+import { terminalDynamicColors, terminalTheme } from "./terminal-theme.ts";
 
-type TerminalDock = DockPanelSide;
+type TerminalDock = Exclude<DockPanelSide, "left">;
 type TerminalTabState = TerminalPanelTab &
   TerminalTabReadinessState & {
     gatewaySessionId: string;
     pendingInput: StartupInputBuffer;
+    defaultColorQueries: ReturnType<typeof createTerminalDefaultColorQueryResponder>;
     controller: GhosttyTerminalController;
     shell: string;
     host: HTMLDivElement;
@@ -72,6 +77,7 @@ const panelLayout = createDockPanelLayout({
   minHeight: 140,
   minWidth: 320,
   defaultDock: "bottom",
+  supportedDocks: ["bottom", "right"],
   defaultHeight: 320,
   defaultWidth: 520,
 });
@@ -79,6 +85,14 @@ const TERMINAL_FONT_FAMILY =
   'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Symbols Nerd Font Mono", "MesloLGLDZ Nerd Font Mono", "JetBrainsMono Nerd Font Mono", "Liberation Mono", monospace';
 const TERMINAL_OUTPUT_ENCODER = new TextEncoder();
 const CATALOG_TERMINAL_READY_TIMEOUT_MS = 30_000;
+
+function forceTerminalRender(controller: GhosttyTerminalController): void {
+  const term = controller.terminal;
+  if (term.renderer && term.wasmTerm) {
+    // An omitted opacity defaults to 1; repaint without inventing a visible scrollbar.
+    term.renderer.render(term.wasmTerm, true, term.viewportY, term, 0);
+  }
+}
 
 /** `<openclaw-terminal-panel>` — the dockable Control UI shell surface. */
 export class OpenClawTerminalPanel extends OpenClawLitElement {
@@ -212,7 +226,7 @@ export class OpenClawTerminalPanel extends OpenClawLitElement {
         const term = tab.controller.terminal;
         if (term.renderer && term.wasmTerm) {
           term.renderer.setTheme(theme);
-          term.renderer.render(term.wasmTerm, true, term.viewportY, term);
+          forceTerminalRender(tab.controller);
         }
       }
     }
@@ -227,7 +241,13 @@ export class OpenClawTerminalPanel extends OpenClawLitElement {
             viewport.append(tab.host);
           }
         }
-        this.tabs.find((tab) => tab.id === this.activeId)?.controller.fit();
+        const activeTab = this.tabs.find((tab) => tab.id === this.activeId);
+        if (activeTab) {
+          activeTab.controller.fit();
+          // FitAddon skips unchanged dimensions; force dirty-row rendering to
+          // repair a canvas that was detached while the panel was hidden.
+          forceTerminalRender(activeTab.controller);
+        }
       }
     }
     this.syncLayoutReservation();
@@ -331,14 +351,22 @@ export class OpenClawTerminalPanel extends OpenClawLitElement {
     if (dock) {
       this.dock = dock;
     }
-    if (detail?.catalog || detail?.open === true) {
+    if (detail?.open === false) {
+      this.closePanel();
+      return;
+    }
+    if (detail?.terminalSessionId || detail?.catalog || detail?.open === true) {
       if (!this.available) {
         return;
       }
       this.open = true;
       this.syncLayoutReservation();
       this.persistLayout();
-      void (detail.catalog ? this.openCatalogSession(detail.catalog) : this.restoreSessions());
+      void (detail.terminalSessionId
+        ? this.openRequestedSession(detail.terminalSessionId)
+        : detail.catalog
+          ? this.openCatalogSession(detail.catalog)
+          : this.restoreSessions());
       return;
     }
     this.toggle();
@@ -376,6 +404,10 @@ export class OpenClawTerminalPanel extends OpenClawLitElement {
     );
   }
 
+  private async openRequestedSession(sessionId: string): Promise<void> {
+    await this.enqueueAttachSession(sessionId, true);
+  }
+
   private async reattachPersistedSessions(): Promise<void> {
     const operation = this.captureTerminalOperation();
     if (!operation || this.tabs.length > 0) {
@@ -390,9 +422,19 @@ export class OpenClawTerminalPanel extends OpenClawLitElement {
         if (!this.isTerminalOperationCurrent(operation)) {
           return;
         }
-        const known = new Set(listed.map((session) => session.sessionId));
-        for (const sessionId of persisted.filter((id) => known.has(id))) {
-          await this.attachSession(sessionId, operation);
+        const known = new Map(listed.map((session) => [session.sessionId, session]));
+        for (const sessionId of persisted) {
+          const session = known.get(sessionId);
+          if (!session) {
+            await this.restoreExitedSession(sessionId, operation);
+          } else {
+            await this.attachSession(
+              sessionId,
+              operation,
+              session.owner?.startsWith("agent:") === true,
+              true,
+            );
+          }
           if (!this.isTerminalOperationCurrent(operation)) {
             return;
           }
@@ -455,8 +497,15 @@ export class OpenClawTerminalPanel extends OpenClawLitElement {
     }
   }
 
-  private async attachPickedSession(sessionId: string): Promise<void> {
+  private async attachPickedSession(
+    sessionId: string,
+    owner: TerminalSessionInfo["owner"],
+  ): Promise<void> {
     this.sessionPickerOpen = false;
+    await this.enqueueAttachSession(sessionId, owner?.startsWith("agent:") === true);
+  }
+
+  private async enqueueAttachSession(sessionId: string, agentOwned: boolean): Promise<void> {
     await this.bootQueue.enqueue(async () => {
       const existing = this.tabs.find((tab) => tab.gatewaySessionId === sessionId);
       if (existing) {
@@ -470,7 +519,7 @@ export class OpenClawTerminalPanel extends OpenClawLitElement {
       this.booting = true;
       this.errorText = null;
       try {
-        const attached = await this.attachSession(sessionId, operation);
+        const attached = await this.attachSession(sessionId, operation, agentOwned);
         if (!attached && this.isTerminalOperationCurrent(operation)) {
           this.errorText = t("terminal.attachFailed");
         }
@@ -513,6 +562,12 @@ export class OpenClawTerminalPanel extends OpenClawLitElement {
       connection,
       () => tabRef.current?.gatewaySessionId,
     );
+    const { createTerminalDefaultColorQueryResponder } =
+      await import("@openclaw/libterminal/browser");
+    const defaultColorQueries = createTerminalDefaultColorQueryResponder({
+      getColors: () => terminalDynamicColors(this.themeMode),
+      reply: (data) => startupInput.onData(TERMINAL_OUTPUT_ENCODER.encode(data)),
+    });
     let controller: GhosttyTerminalController;
     try {
       controller = await this.createTerminal({
@@ -547,10 +602,12 @@ export class OpenClawTerminalPanel extends OpenClawLitElement {
       sequence: this.tabSeq,
       gatewaySessionId: "",
       pendingInput: startupInput.buffer,
+      defaultColorQueries,
       shellName: null,
       shell: "",
       agentId: null,
       cwd: null,
+      agentOwned: false,
       controller,
       host,
       status: "connecting",
@@ -571,6 +628,7 @@ export class OpenClawTerminalPanel extends OpenClawLitElement {
       // connection.open/attach from writing to an already-disposed terminal.
       onData: (data: string) => {
         if (!tab.cancelled) {
+          tab.defaultColorQueries.observe(data);
           tab.controller.write(TERMINAL_OUTPUT_ENCODER.encode(data));
           if (data.length > 0) {
             this.readiness.markReady(tab);
@@ -579,8 +637,12 @@ export class OpenClawTerminalPanel extends OpenClawLitElement {
       },
       // A replay is authoritative. Reset parser, screen, and scrollback so a
       // gap cannot leave stale cells or a partial escape sequence behind.
-      onReplay: (data: string) => {
+      onReplay: (data: string, newlyObservedFrom: number) => {
         if (!tab.cancelled) {
+          // Suppress complete historical queries, then answer only the suffix
+          // recovered after a sequence gap. A split query may cross the seam.
+          tab.defaultColorQueries.primeFromReplay(data.slice(0, newlyObservedFrom));
+          tab.defaultColorQueries.observe(data.slice(newlyObservedFrom));
           tab.controller.terminal.reset();
           if (data) {
             tab.controller.write(TERMINAL_OUTPUT_ENCODER.encode(data));
@@ -597,12 +659,14 @@ export class OpenClawTerminalPanel extends OpenClawLitElement {
   private adoptSession(
     tab: TerminalTabState,
     result: { sessionId: string; shell: string; agentId: string; cwd: string; title?: string },
+    agentOwned = false,
   ): void {
     tab.gatewaySessionId = result.sessionId;
     tab.shellName = result.title ?? shellBasename(result.shell);
     tab.shell = result.shell;
     tab.agentId = result.agentId;
     tab.cwd = result.cwd;
+    tab.agentOwned = agentOwned;
     // Libterminal observes layout before the Gateway session exists. Resync the
     // current grid now so a resize during the open/attach RPC is not lost.
     const { cols, rows } = tab.controller.terminal;
@@ -690,12 +754,19 @@ export class OpenClawTerminalPanel extends OpenClawLitElement {
     }
   }
 
-  /** Reattaches one persisted session; returns false when it is gone. */
-  private async attachSession(sessionId: string, operation: TerminalOperation): Promise<boolean> {
+  /** Reattaches one session and reports whether adoption succeeded. */
+  private async attachSession(
+    sessionId: string,
+    operation: TerminalOperation,
+    agentOwned = false,
+    confirmGoneOnFailure = false,
+  ): Promise<boolean> {
     let createdTab: TerminalTabState | undefined;
+    let createdConnection: TerminalConnection | undefined;
     try {
       const boot = await this.bootTab(operation);
       createdTab = boot.tab;
+      createdConnection = boot.connection;
       const result = await boot.connection.attach(sessionId, this.tabSink(boot.tab));
       if (!this.isTerminalOperationCurrent(operation) || boot.tab.cancelled) {
         // A user close is deliberate; lifecycle cancellation leaves the existing
@@ -709,17 +780,61 @@ export class OpenClawTerminalPanel extends OpenClawLitElement {
         }
         return false;
       }
-      this.adoptSession(boot.tab, result);
+      this.adoptSession(boot.tab, result, agentOwned);
       return true;
     } catch {
-      // Session expired between list and attach (reaper race) or an older
-      // gateway: quietly drop the placeholder tab; restore falls back to a
-      // fresh session when nothing could be reattached.
+      const sessionGone =
+        confirmGoneOnFailure && createdConnection
+          ? await this.confirmRestoredSessionGone(createdConnection, sessionId, operation)
+          : false;
       if (createdTab && !createdTab.gatewaySessionId && this.tabs.includes(createdTab)) {
-        this.dropFailedTab(createdTab);
+        if (sessionGone) {
+          this.markRestoredSessionExited(createdTab, sessionId);
+        } else {
+          this.dropFailedTab(createdTab);
+        }
       }
       return false;
     }
+  }
+
+  private async confirmRestoredSessionGone(
+    connection: TerminalConnection,
+    sessionId: string,
+    operation: TerminalOperation,
+  ): Promise<boolean> {
+    try {
+      const sessions = await connection.list();
+      return (
+        this.isTerminalOperationCurrent(operation) &&
+        !sessions.some((session) => session.sessionId === sessionId)
+      );
+    } catch {
+      // A failed confirmation cannot turn a transport or authorization error
+      // into an authoritative terminal exit.
+      return false;
+    }
+  }
+
+  /** Keeps a dead persisted session visible without replaying bytes from a missing PTY. */
+  private async restoreExitedSession(
+    sessionId: string,
+    operation: TerminalOperation,
+  ): Promise<void> {
+    const boot = await this.bootTab(operation);
+    if (!this.isTerminalOperationCurrent(operation) || boot.tab.cancelled) {
+      if (this.tabs.includes(boot.tab)) {
+        boot.tab.cancelled = "lifecycle";
+        this.dropFailedTab(boot.tab);
+      }
+      return;
+    }
+    this.markRestoredSessionExited(boot.tab, sessionId);
+  }
+
+  private markRestoredSessionExited(tab: TerminalTabState, sessionId: string): void {
+    tab.gatewaySessionId = sessionId;
+    this.handleExit(tab.id, { reason: "disconnected", exitCode: null });
   }
 
   private handleExit(
@@ -773,10 +888,14 @@ export class OpenClawTerminalPanel extends OpenClawLitElement {
   private switchTo(tabId: string): void {
     this.activeId = tabId;
     const tab = this.tabs.find((entry) => entry.id === tabId);
-    // Refit after the container becomes visible so cols/rows match the viewport.
+    // Refit and repaint after the container becomes visible. A same-size tab
+    // switch otherwise leaves the newly shown canvas without dirty rows.
     void this.updateComplete.then(() => {
-      tab?.controller.fit();
-      tab?.controller.terminal.focus();
+      if (tab) {
+        tab.controller.fit();
+        forceTerminalRender(tab.controller);
+        tab.controller.terminal.focus();
+      }
     });
   }
 
@@ -986,7 +1105,7 @@ export class OpenClawTerminalPanel extends OpenClawLitElement {
               ),
               onToggle: () => this.toggleSessionPicker(),
               onRefresh: () => void this.refreshSessionPicker(),
-              onAttach: (sessionId) => void this.attachPickedSession(sessionId),
+              onAttach: (sessionId, owner) => void this.attachPickedSession(sessionId, owner),
             }),
             onDock: (dock) => this.setDock(dock),
             onHide: () => this.closePanel(),
@@ -1026,7 +1145,7 @@ export class OpenClawTerminalPanel extends OpenClawLitElement {
     }
   }
 
-  static override styles = [terminalPanelStyles, terminalPanelUploadStyles];
+  static override styles = [panelTabStripStyles, terminalPanelStyles, terminalPanelUploadStyles];
 }
 
 declare global {

@@ -50,10 +50,16 @@ export type {
   AgentHarnessRuntimeArtifactBinding,
   AgentHarnessSideQuestionParams,
   AgentHarnessSideQuestionResult,
+  AgentHarnessSettledTurnFinalizationResult,
   AgentHarnessResetParams,
+  AgentHarnessSessionForkFailureCode,
+  AgentHarnessSessionForkParams,
+  AgentHarnessSessionForkResult,
   AgentHarnessSupport,
   AgentHarnessSupportContext,
 } from "../agents/harness/types.js";
+export { AgentHarnessSessionSupersededError } from "../agents/harness/errors.js";
+export { projectSettledTurnFinalizationAttemptResult } from "../agents/harness/settled-turn-finalization-result.js";
 export { fingerprintResolvedAuthProfileCredential } from "../agents/execution-auth-binding.js";
 export type {
   AgentHarnessUserInputAnswers,
@@ -61,6 +67,7 @@ export type {
   AgentHarnessUserInputPromptOptions,
   AgentHarnessUserInputQuestion,
 } from "../agents/harness/user-input-bridge.js";
+export type { AgentHarnessQuestionGatewayCall } from "../agents/harness/gateway-question.js";
 export type EmbeddedRunAttemptParams = Omit<CoreEmbeddedRunAttemptParams, "trajectoryRecorder">;
 export type { EmbeddedRunAttemptResult };
 export type {
@@ -97,7 +104,6 @@ export type {
   AgentToolResultMiddleware,
   AgentToolResultMiddlewareContext,
   AgentToolResultMiddlewareEvent,
-  AgentToolResultMiddlewareHarness,
   AgentToolResultMiddlewareOptions,
   AgentToolResultMiddlewareResult,
   AgentToolResultMiddlewareRuntime,
@@ -132,7 +138,6 @@ export {
   /** @deprecated Use classifyEmbeddedAgentRunResultForModelFallback. */
   classifyEmbeddedAgentRunResultForModelFallback as classifyEmbeddedPiRunResultForModelFallback,
 } from "../agents/embedded-agent-runner/result-fallback-classifier.js";
-export { resolveEmbeddedAgentRuntime } from "../agents/agent-runtime-id.js";
 export { resolveUserPath } from "../utils.js";
 export { callGatewayTool } from "../agents/tools/gateway.js";
 export type { NodeListNode } from "../agents/tools/nodes-utils.js";
@@ -163,7 +168,6 @@ export {
   type ToolResultFailureKind,
 } from "../agents/tool-result-error.js";
 export { normalizeUsage } from "../agents/usage.js";
-export { resolveOpenClawAgentDir } from "./agent-dir-compat.js";
 export {
   resolveAgentDir,
   resolveDefaultAgentDir,
@@ -180,6 +184,11 @@ export {
   formatAgentHarnessUserInputPrompt,
   normalizeAgentHarnessUserInputAnswer,
 } from "../agents/harness/user-input-bridge.js";
+export {
+  cancelPendingAgentQuestionForSession,
+  claimPendingAgentQuestionAnswer,
+  runAgentHarnessGatewayQuestion,
+} from "../agents/harness/gateway-question.js";
 export {
   buildSkillWorkshopPromptSection,
   SKILL_WORKSHOP_TOOL_NAME,

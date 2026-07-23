@@ -480,7 +480,6 @@ vi.mock("./inbound/runtime-api.js", () => ({
 vi.mock("./auto-reply/monitor/inbound-dispatch.runtime.js", () => ({
   createChannelMessageReplyPipeline: createChannelMessageReplyPipelineMock,
   dispatchReplyWithBufferedBlockDispatcher: createBufferedDispatchReplyMock(),
-  finalizeInboundContext: <T>(ctx: T) => ctx,
   getAgentScopedMediaLocalRoots: () => [] as string[],
   jidToE164: normalizePhoneLikeToE164,
   logVerbose: (_msg: string) => undefined,
@@ -510,7 +509,6 @@ vi.mock("./auto-reply/monitor/runtime-api.js", () => ({
   },
   createChannelMessageReplyPipeline: createChannelMessageReplyPipelineMock,
   dispatchReplyWithBufferedBlockDispatcher: createBufferedDispatchReplyMock(),
-  finalizeInboundContext: <T>(ctx: T) => ctx,
   formatInboundEnvelope: formatInboundEnvelopeMock,
   getAgentScopedMediaLocalRoots: () => [] as string[],
   isControlCommandMessage: () => false,
@@ -540,7 +538,6 @@ vi.mock("./auto-reply/monitor/runtime-api.js", () => ({
     const first = params.allowFrom?.[0];
     return first ? params.normalizeEntry(first) : null;
   },
-  resolveDmGroupAccessWithCommandGate: () => ({ commandAuthorized: true }),
   resolveSendableOutboundReplyParts: resolveSendableOutboundReplyPartsMock,
   resolveTextChunkLimit: () => 64_000,
   shouldComputeCommandAuthorized: () => false,
@@ -634,12 +631,11 @@ vi.mock("./auto-reply/monitor/message-line.runtime.js", () => ({
   resolveMessagePrefix: (
     cfg: {
       channels?: { whatsapp?: { messagePrefix?: string; allowFrom?: string[] } };
-      messages?: { messagePrefix?: string };
     },
     _agentId: string,
     params?: { configured?: string; hasAllowFrom?: boolean },
   ) => {
-    const configured = params?.configured ?? cfg.messages?.messagePrefix;
+    const configured = params?.configured ?? cfg.channels?.whatsapp?.messagePrefix;
     if (configured !== undefined) {
       return configured;
     }
