@@ -123,7 +123,9 @@ export {
   clearPluginOwnedSessionState,
   listSessionEntries,
   listSessionEntriesReadOnly,
+  listSessionEntryKeysReadOnly,
   loadExactSessionEntry,
+  loadExactSessionEntryReadOnly,
   loadSessionEntry,
   loadSessionEntryReadOnly,
   openSessionEntryReadView,
@@ -177,6 +179,7 @@ export {
   commitReplySessionInitialization,
   loadReplySessionInitializationSnapshot,
   persistSessionResetLifecycle,
+  SessionInitializationAgentScopeMismatchError,
 } from "./session-accessor.reset.js";
 export {
   appendTranscriptEvent,
