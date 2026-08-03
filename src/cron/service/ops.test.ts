@@ -921,7 +921,7 @@ describe("cron service ops seam coverage", () => {
         runtime: "cron",
         status: "succeeded",
         sourceId: "isolated-timeout",
-        progressSummary: "Running cron job.",
+        progressSummary: "Running automation.",
       });
       expect(findTaskByRunId(manualRunId)).toBeUndefined();
     });
@@ -1207,7 +1207,7 @@ describe("cron service ops seam coverage", () => {
         runtime: "cron",
         status: "timed_out",
         sourceId: "startup-timeout",
-        progressSummary: "Running cron job.",
+        progressSummary: "Running automation.",
       });
     });
   });
@@ -1244,8 +1244,8 @@ describe("cron service ops seam coverage", () => {
         throw new Error("expected active manual cron task ledger record");
       }
       expect(task.status).toBe("running");
-      expect(task.progressSummary).toBe("Running cron job.");
-      expect(formatTaskStatusDetail(task)).toBe("Running cron job.");
+      expect(task.progressSummary).toBe("Running automation.");
+      expect(formatTaskStatusDetail(task)).toBe("Running automation.");
 
       resolveRun?.({ status: "ok", summary: "done" });
       await manualRun;
@@ -1353,6 +1353,54 @@ describe("cron service ops seam coverage", () => {
     }
 
     expect(updated.enabled).toBe(false);
+  });
+
+  it("clears auto-disable state and failure streaks when manually re-enabled", async () => {
+    const { storePath } = await makeStorePath();
+    const now = Date.parse("2026-08-01T16:00:00.000Z");
+    await writeCronStoreSnapshot({
+      storePath,
+      jobs: [
+        {
+          id: "auto-disabled-recurring",
+          name: "auto-disabled recurring",
+          enabled: false,
+          createdAtMs: now - 60_000,
+          updatedAtMs: now - 60_000,
+          schedule: { kind: "cron", expr: "0 * * * *" },
+          sessionTarget: "isolated",
+          wakeMode: "next-heartbeat",
+          payload: { kind: "agentTurn", message: "do work" },
+          state: {
+            consecutiveErrors: 10,
+            scheduleErrorCount: 3,
+            autoDisabled: {
+              reason: "consecutive-failures",
+              atMs: now - 1_000,
+              consecutiveErrors: 10,
+            },
+          },
+        },
+      ],
+    });
+    const state = createOkIsolatedCronState({ storePath, now });
+
+    const updated = await update(state, "auto-disabled-recurring", { enabled: true });
+    if (state.timer) {
+      clearTimeout(state.timer);
+    }
+
+    expect(updated).toMatchObject({
+      enabled: true,
+      state: { consecutiveErrors: 0, scheduleErrorCount: 0 },
+    });
+    expect(updated.state.autoDisabled).toBeUndefined();
+    const persisted = (await loadCronStore(storePath)).jobs[0];
+    expect(persisted).toMatchObject({
+      enabled: true,
+      state: { consecutiveErrors: 0, scheduleErrorCount: 0 },
+    });
+    expect(persisted?.state.autoDisabled).toBeUndefined();
   });
 
   it("rejects enabling a pre-existing never-matching job", async () => {

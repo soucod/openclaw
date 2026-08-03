@@ -1,4 +1,5 @@
 /** Linux systemd user service installer, parser, and lifecycle controls. */
+import { randomUUID } from "node:crypto";
 import * as fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -17,6 +18,7 @@ import {
   parseStrictNonNegativeInteger,
   parseStrictPositiveInteger,
 } from "../infra/parse-finite-number.js";
+import { escapeRegExp } from "../shared/regexp.js";
 import { splitArgsPreservingQuotes } from "./arg-split.js";
 import {
   LEGACY_GATEWAY_SYSTEMD_SERVICE_NAMES,
@@ -48,6 +50,7 @@ import type {
   GatewayServiceRestartResult,
 } from "./service-types.js";
 import { enableSystemdUserLinger, readSystemdUserLingerStatus } from "./systemd-linger.js";
+import { assertNoSystemSystemdOwnership } from "./systemd-system.js";
 import {
   classifySystemdUnavailableDetail,
   isSystemctlMissingDetail,
@@ -55,7 +58,6 @@ import {
 } from "./systemd-unavailable.js";
 import {
   buildSystemdUnit,
-  parseSystemdEnvAssignment,
   parseSystemdEnvAssignments,
   parseSystemdExecStart,
   renderSystemdEnvAssignment,
@@ -325,8 +327,7 @@ export async function readSystemdServiceExecStart(
         workingDirectory = line.slice("WorkingDirectory=".length).trim();
       } else if (line.startsWith("Environment=")) {
         const raw = line.slice("Environment=".length).trim();
-        const parsed = parseSystemdEnvAssignment(raw);
-        if (parsed) {
+        for (const parsed of parseSystemdEnvAssignments(raw)) {
           inlineEnvironment[parsed.key] = parsed.value;
         }
       } else if (line.startsWith("EnvironmentFile=")) {
@@ -514,6 +515,13 @@ function resolveLegacyNodeSystemdEnvironmentFilePath(params: {
 
 function isNodeSystemdEnvironment(env: GatewayServiceEnv): boolean {
   return env.OPENCLAW_SERVICE_KIND?.trim() === "node";
+}
+
+async function assertNoSystemGatewayOwnership(env: GatewayServiceEnv): Promise<void> {
+  if (isNodeSystemdEnvironment(env)) {
+    return;
+  }
+  await assertNoSystemSystemdOwnership(`${resolveSystemdServiceName(env)}.service`);
 }
 
 function expandSystemdSpecifier(input: string, env: GatewayServiceEnv): string {
@@ -1097,9 +1105,11 @@ async function writeSystemdUnit({
   description,
 }: Omit<GatewayServiceInstallArgs, "stdout">): Promise<{ unitPath: string; backedUp: boolean }> {
   await assertSystemdAvailable(env);
+  await assertNoSystemGatewayOwnership(env);
 
   const unitPath = resolveSystemdUnitPath(env);
   await fs.mkdir(path.dirname(unitPath), { recursive: true });
+  await assertSystemdManagedPathIsNotSymlink(unitPath);
   const fileManagedKeys = collectSystemdFileManagedKeys({
     environmentValueSources,
   });
@@ -1139,51 +1149,163 @@ async function writeSystemdUnit({
     environment,
     environmentValueSources,
   });
-  const environmentFileResult = await writeSystemdGatewayEnvironmentFile({
+  const environmentFilePath = resolveSystemdEnvironmentFilePath({
     stateDir,
-    dotenvVars: stateDirDotEnvVars,
-    inlineManagedKeys,
-    fileManagedKeys,
-    skippedManagedKeys: skippedShellReferenceKeys,
-    fileBackedEnvironment: collectSystemdFileBackedEnvironment({
-      environment,
-      fileManagedKeys,
-    }),
     environment,
   });
-  const environmentSansDotEnvEntries = Object.fromEntries(
-    Object.entries(environment ?? {}).filter(([key, value]) => {
-      if (typeof value !== "string") {
-        return false;
+  const environmentFileSnapshot = isNodeSystemdEnvironment(env)
+    ? undefined
+    : await readSystemdFileSnapshot(environmentFilePath);
+  try {
+    const environmentFileResult = await writeSystemdGatewayEnvironmentFile({
+      stateDir,
+      dotenvVars: stateDirDotEnvVars,
+      inlineManagedKeys,
+      fileManagedKeys,
+      skippedManagedKeys: skippedShellReferenceKeys,
+      fileBackedEnvironment: collectSystemdFileBackedEnvironment({
+        environment,
+        fileManagedKeys,
+      }),
+      environment,
+    });
+    const environmentSansDotEnvEntries = Object.fromEntries(
+      Object.entries(environment ?? {}).filter(([key, value]) => {
+        if (typeof value !== "string") {
+          return false;
+        }
+        const source = readEnvironmentValueSource(environmentValueSources, key);
+        if (hasEnvironmentFileSource(source) && isUnresolvedShellReference(value)) {
+          return false;
+        }
+        const normalizedKey = normalizeSystemdEnvironmentKey(key);
+        if (
+          normalizedKey &&
+          environmentFileResult.environmentKeys.has(normalizedKey) &&
+          !inlineManagedKeys.has(normalizedKey)
+        ) {
+          return false;
+        }
+        const stateDirValue = stateDirDotEnvVars[key];
+        if (typeof stateDirValue !== "string") {
+          return true;
+        }
+        return value.trim() !== stateDirValue.trim();
+      }),
+    );
+    const unit = buildSystemdUnit({
+      description: serviceDescription,
+      programArguments,
+      workingDirectory,
+      environment: environmentSansDotEnvEntries,
+      environmentFiles: environmentFileResult.environmentFiles,
+    });
+    await publishSystemdUnit({ env, unitPath, contents: unit });
+  } catch (error) {
+    if (environmentFileSnapshot !== undefined) {
+      try {
+        await restoreSystemdFileSnapshot(environmentFilePath, environmentFileSnapshot);
+      } catch (rollbackError) {
+        const failureDetail = error instanceof Error ? error.message : String(error);
+        throw new Error(
+          `${failureDetail}\nThe previous systemd environment file at ${environmentFilePath} could not be restored.`,
+          { cause: rollbackError },
+        );
       }
-      const source = readEnvironmentValueSource(environmentValueSources, key);
-      if (hasEnvironmentFileSource(source) && isUnresolvedShellReference(value)) {
-        return false;
-      }
-      const normalizedKey = normalizeSystemdEnvironmentKey(key);
-      if (
-        normalizedKey &&
-        environmentFileResult.environmentKeys.has(normalizedKey) &&
-        !inlineManagedKeys.has(normalizedKey)
-      ) {
-        return false;
-      }
-      const stateDirValue = stateDirDotEnvVars[key];
-      if (typeof stateDirValue !== "string") {
-        return true;
-      }
-      return value.trim() !== stateDirValue.trim();
-    }),
-  );
-  const unit = buildSystemdUnit({
-    description: serviceDescription,
-    programArguments,
-    workingDirectory,
-    environment: environmentSansDotEnvEntries,
-    environmentFiles: environmentFileResult.environmentFiles,
-  });
-  await fs.writeFile(unitPath, unit, "utf8");
+    }
+    throw error;
+  }
   return { unitPath, backedUp };
+}
+
+type SystemdFileSnapshot = { contents: Buffer; mode: number } | null;
+
+async function assertSystemdManagedPathIsNotSymlink(filePath: string): Promise<void> {
+  try {
+    const stat = await fs.lstat(filePath);
+    if (stat.isSymbolicLink()) {
+      throw new Error(`Refusing to rewrite symlinked managed systemd file: ${filePath}`);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return;
+    }
+    throw error;
+  }
+}
+
+async function readSystemdFileSnapshot(filePath: string): Promise<SystemdFileSnapshot> {
+  try {
+    const stat = await fs.lstat(filePath);
+    if (stat.isSymbolicLink()) {
+      throw new Error(`Refusing to rewrite symlinked managed systemd file: ${filePath}`);
+    }
+    const contents = await fs.readFile(filePath);
+    return { contents, mode: stat.mode & 0o777 };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function restoreSystemdFileSnapshot(
+  filePath: string,
+  snapshot: SystemdFileSnapshot,
+): Promise<void> {
+  if (snapshot === null) {
+    await fs.rm(filePath, { force: true });
+    return;
+  }
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  const rollbackPath = `${filePath}.openclaw-${randomUUID()}.rollback`;
+  try {
+    await fs.writeFile(rollbackPath, snapshot.contents, {
+      flag: "wx",
+      mode: snapshot.mode,
+    });
+    await fs.rename(rollbackPath, filePath);
+  } finally {
+    await fs.unlink(rollbackPath).catch(() => undefined);
+  }
+}
+
+async function publishSystemdUnit(params: {
+  env: GatewayServiceEnv;
+  unitPath: string;
+  contents: string;
+}): Promise<void> {
+  const previous = await readSystemdFileSnapshot(params.unitPath);
+  const temporaryPath = `${params.unitPath}.openclaw-${randomUUID()}.tmp`;
+  await fs.writeFile(temporaryPath, params.contents, {
+    encoding: "utf8",
+    flag: "wx",
+    mode: previous?.mode ?? 0o644,
+  });
+  try {
+    // systemd ignores the temporary suffix, so this is the last ownership check
+    // before the canonical user unit becomes discoverable.
+    await assertNoSystemGatewayOwnership(params.env);
+    await fs.rename(temporaryPath, params.unitPath);
+    try {
+      await assertNoSystemGatewayOwnership(params.env);
+    } catch (ownershipError) {
+      try {
+        await restoreSystemdFileSnapshot(params.unitPath, previous);
+      } catch (rollbackError) {
+        const ownershipDetail =
+          ownershipError instanceof Error ? ownershipError.message : String(ownershipError);
+        throw new Error(
+          `${ownershipDetail}\nThe previous user systemd unit at ${params.unitPath} could not be restored.`,
+          { cause: rollbackError },
+        );
+      }
+      throw ownershipError;
+    }
+  } finally {
+    await fs.unlink(temporaryPath).catch(() => undefined);
+  }
 }
 
 async function writeSystemdGatewayEnvironmentFile(params: {
@@ -1347,6 +1469,9 @@ export async function stageSystemdService({
 async function activateSystemdService(params: { env: GatewayServiceEnv }) {
   const serviceName = resolveSystemdServiceName(params.env);
   const unitName = `${serviceName}.service`;
+  // A system unit may appear after publication. Refuse before the user manager
+  // can load a second supervisor for the same gateway name.
+  await assertNoSystemGatewayOwnership(params.env);
   const reloadSystemd = async () => await execSystemctlUser(params.env, ["daemon-reload"]);
   const throwActivationFailure = (
     action: "daemon-reload" | "enable" | "restart",
@@ -1419,7 +1544,21 @@ export async function uninstallSystemdService({
   await assertSystemdAvailable(env);
   const serviceName = resolveSystemdServiceName(env);
   const unitName = `${serviceName}.service`;
-  await execSystemctlUser(env, ["disable", "--now", unitName]);
+  const disabled = await execSystemctlUser(env, ["disable", "--now", unitName]);
+  if (disabled.code !== 0) {
+    const detail = readSystemctlDetail(disabled);
+    const escapedUnitName = escapeRegExp(normalizeLowercaseStringOrEmpty(unitName));
+    const alreadyMissingOrInactive = new RegExp(
+      `^(?:failed to (?:disable unit|stop\\s+${escapedUnitName}):\\s*)?` +
+        `(?:unit file\\s+${escapedUnitName}\\s+does not exist|` +
+        `unit\\s+${escapedUnitName}(?:\\s+is)?\\s+` +
+        `(?:inactive|not\\s+active|not\\s+loaded|not-found|could not be found))[.!]?$`,
+      "u",
+    ).test(normalizeLowercaseStringOrEmpty(detail));
+    if (!alreadyMissingOrInactive) {
+      throw new Error(`systemctl disable failed: ${detail || "unknown error"}`);
+    }
+  }
 
   const unitPath = resolveSystemdUnitPath(env);
   let removed = false;
@@ -1467,11 +1606,11 @@ async function runSystemdServiceAction(params: {
         `${unitName} is a system-scope unit (${installed.unitPath}); run \`sudo systemctl ${params.action} ${unitName}\` to ${params.action} it`,
       );
     }
-    if (params.action === "restart") {
+    if (params.action !== "stop") {
       // systemd latches a unit into failed/start-limit-hit after it crashes faster
       // than StartLimitBurst allows and then stops auto-restarting it. Clear the
-      // latch first so an operator restart can recover a crash-looped gateway;
-      // reset-failed is idempotent and a no-op on a healthy unit.
+      // latch before start/restart so an operator can recover a crash-looped
+      // gateway with the natural start command. Idempotent on healthy units.
       await execSystemctl(["reset-failed", unitName], env);
     }
     const res = await execSystemctl([params.action, unitName], env);
@@ -1483,9 +1622,10 @@ async function runSystemdServiceAction(params: {
     return;
   }
   await assertSystemdAvailable(env);
-  if (params.action === "restart") {
-    // Clear any failed/start-limit-hit latch before restart so a crash-looped
-    // gateway recovers (see system-scope branch above). Idempotent on healthy units.
+  if (params.action !== "stop") {
+    await assertNoSystemGatewayOwnership(env);
+    // Clear the same latch for user-scope start/restart after the ownership
+    // guard, so a conflicting system unit is never mutated.
     await execSystemctlUser(env, ["reset-failed", unitName]);
   }
   const res = await execSystemctlUser(env, [params.action, unitName]);
