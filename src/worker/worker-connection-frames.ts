@@ -27,11 +27,15 @@ import {
   validateWorkerInferenceEventFrame,
   validateWorkerInferenceTerminalFrame,
 } from "../../packages/gateway-protocol/src/schema/worker-inference.js";
+import { notifyListeners } from "../shared/listeners.js";
 import {
   createPendingRequestRegistry,
   type PendingRequestEntry,
 } from "../shared/pending-request-registry.js";
-import { WorkerConnectionInterruptedError, toError } from "./worker-connection-contract.js";
+import {
+  WorkerConnectionInterruptedError,
+  toWorkerConnectionError,
+} from "./worker-connection-contract.js";
 
 const WORKER_REQUEST_SPECS = {
   heartbeat: {
@@ -133,9 +137,7 @@ export class WorkerConnectionFrameDispatcher {
         closeInvalidWorkerFrame(socket);
         return;
       }
-      for (const listener of this.inferenceEventListeners) {
-        listener(frame);
-      }
+      notifyListeners(this.inferenceEventListeners, frame);
       return;
     }
     if (validateWorkerInferenceTerminalFrame(frame)) {
@@ -143,9 +145,7 @@ export class WorkerConnectionFrameDispatcher {
         closeInvalidWorkerFrame(socket);
         return;
       }
-      for (const listener of this.inferenceTerminalListeners) {
-        listener(frame);
-      }
+      notifyListeners(this.inferenceTerminalListeners, frame);
       return;
     }
     const id = responseId(frame);
@@ -198,7 +198,7 @@ export class WorkerConnectionFrameDispatcher {
     try {
       completed.value.beforeResolve?.(response);
     } catch (error) {
-      completed.reject(toError(error));
+      completed.reject(toWorkerConnectionError(error));
       return true;
     }
     completed.resolve(response);
@@ -223,7 +223,7 @@ export class WorkerConnectionFrameDispatcher {
     try {
       encoded = JSON.stringify(frame);
     } catch (error) {
-      return Promise.reject(toError(error));
+      return Promise.reject(toWorkerConnectionError(error));
     }
     const payloadLimit =
       value.kind === "inference-start"
@@ -257,7 +257,7 @@ export class WorkerConnectionFrameDispatcher {
     } catch (error) {
       this.pending
         .take(id, pending)
-        ?.reject(new WorkerConnectionInterruptedError(toError(error).message));
+        ?.reject(new WorkerConnectionInterruptedError(toWorkerConnectionError(error).message));
       this.options.interruptReadySocket(readySocket);
     }
     return pending.promise;

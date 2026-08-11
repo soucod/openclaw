@@ -1,43 +1,50 @@
+import path from "node:path";
 // sessions_spawn tool tests cover model-visible schema gating, ACP/subagent
 // dispatch, and result details for spawned child sessions.
-import path from "node:path";
+import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { upsertSessionEntry } from "../../config/sessions/session-accessor.js";
 import { withTempDir } from "../../test-helpers/temp-dir.js";
 import {
   SWARM_CODE_MODE_IDEMPOTENCY_KEY,
   SWARM_CODE_MODE_REQUEST_FINGERPRINT,
-} from "../swarm-code-mode.js";
+} from "../subagents/swarm/swarm-code-mode.js";
 import type { InProcessGatewayCaller } from "./in-process-gateway.js";
 
 const hoisted = vi.hoisted(() => {
   const spawnSubagentDirectMock = vi.fn();
   const spawnAcpDirectMock = vi.fn();
   const registerSubagentRunMock = vi.fn();
+  const getSubagentDeliveryBacklogPressureMock = vi.fn(() => ({
+    suspended: 0,
+    blocked: false,
+  }));
   const runSubagentProgressMock = vi.fn(async () => {});
   return {
     spawnSubagentDirectMock,
     spawnAcpDirectMock,
     registerSubagentRunMock,
+    getSubagentDeliveryBacklogPressureMock,
     runSubagentProgressMock,
   };
 });
 
-vi.mock("../subagent-spawn.js", () => ({
+vi.mock("../subagents/spawn/subagent-spawn.js", () => ({
   SUBAGENT_SPAWN_CONTEXT_MODES: ["isolated", "fork"],
   SUBAGENT_SPAWN_MODES: ["run", "session"],
   spawnSubagentDirect: (...args: unknown[]) => hoisted.spawnSubagentDirectMock(...args),
 }));
 
-vi.mock("../acp-spawn.js", () => ({
+vi.mock("../subagents/spawn/acp-spawn.js", () => ({
   ACP_SPAWN_MODES: ["run", "session"],
   ACP_SPAWN_STREAM_TARGETS: ["parent"],
   isSpawnAcpAcceptedResult: (result: { status?: string }) => result?.status === "accepted",
   spawnAcpDirect: (...args: unknown[]) => hoisted.spawnAcpDirectMock(...args),
 }));
 
-vi.mock("../subagent-registry.js", () => ({
+vi.mock("../subagents/registry/subagent-registry.js", () => ({
   registerSubagentRun: (...args: unknown[]) => hoisted.registerSubagentRunMock(...args),
+  getSubagentDeliveryBacklogPressure: () => hoisted.getSubagentDeliveryBacklogPressureMock(),
 }));
 
 vi.mock("../../plugins/hook-runner-global.js", () => ({
@@ -69,6 +76,9 @@ describe("sessions_spawn tool", () => {
       runId: "run-acp",
     });
     hoisted.registerSubagentRunMock.mockReset();
+    hoisted.getSubagentDeliveryBacklogPressureMock
+      .mockReset()
+      .mockReturnValue({ suspended: 0, blocked: false });
     hoisted.runSubagentProgressMock.mockClear();
   });
 
@@ -101,12 +111,7 @@ describe("sessions_spawn tool", () => {
     return property;
   }
 
-  function requireRecord(value: unknown, label: string): Record<string, unknown> {
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-      throw new Error(`expected ${label}`);
-    }
-    return value as Record<string, unknown>;
-  }
+  const requireRecord = createRequireRecord("record", "expected-label");
 
   function expectDetailFields(details: unknown, expected: Record<string, unknown>) {
     const record = requireRecord(details, "result details");
@@ -218,6 +223,30 @@ describe("sessions_spawn tool", () => {
     expect(JSON.stringify(result.details)).toContain("no ACP runtime backend is loaded");
     expect(hoisted.spawnAcpDirectMock).not.toHaveBeenCalled();
     expect(hoisted.spawnSubagentDirectMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { label: "native", args: { task: "investigate", runtime: "subagent" } },
+    { label: "ACP", args: { task: "investigate", runtime: "acp" }, acp: true },
+    { label: "visible", args: { task: "investigate", visible: true } },
+  ])("blocks $label starts when retained delivery pressure reaches capacity", async (testCase) => {
+    if (testCase.acp) {
+      registerAcpBackendForTest();
+    }
+    hoisted.getSubagentDeliveryBacklogPressureMock.mockReturnValue({
+      suspended: 50,
+      blocked: true,
+    });
+    const callGateway = vi.fn();
+    const tool = createSessionsSpawnTool({ callGateway });
+
+    const result = await tool.execute(`blocked-${testCase.label}`, testCase.args);
+
+    expectDetailFields(result.details, { status: "forbidden" });
+    expect(JSON.stringify(result.details)).toContain("50 completed tasks have blocked delivery");
+    expect(hoisted.spawnSubagentDirectMock).not.toHaveBeenCalled();
+    expect(hoisted.spawnAcpDirectMock).not.toHaveBeenCalled();
+    expect(callGateway).not.toHaveBeenCalled();
   });
 
   it("hides ACP runtime affordances when ACP policy is disabled", () => {

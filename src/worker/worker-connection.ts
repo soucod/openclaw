@@ -19,6 +19,7 @@ import type {
   WorkerInferenceTerminalFrame,
 } from "../../packages/gateway-protocol/src/schema/worker-inference.js";
 import { computeBackoff, sleepWithAbort, type BackoffPolicy } from "../infra/backoff.js";
+import { notifyListeners } from "../shared/listeners.js";
 import {
   connectWorkerConnectionAttempt,
   isRetryableWorkerCloseReason,
@@ -31,7 +32,7 @@ import {
   WorkerFencedError,
   isFencedCloseReason,
   resolvePositiveTimeout,
-  toError,
+  toWorkerConnectionError,
   type WorkerConnectionExit,
   type WorkerConnectionOptions,
   type WorkerConnectionState,
@@ -227,7 +228,7 @@ export class WorkerConnection {
             this.reconnectAbort.signal,
           );
         } catch (error) {
-          throw this.isTerminal() ? this.terminalError() : toError(error);
+          throw this.isTerminal() ? this.terminalError() : toWorkerConnectionError(error);
         }
         remainingMs = this.admissionDeadlineMs - (Date.now() - startedAt);
         if (remainingMs <= 0) {
@@ -309,7 +310,7 @@ export class WorkerConnection {
       await this.connectUntilReady();
     } catch (error) {
       if (!this.isTerminal()) {
-        this.finishFailed(toError(error));
+        this.finishFailed(toWorkerConnectionError(error));
       }
     } finally {
       this.reconnectPromise = undefined;
@@ -357,7 +358,7 @@ export class WorkerConnection {
       }
     } catch (error) {
       if (!(error instanceof WorkerConnectionInterruptedError) && !this.isTerminal()) {
-        this.finishFailed(toError(error));
+        this.finishFailed(toWorkerConnectionError(error));
         return;
       }
     }
@@ -386,16 +387,12 @@ export class WorkerConnection {
     for (const waiter of waiters) {
       waiter.resolve(hello);
     }
-    for (const listener of this.readyListeners) {
-      listener(hello);
-    }
+    notifyListeners(this.readyListeners, hello);
   }
 
   private transition(state: WorkerConnectionState): void {
     this.stateValue = state;
-    for (const listener of this.stateListeners) {
-      listener(state);
-    }
+    notifyListeners(this.stateListeners, state);
   }
 
   private finishFenced(reason: WorkerFencedReason): void {

@@ -87,6 +87,7 @@ vi.mock("./model-catalog.js", () => ({
 }));
 
 vi.mock("./model-catalog.runtime.js", () => ({
+  loadProviderScopedThinkingCatalog: vi.fn(async () => []),
   loadPreparedModelCatalogSnapshot: vi.fn(async () => ({
     entries: [],
     routeVariants: [],
@@ -102,6 +103,10 @@ vi.mock("./provider-model-normalization.runtime.js", () => ({
 
 vi.mock("./harness/runtime-plugin.js", () => ({
   ensureSelectedAgentHarnessPlugin: vi.fn(async () => undefined),
+}));
+
+vi.mock("./runtime-plugins.js", () => ({
+  withAgentPluginRegistry: ({ run }: { run: () => unknown }) => run(),
 }));
 
 vi.mock("./workspace.js", () => ({
@@ -380,12 +385,40 @@ describe("agentCommand compaction transcript rotation", () => {
       providerOverride: "tui-pty-mock",
       modelOverride: "gpt-5.5",
       pluginsEnabled: false,
+      userTurnTranscriptRecorder: { message: { __openclaw: { senderIsOwner: true } } },
     });
     expect(state.normalizeProviderModelIdWithRuntimeMock).not.toHaveBeenCalledWith(
       expect.objectContaining({ provider: "tui-pty-mock" }),
     );
     expect(state.loadManifestModelCatalogMock).not.toHaveBeenCalled();
   });
+
+  it.each([
+    [true, "external_user", true],
+    [true, "inter_session", false],
+    [true, "internal_system", false],
+    [false, "external_user", false],
+  ] as const)(
+    "preserves human transcript ownership for %s/%s",
+    async (senderIsOwner, kind, owner) => {
+      const inputProvenance = { kind, sourceTool: "test" };
+      state.runAgentAttemptMock.mockResolvedValueOnce(
+        makeResult({ sessionId: "owned", text: "ok" }),
+      );
+      await agentCommand({
+        message: "remember",
+        sessionId: "owned",
+        senderIsOwner,
+        inputProvenance,
+      });
+      expect(state.runAgentAttemptMock.mock.calls[0]?.[0]).toMatchObject({
+        opts: { senderIsOwner, inputProvenance },
+        userTurnTranscriptRecorder: {
+          message: { provenance: inputProvenance, __openclaw: { senderIsOwner: owner } },
+        },
+      });
+    },
+  );
 
   it("keeps SQLite session state on the rotated successor", async () => {
     const storePath = requireStorePath();
@@ -795,7 +828,7 @@ describe("agentCommand compaction transcript rotation", () => {
     },
   );
 
-  it("skips post-turn compaction before delivering sendable finals that pending text cannot replay", async () => {
+  it("compacts after persisting transport ownership for finals that text cannot replay", async () => {
     const sessionId = "unrecoverable-media-before-compaction";
     const sessionKey = `agent:main:explicit:${sessionId}`;
     const payloads = [{ mediaUrl: "/tmp/reply.ogg", audioAsVoice: true }];
@@ -812,7 +845,7 @@ describe("agentCommand compaction transcript rotation", () => {
       deliver: true,
     });
 
-    expect(state.runCliTurnCompactionLifecycleMock).not.toHaveBeenCalled();
+    expect(state.runCliTurnCompactionLifecycleMock).toHaveBeenCalledOnce();
     expect(state.deliverAgentCommandResultMock).toHaveBeenCalledOnce();
     expect(state.deliverAgentCommandResultMock).toHaveBeenCalledWith(
       expect.objectContaining({ payloads }),

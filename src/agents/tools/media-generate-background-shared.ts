@@ -27,7 +27,7 @@ import {
   resolveRequiredCompletionDeliveryFailureTerminalResult,
   type RequiredCompletionTerminalResult,
 } from "../../tasks/task-completion-contract.js";
-import type { DeliveryContext } from "../../utils/delivery-context.js";
+import type { DeliveryContext } from "../../utils/delivery-context.types.js";
 import { INTERNAL_MESSAGE_CHANNEL } from "../../utils/message-channel.js";
 import {
   mediaUrlsFromGeneratedAttachments,
@@ -38,8 +38,8 @@ import { MEDIA_GENERATION_DELIVERING_COMPLETION_PROGRESS } from "../media-genera
 import {
   deliverSubagentAnnouncement,
   loadRequesterSessionEntry,
-} from "../subagent-announce-delivery.js";
-import { resolveAnnounceOrigin } from "../subagent-announce-origin.js";
+} from "../subagents/announce/subagent-announce-delivery.js";
+import { resolveAnnounceOrigin } from "../subagents/announce/subagent-announce-origin.js";
 
 const log = createSubsystemLogger("agents/tools/media-generate-background-shared");
 const MEDIA_GENERATION_TASK_KEEPALIVE_INTERVAL_MS = 60_000;
@@ -670,10 +670,13 @@ async function wakeMediaGenerationTaskCompletion(params: {
   if (delivery.delivered) {
     return { status: "delivered" };
   }
-  if (delivery.reason === "completion_handoff_pending") {
+  if (
+    delivery.disposition === "session_queued" ||
+    delivery.reason === "completion_handoff_pending"
+  ) {
     return { status: "pending" };
   }
-  if (delivery.terminal) {
+  if (delivery.disposition === "ambiguous") {
     log.warn("Media generation completion delivery stopped after terminal fallback", {
       taskId: params.handle.taskId,
       runId: params.handle.runId,
