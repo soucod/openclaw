@@ -17,11 +17,7 @@ import type { PluginStateSyncKeyedStore } from "openclaw/plugin-sdk/plugin-state
 import { getSessionEntry, resolveStorePath } from "openclaw/plugin-sdk/session-store-runtime";
 import { asOptionalRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { z } from "zod";
-import {
-  CODEX_PLUGINS_MARKETPLACE_NAME,
-  CODEX_PLUGINS_WORKSPACE_MARKETPLACE_NAME,
-  normalizeCodexServiceTier,
-} from "./config.js";
+import { CODEX_PLUGIN_MARKETPLACE_NAME_PATTERN, normalizeCodexServiceTier } from "./config.js";
 import type { PluginAppPolicyContext } from "./plugin-thread-config.js";
 import type { CodexServiceTier } from "./protocol.js";
 
@@ -178,6 +174,7 @@ const accountAppPolicyEntrySchema = z
     source: z.literal("account"),
     appName: z.string(),
     allowDestructiveActions: z.boolean(),
+    allowOpenWorld: z.boolean().optional(),
     destructiveApprovalMode: destructiveApprovalModeSchema,
     mcpServerNames: z.array(z.string()),
   })
@@ -186,12 +183,10 @@ const pluginAppPolicyEntrySchema = z
   .object({
     source: z.literal("plugin").optional(),
     configKey: z.string(),
-    marketplaceName: z.enum([
-      CODEX_PLUGINS_MARKETPLACE_NAME,
-      CODEX_PLUGINS_WORKSPACE_MARKETPLACE_NAME,
-    ]),
+    marketplaceName: z.string().regex(CODEX_PLUGIN_MARKETPLACE_NAME_PATTERN),
     pluginName: z.string(),
     allowDestructiveActions: z.boolean(),
+    allowOpenWorld: z.boolean().optional(),
     destructiveApprovalMode: destructiveApprovalModeSchema,
     mcpServerNames: z.array(z.string()),
   })
@@ -1427,6 +1422,7 @@ function readPluginAppPolicyContext(
         "appId" in entry ||
         typeof entry.appName !== "string" ||
         typeof entry.allowDestructiveActions !== "boolean" ||
+        (entry.allowOpenWorld !== undefined && typeof entry.allowOpenWorld !== "boolean") ||
         destructiveApprovalMode === "invalid" ||
         !mcpServerNamesValid
       ) {
@@ -1436,6 +1432,9 @@ function readPluginAppPolicyContext(
         source: "account",
         appName: entry.appName,
         allowDestructiveActions: entry.allowDestructiveActions,
+        ...(typeof entry.allowOpenWorld === "boolean"
+          ? { allowOpenWorld: entry.allowOpenWorld }
+          : {}),
         ...(destructiveApprovalMode ? { destructiveApprovalMode } : {}),
         mcpServerNames: entry.mcpServerNames as string[],
       };
@@ -1445,10 +1444,11 @@ function readPluginAppPolicyContext(
       "appId" in entry ||
       (entry.source !== undefined && entry.source !== "plugin") ||
       typeof entry.configKey !== "string" ||
-      (entry.marketplaceName !== CODEX_PLUGINS_MARKETPLACE_NAME &&
-        entry.marketplaceName !== CODEX_PLUGINS_WORKSPACE_MARKETPLACE_NAME) ||
+      typeof entry.marketplaceName !== "string" ||
+      !CODEX_PLUGIN_MARKETPLACE_NAME_PATTERN.test(entry.marketplaceName) ||
       typeof entry.pluginName !== "string" ||
       typeof entry.allowDestructiveActions !== "boolean" ||
+      (entry.allowOpenWorld !== undefined && typeof entry.allowOpenWorld !== "boolean") ||
       destructiveApprovalMode === "invalid" ||
       !mcpServerNamesValid
     ) {
@@ -1459,6 +1459,9 @@ function readPluginAppPolicyContext(
       marketplaceName: entry.marketplaceName,
       pluginName: entry.pluginName,
       allowDestructiveActions: entry.allowDestructiveActions,
+      ...(typeof entry.allowOpenWorld === "boolean"
+        ? { allowOpenWorld: entry.allowOpenWorld }
+        : {}),
       ...(destructiveApprovalMode ? { destructiveApprovalMode } : {}),
       mcpServerNames: entry.mcpServerNames as string[],
     };
