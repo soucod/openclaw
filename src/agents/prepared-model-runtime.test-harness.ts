@@ -85,6 +85,13 @@ const preparedModelRuntimeMocks = vi.hoisted(() => ({
 vi.mock("../plugins/plugin-metadata-snapshot.js", () => ({
   isPluginMetadataSnapshotCompatible: () => true,
   loadPluginMetadataSnapshot: () => preparedModelRuntimeMocks.pluginMetadataSnapshot,
+  projectPluginMetadataSnapshotWorkspace: ({
+    snapshot,
+    workspaceDir,
+  }: {
+    snapshot: typeof preparedModelRuntimeMocks.pluginMetadataSnapshot & { workspaceDir?: string };
+    workspaceDir: string;
+  }) => ({ ...snapshot, index: { ...snapshot.index, workspaceDir }, workspaceDir }),
   resolvePluginMetadataSnapshot: () => preparedModelRuntimeMocks.pluginMetadataSnapshot,
 }));
 
@@ -185,6 +192,7 @@ vi.mock("./agent-scope.js", () => ({
     preparedModelRuntimeMocks.configuredWorkspaces.get(agentId) ??
     (agentId === "default" ? "/tmp/unused-workspace" : `/tmp/workspace-${agentId}`),
   tryResolveConfiguredAgentWorkspaceDir: () => "/tmp/unused-workspace",
+  tryResolveSystemAgentWorkspaceDir: () => "/tmp/unused-workspace",
   resolveDefaultAgentDir: () => "/tmp/unused-agent",
   resolveDefaultAgentId: () => "default",
   resolveAgentConfig: (config: { agents?: { list?: Array<{ id?: string }> } }, agentId: string) =>

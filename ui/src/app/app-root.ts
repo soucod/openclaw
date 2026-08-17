@@ -9,6 +9,7 @@ import "../components/login-gate.ts";
 import "../components/openclaw-mascot.ts";
 import "../components/tooltip.ts";
 import { t } from "../i18n/index.ts";
+import { normalizeAgentId } from "../lib/sessions/session-key.ts";
 import { isTerminalAvailable } from "../lib/terminal-availability.ts";
 import { OpenClawLightDomElement } from "../lit/openclaw-element.ts";
 import { SubscriptionsController } from "../lit/subscriptions-controller.ts";
@@ -103,6 +104,10 @@ export class OpenClawApp extends OpenClawLightDomElement {
       .watch(
         () => (this.terminalOnly ? this.context?.config : undefined),
         (config, notify) => config.subscribe(notify),
+      )
+      .watch(
+        () => (this.terminalOnly ? this.context?.agentSelection : undefined),
+        (selection, notify) => selection.subscribe(notify),
       );
   }
 
@@ -144,6 +149,12 @@ export class OpenClawApp extends OpenClawLightDomElement {
     this.pendingGatewayUrl = null;
     this.resetLoginSensitivePresentation();
     super.disconnectedCallback();
+  }
+
+  protected override firstUpdated(): void {
+    if (this.runtime) {
+      globalThis.dispatchEvent(new Event("openclaw-control-ui-rendered"));
+    }
   }
 
   private synchronizeGateway(gateway: ApplicationContext["gateway"]) {
@@ -214,11 +225,15 @@ export class OpenClawApp extends OpenClawLightDomElement {
         gatewaySnapshot,
         context.config.current.terminalEnabled ?? false,
       );
+      const terminalOwner =
+        context.agentSelection.state.selectedId ?? gatewaySnapshot.assistantAgentId;
+      const terminalAgentId = terminalOwner ? normalizeAgentId(terminalOwner) : null;
       // Embedded clients query this host immediately; keep it stable while the chunk loads.
       return html`
         <openclaw-terminal-panel
           .client=${gatewayConnected ? gatewaySnapshot.client : null}
           .available=${terminalAvailable}
+          .agentId=${terminalAgentId}
           .themeMode=${resolveTerminalThemeMode()}
           fullscreen
         ></openclaw-terminal-panel>
@@ -241,6 +256,7 @@ export class OpenClawApp extends OpenClawLightDomElement {
           .available=${desktopAvailable}
           .documentMode=${true}
           .documentSource=${this.desktopOptions.source}
+          .documentSession=${this.desktopOptions.session}
           .documentControl=${this.desktopOptions.control}
           .onDocumentClose=${() => {
             if (globalThis.history.length > 1) {
@@ -277,8 +293,9 @@ export class OpenClawApp extends OpenClawLightDomElement {
         </openclaw-tooltip-provider>
       `;
     }
-    const showLoginGate =
-      !gatewayConnected && (this.loginGatePinned || gatewaySnapshot.phase !== "reconnecting");
+    const shellOwnsRecovery =
+      gatewaySnapshot.phase === "reconnecting" || gatewaySnapshot.phase === "reload-required";
+    const showLoginGate = !gatewayConnected && !shellOwnsRecovery;
     if (showLoginGate) {
       return html`
         <openclaw-tooltip-provider>

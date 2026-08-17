@@ -84,6 +84,13 @@ export interface AgentModelCatalogs {
   updated_at: number;
 }
 
+export interface AgentProvenance {
+  agent_id: string;
+  created_at_ms: number;
+  created_via: string;
+  creator_agent_id: string | null;
+}
+
 export interface AndroidNotificationRecentPackages {
   package_name: string;
   sort_order: number;
@@ -554,6 +561,7 @@ export interface DeviceBootstrapTokens {
   profile_json: string | null;
   public_key: string | null;
   redeemed_profile_json: string | null;
+  setup_id: string | null;
   token: string;
   token_key: string;
   ts: number;
@@ -566,6 +574,16 @@ export interface DeviceIdentities {
   private_key_pem: string;
   public_key_pem: string;
   updated_at_ms: number;
+}
+
+export interface DevicePairSetupCompletions {
+  access: string;
+  completed_at_ms: number;
+  delivery_state: string;
+  device_id: string;
+  device_name: string | null;
+  retain_until_ms: number;
+  setup_id: string;
 }
 
 export interface DevicePairingJoinCodes {
@@ -790,6 +808,7 @@ export interface InstalledPluginIndex {
   updated_at_ms: number;
   version: number;
   warning: string | null;
+  workspace_dir: string | null;
 }
 
 export interface MacosPortGuardianRecords {
@@ -1118,6 +1137,7 @@ export interface SchemaMeta {
 }
 
 export interface SecretStoreEntries {
+  allowed_hosts: string | null;
   created_at_ms: number;
   deleted_at_ms: number | null;
   kind: string;
@@ -1131,8 +1151,10 @@ export interface SecretStoreEntries {
 
 export interface SessionGroups {
   created_at: number;
+  cwd: string | null;
   name: string;
   position: number;
+  worktree: number | null;
 }
 
 export interface SessionStateEvents {
@@ -1544,6 +1566,7 @@ export interface WorkerSessionPlacements {
   agent_id: string;
   created_at_ms: number;
   environment_id: string | null;
+  execution_mode: string | null;
   last_live_event_ack_cursor: number | null;
   last_transcript_ack_cursor: number | null;
   recovery_error: string | null;
@@ -1697,6 +1720,7 @@ export interface DB {
   agent_databases: AgentDatabases;
   agent_deletion_journal: AgentDeletionJournal;
   agent_model_catalogs: AgentModelCatalogs;
+  agent_provenance: AgentProvenance;
   android_notification_recent_packages: AndroidNotificationRecentPackages;
   apns_registration_tombstones: ApnsRegistrationTombstones;
   apns_registrations: ApnsRegistrations;
@@ -1731,6 +1755,7 @@ export interface DB {
   device_auth_tokens: DeviceAuthTokens;
   device_bootstrap_tokens: DeviceBootstrapTokens;
   device_identities: DeviceIdentities;
+  device_pair_setup_completions: DevicePairSetupCompletions;
   device_pairing_join_codes: DevicePairingJoinCodes;
   device_pairing_paired: DevicePairingPaired;
   device_pairing_pending: DevicePairingPending;
