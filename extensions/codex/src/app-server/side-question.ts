@@ -299,7 +299,7 @@ export async function runCodexAppServerSideQuestion(
   const nativeToolSurfaceEnabled = shouldEnableCodexAppServerNativeToolSurface(
     sideRunParams,
     params.sandbox ?? undefined,
-    { sandboxExecServerEnabled },
+    { agentId: sideRunParams.agentId, sandboxExecServerEnabled },
   );
   const sandboxEnvironmentRequired = shouldRequireCodexSandboxExecServerEnvironment({
     sandbox: params.sandbox ?? undefined,
@@ -310,6 +310,7 @@ export async function runCodexAppServerSideQuestion(
     config: sideRunParams.config,
     sessionKey: sideRunParams.sandboxSessionKey?.trim() || sideRunParams.sessionKey,
     sessionId: sideRunParams.sessionId,
+    agentId: sideRunParams.agentId,
     sandbox: params.sandbox,
     sandboxEnvironmentSelected: sandboxEnvironmentRequired,
     surface: "/btw side-question mode",
@@ -982,6 +983,7 @@ function buildSideRunAttemptParams(
     authStorage: params.preparedRuntimeAuth.authStorage,
     authProfileStore: params.preparedRuntimeAuth.authProfileStore,
     modelRegistry: params.preparedRuntimeAuth.modelRegistry,
+    preparedModelRuntime: params.preparedModelRuntime,
     ...(params.preparedRuntimeAuth.resolvedApiKey
       ? { resolvedApiKey: params.preparedRuntimeAuth.resolvedApiKey }
       : {}),
@@ -1015,6 +1017,7 @@ async function createCodexSideToolBridge(input: {
     ({ id: input.params.model, provider: input.params.provider } as never);
   const messageToolProvider = resolveCodexMessageToolProvider(input.params);
   let tools: AnyAgentTool[] = [];
+  const webFetchHostnameAllowlistRef: { value?: string[] } = {};
   if (supportsModelTools(runtimeModel)) {
     const createOpenClawCodingTools = (await import("openclaw/plugin-sdk/agent-harness"))
       .createOpenClawCodingTools;
@@ -1048,6 +1051,7 @@ async function createCodexSideToolBridge(input: {
         resolvedWorkspace: input.params.workspaceDir ?? input.cwd,
       }),
       config: input.params.cfg,
+      preparedModelRuntime: input.params.preparedModelRuntime,
       abortSignal: input.signal,
       modelProvider: runtimeModel.provider,
       modelId: input.params.model,
@@ -1061,6 +1065,7 @@ async function createCodexSideToolBridge(input: {
         workspaceDir: input.cwd,
       }),
       suppressManagedWebSearch: false,
+      webFetchHostnameAllowlistRef,
       ...(input.params.messageProvider || input.params.messageChannel
         ? {
             messageProvider: messageToolProvider,
@@ -1117,6 +1122,7 @@ async function createCodexSideToolBridge(input: {
     nativeProviderWebSearchSupport: input.nativeProviderWebSearchSupport,
     webSearchAllowed: tools.some((tool) => tool.name === "web_search"),
   });
+  webFetchHostnameAllowlistRef.value = requestedWebSearchPlan.webFetchHostnameAllowlist;
   // Codex forks do not accept dynamicTools, so managed web_search cannot be
   // registered on a side thread. Keep it only as the native-search policy signal.
   const webSearchPlan =

@@ -70,7 +70,6 @@ const repositoryScriptEntries = [
   "scripts/ios-release-plan.ts!",
   "scripts/ios-release-signing.mts!",
   "scripts/lib/docker-plugin-selection.mjs!",
-  "scripts/lib/openclaw-test-state.mts!",
   "scripts/list-prod-store-packages.mjs!",
   // Invoked by scripts/lib/live-docker-stage.sh during container validation.
   "scripts/live-docker-normalize-config.ts!",
@@ -157,6 +156,8 @@ const rootEntries = [
   // Loaded by URL from the SQLite lifecycle archive owner.
   "src/config/sessions/session-accessor.sqlite-archive.worker.ts!",
   "src/state/openclaw-database-verify.worker.ts!",
+  // Loaded by URL from tailscale.ts to outlive abrupt Gateway process exit.
+  "src/infra/tailscale-route-owner.worker.ts!",
   "src/agents/model-provider-auth.worker.ts!",
   "src/agents/prepared-model-catalog.worker.ts!",
   // Spawned through computed sibling URLs by the service-child host and relay.

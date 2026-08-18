@@ -10,6 +10,7 @@ import { markInboundContextLabel } from "../../auto-reply/reply/inbound-context-
 import type { ChannelOutboundAdapter } from "../../channels/plugins/types.public.js";
 import type { CliDeps } from "../../cli/outbound-send-deps.js";
 import type { OpenClawConfig } from "../../config/config.js";
+import * as configSessions from "../../config/sessions.js";
 import type { InternalSessionEntry as SessionEntry } from "../../config/sessions.js";
 import * as sessionAccessor from "../../config/sessions/session-accessor.js";
 import {
@@ -1434,7 +1435,7 @@ describe("main-session-restart-recovery", () => {
     ).toBe(2);
   });
 
-  it("rekeys recovery identity after a prior-lifecycle recovery was admitted", async () => {
+  it("preserves recovery identity when a prior-lifecycle delivery run rotates", async () => {
     const previousRecoveryRunId = "recovery-run-a";
     const sourceRunId = "channel-run";
     const previousExecutionIdentity = createExecutionIdentityAdmissionToken(previousRecoveryRunId, {
@@ -1487,13 +1488,7 @@ describe("main-session-restart-recovery", () => {
         });
         expect(gatewayAdmission?.consume(dispatchedRunId)).toEqual({
           accepted: true,
-          token: {
-            tokenVersion: 1,
-            contextId: previousExecutionIdentity.contextId,
-            executionId: previousExecutionIdentity.executionId,
-            runId: dispatchedRunId,
-            createdAt: previousExecutionIdentity.createdAt,
-          },
+          token: previousExecutionIdentity,
         });
         const recoveryMessage = {
           role: "user" as const,
@@ -1523,20 +1518,15 @@ describe("main-session-restart-recovery", () => {
       idempotencyKey: dispatchedRunId,
       to: "discord:dm:123",
     });
-    expect(loadSessionEntry({ sessionKey, storePath })).toMatchObject({
-      mainRestartRecovery: {
-        executionIdentity: {
-          tokenVersion: 1,
-          contextId: previousExecutionIdentity.contextId,
-          executionId: previousExecutionIdentity.executionId,
-          runId: dispatchedRunId,
-          createdAt: previousExecutionIdentity.createdAt,
-        },
-      },
+    const recoveredEntry = loadSessionEntry({ sessionKey, storePath });
+    expect(recoveredEntry).toMatchObject({
       restartRecoveryDeliveryContext: discordDeliveryContext,
       restartRecoveryDeliveryRunId: dispatchedRunId,
       restartRecoveryDeliverySourceRunId: sourceRunId,
     });
+    expect(recoveredEntry?.mainRestartRecovery?.executionIdentity).toEqual(
+      previousExecutionIdentity,
+    );
     const transcript = await loadTestTranscript(sessionKey, storePath);
     expect(
       transcript
@@ -2907,6 +2897,70 @@ describe("main-session-restart-recovery", () => {
     expect(customStore["agent:main:main"]?.abortedLastRun).toBe(false);
   });
 
+  it("rediscovers a restored configured store between startup marking and recovery", async () => {
+    const sessionsDir = await makeSessionsDir();
+    const storePath = path.join(sessionsDir, "sessions.json");
+    await writeMainSession({ sessionsDir, abortedLastRun: undefined });
+    await writeTranscript(sessionsDir, "main-session", [
+      { role: "user", content: "resume the interrupted main session" },
+      { role: "toolResult", content: "main result" },
+    ]);
+
+    const lateSessionsDir = path.join(tmpDir, "agents", "late", "sessions");
+    const lateStorePath = path.join(lateSessionsDir, "sessions.json");
+    const cfg = {
+      agents: { list: [{ id: "main", default: true }, { id: "late" }] },
+    } as OpenClawConfig;
+    const discoverySpy = vi.spyOn(configSessions, "resolveAllAgentSessionStoreTargetsSync");
+    const originalApply = sessionAccessor.applySessionEntryReplacements;
+    let restoredLateStore = false;
+    const replacementSpy = vi
+      .spyOn(sessionAccessor, "applySessionEntryReplacements")
+      .mockImplementation(async (params) => {
+        const result = await originalApply(params);
+        if (params.requireWriteSuccess === true && !restoredLateStore) {
+          restoredLateStore = true;
+          await writeStorePath(lateStorePath, {
+            "agent:late:main": {
+              sessionId: "late-session",
+              updatedAt: 1,
+              status: "running",
+              abortedLastRun: true,
+            },
+          });
+          await writeTranscript(lateSessionsDir, "late-session", [
+            { role: "user", content: "resume the restored session" },
+            { role: "toolResult", content: "late result" },
+          ]);
+        }
+        return result;
+      });
+
+    const recovery = scheduleRestartAbortedMainSessionRecovery({
+      getConfig: () => cfg,
+      delayMs: 0,
+      stateDir: tmpDir,
+    });
+    try {
+      await waitForFast(() => expect(callGateway).toHaveBeenCalledTimes(2));
+      await recovery.stop();
+
+      expect(loadSessionEntry({ sessionKey: "agent:main:main", storePath })).toMatchObject({
+        abortedLastRun: false,
+      });
+      expect(
+        loadSessionEntry({ sessionKey: "agent:late:main", storePath: lateStorePath }),
+      ).toMatchObject({ abortedLastRun: false });
+      expect(discoverySpy.mock.calls.filter(([observedCfg]) => observedCfg === cfg)).toHaveLength(
+        2,
+      );
+    } finally {
+      await recovery.stop();
+      replacementSpy.mockRestore();
+      discoverySpy.mockRestore();
+    }
+  });
+
   it("cancels startup recovery when its gateway lifecycle stops", async () => {
     const sessionsDir = await makeSessionsDir();
     await writeMainSession({
@@ -3234,6 +3288,8 @@ describe("main-session-restart-recovery", () => {
       sessionsDir,
       pendingFinalDelivery: makePendingFinalDelivery(),
     });
+    const cfg = {} as OpenClawConfig;
+    const discoverySpy = vi.spyOn(configSessions, "resolveAllAgentSessionStoreTargetsSync");
     const firstDispatch = createDeferred();
     const secondDispatch = createDeferred();
     let firstAgentDispatch = true;
@@ -3266,7 +3322,7 @@ describe("main-session-restart-recovery", () => {
     let recovery: ReturnType<typeof scheduleRestartAbortedMainSessionRecovery> | undefined;
     try {
       recovery = scheduleRestartAbortedMainSessionRecovery({
-        getConfig: () => ({}),
+        getConfig: () => cfg,
         delayMs: 0,
         maxRetries: 2,
         stateDir: tmpDir,
@@ -3301,9 +3357,13 @@ describe("main-session-restart-recovery", () => {
       });
       expect(lateEntry).toMatchObject({ status: "running" });
       expect(lateEntry?.abortedLastRun).toBeUndefined();
+      expect(discoverySpy.mock.calls.filter(([observedCfg]) => observedCfg === cfg)).toHaveLength(
+        4,
+      );
     } finally {
       await recovery?.stop();
       setTimeoutSpy.mockRestore();
+      discoverySpy.mockRestore();
       vi.useRealTimers();
     }
   });
@@ -4801,6 +4861,48 @@ describe("main-session-restart-recovery", () => {
     await expectRecovery({ recovered: 1, failed: 0, skipped: 0 });
     expect(callGateway).toHaveBeenCalledTimes(1);
     expect(gatewayParams()).toMatchObject({ forceRestartSafeTools: true });
+  });
+
+  it("reports an interrupted native tool outcome as unknown", async () => {
+    await writeMainSessionTranscript([
+      { role: "user", content: "run the command" },
+      createAssistantToolCallMessage([
+        { type: "toolCall", id: "call-bash-1", name: "bash", arguments: { command: "true" } },
+      ]),
+      {
+        role: "toolResult",
+        toolName: "bash",
+        toolCallId: "call-bash-1",
+        content: "native tool call had no matching result",
+        details: { reason: "missing_tool_result" },
+        isError: true,
+      },
+    ]);
+
+    await expectRecovery({ recovered: 1, failed: 0, skipped: 0 });
+    expect(gatewayParams().message).toContain("unknown outcome");
+    expect(gatewayParams().message).toContain("never claim completion or success");
+    expect(gatewayParams()).toMatchObject({ forceRestartSafeTools: true });
+  });
+
+  it("keeps a confirmed native tool failure distinct from an unknown outcome", async () => {
+    await writeMainSessionTranscript([
+      { role: "user", content: "run the command" },
+      createAssistantToolCallMessage([
+        { type: "toolCall", id: "call-bash-1", name: "bash", arguments: { command: "false" } },
+      ]),
+      {
+        role: "toolResult",
+        toolName: "bash",
+        toolCallId: "call-bash-1",
+        content: "command failed with exit code 1",
+        details: { reason: "nonzero_exit" },
+        isError: true,
+      },
+    ]);
+
+    await expectRecovery({ recovered: 1, failed: 0, skipped: 0 });
+    expect(gatewayParams()).not.toHaveProperty("forceRestartSafeTools");
   });
 
   it("keeps a dangling side-effecting call in an aborted tail restricted", async () => {

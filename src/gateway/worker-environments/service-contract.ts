@@ -1,5 +1,13 @@
 import { createHash } from "node:crypto";
-import type { WorkerDesktopApp, WorkerProfile } from "../../plugins/capability-provider.types.js";
+import type {
+  WorkerDesktopApp,
+  WorkerMachineOption,
+  WorkerProfile,
+} from "../../plugins/capability-provider.types.js";
+import type {
+  WorkerPlacementMoveSource,
+  WorkerPlacementMoveTarget,
+} from "./placement-move-intent.js";
 import type {
   WorkerSessionPlacementRecord,
   WorkerPlacementExecutionMode,
@@ -27,6 +35,7 @@ export type WorkerEnvironmentServiceRecord = {
   environmentId: string;
   providerId: string;
   leaseId: string | null;
+  nodeDeviceId?: string | null;
   sharedHost: boolean | null;
   state: WorkerEnvironmentState;
   ownerEpoch: number;
@@ -56,7 +65,14 @@ export type WorkerDesktopLaunchResult = {
 export type WorkerEnvironmentServiceContract = {
   list(): WorkerEnvironmentServiceRecord[];
   get(environmentId: string): WorkerEnvironmentServiceRecord | undefined;
-  create(profileId: string, idempotencyKey: string): Promise<WorkerEnvironmentServiceRecord>;
+  supportsExecutionMode?(profileId: string, mode: WorkerPlacementExecutionMode): boolean;
+  listMachineOptions(profileId: string): Promise<readonly WorkerMachineOption[] | undefined>;
+  create(
+    profileId: string,
+    idempotencyKey: string,
+    machineClass?: string,
+    executionMode?: WorkerPlacementExecutionMode,
+  ): Promise<WorkerEnvironmentServiceRecord>;
   destroy(environmentId: string): Promise<WorkerEnvironmentServiceRecord>;
   destroyUnattached(environmentId: string): Promise<WorkerEnvironmentServiceRecord>;
   observeDesktop(request: {
@@ -77,17 +93,29 @@ export type WorkerPlacementDispatchRequest = {
   agentId: string;
   profileId: string;
   executionMode: WorkerPlacementExecutionMode;
+  idempotencyKey?: string;
   deviceId?: string;
+  machineClass?: string;
   inheritedProfile?: {
     providerId: string;
     profileSnapshot: WorkerProfile;
   };
 };
 
+export type WorkerPlacementMoveDestination = Pick<
+  WorkerPlacementDispatchRequest,
+  "profileId" | "executionMode" | "deviceId" | "machineClass" | "inheritedProfile"
+>;
+
 export type WorkerPlacementReclaimRequest = {
   sessionId: string;
   sessionKey: string;
   agentId: string;
+};
+
+export type WorkerPlacementMoveRequest = WorkerPlacementReclaimRequest & {
+  source: WorkerPlacementMoveSource;
+  target: WorkerPlacementMoveTarget;
 };
 
 // Leaf dispatch contract: GatewayRequestContext must not import the dispatch
@@ -96,6 +124,10 @@ export type WorkerPlacementDispatchContract = {
   dispatch(
     request: WorkerPlacementDispatchRequest,
   ): Promise<Extract<WorkerSessionPlacementRecord, { state: "active" }>>;
+  move?(
+    request: WorkerPlacementMoveRequest,
+    onTransition?: (placement: WorkerSessionPlacementRecord) => void,
+  ): Promise<Extract<WorkerSessionPlacementRecord, { state: "local" | "active" }>>;
   reclaim?(
     request: WorkerPlacementReclaimRequest,
   ): Promise<Extract<WorkerSessionPlacementRecord, { state: "local" | "reclaimed" }>>;

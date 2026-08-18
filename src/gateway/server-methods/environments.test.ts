@@ -42,6 +42,11 @@ type TestWorkerRecord = WorkerEnvironmentRecord &
 type TestWorkerService = {
   list: () => TestWorkerRecord[];
   get: (environmentId: string) => TestWorkerRecord | undefined;
+  listMachineOptions: (
+    profileId: string,
+  ) => Promise<
+    Array<{ id: string; label: string; description?: string; default?: boolean }> | undefined
+  >;
   create: (profileId: string, idempotencyKey: string) => Promise<TestWorkerRecord>;
   destroy: (environmentId: string) => Promise<TestWorkerRecord>;
   destroyUnattached: (environmentId: string) => Promise<TestWorkerRecord>;
@@ -140,6 +145,7 @@ function workerService(overrides: Partial<TestWorkerService> = {}) {
   return {
     list: vi.fn(() => []),
     get: vi.fn(() => undefined),
+    listMachineOptions: vi.fn(async () => undefined),
     create: vi.fn(async () => workerRecord()),
     destroy: vi.fn(async () => workerRecord({ state: "destroyed" })),
     destroyUnattached: vi.fn(async () => workerRecord({ state: "destroyed" })),
@@ -446,6 +452,46 @@ describe("environment gateway methods", () => {
     expect(worker?.worker).not.toHaveProperty("keyRef");
   });
 
+  it("adds provider machine options to configured profile summaries", async () => {
+    const listMachineOptions = vi.fn(async (profileId: string) =>
+      profileId === "aws"
+        ? [
+            {
+              id: "standard",
+              label: "Standard",
+              description: "Cheap smoke checks and small repos",
+              default: true,
+            },
+          ]
+        : undefined,
+    );
+    const [ok, payload] = await callEnvironmentMethod(
+      "environments.list",
+      {},
+      { service: workerService({ listMachineOptions }) },
+    );
+
+    expect(ok).toBe(true);
+    expect(payload).toMatchObject({
+      profiles: [
+        {
+          id: "aws",
+          providerId: "crabbox",
+          machines: [
+            {
+              id: "standard",
+              label: "Standard",
+              description: "Cheap smoke checks and small repos",
+              default: true,
+            },
+          ],
+        },
+        { id: "zeta", providerId: "static-ssh" },
+      ],
+    });
+    expect(listMachineOptions.mock.calls).toEqual([["aws"], ["zeta"]]);
+  });
+
   it.each([
     ["requested", "starting"],
     ["ready", "available"],
@@ -519,7 +565,7 @@ describe("environment gateway methods", () => {
     });
   });
 
-  it("returns status for one worker without listing providers", async () => {
+  it("returns status for one worker", async () => {
     const get = vi.fn(() => workerRecord({ state: "attached" }));
     const service = workerService({ get });
     const [ok, payload] = await callEnvironmentMethod(
@@ -536,7 +582,6 @@ describe("environment gateway methods", () => {
       worker: { state: "attached", ageMs: 9_000 },
     });
     expect(get).toHaveBeenCalledWith("worker-1");
-    expect(service.list).not.toHaveBeenCalled();
   });
 
   it("rejects unknown environment ids", async () => {

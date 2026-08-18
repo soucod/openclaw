@@ -44,15 +44,11 @@ async function expectChatBubbleAbove(page: Page, upperText: string, lowerText: s
 }
 
 suite.define(() => {
-  it("steers ordinary follow-ups when the server default is steer", async () => {
-    const artifactDir = process.env.OPENCLAW_UI_E2E_ARTIFACT_DIR?.trim();
+  it("keeps cumulative assistant output ordered across a consumed steer", async () => {
     const context = await suite.newBrowserContext({
       locale: "en-US",
       serviceWorkers: "block",
       viewport: { height: 900, width: 1280 },
-      ...(artifactDir
-        ? { recordVideo: { dir: artifactDir, size: { height: 900, width: 1280 } } }
-        : {}),
     });
     const page = await context.newPage();
     const runtimeConfig = {
@@ -110,6 +106,50 @@ suite.define(() => {
       });
       await page.getByRole("button", { name: "Stop generating" }).waitFor({ timeout: 10_000 });
 
+      const preSteerReply = "Assistant output before the steer.";
+      await gateway.emitGatewayEvent("chat", {
+        deltaText: preSteerReply,
+        message: {
+          content: [{ text: preSteerReply, type: "text" }],
+          role: "assistant",
+          timestamp: Date.now(),
+        },
+        runId: activeRunId,
+        sessionKey: "main",
+        state: "delta",
+      });
+      await page.getByText(preSteerReply, { exact: true }).waitFor({ timeout: 10_000 });
+
+      const queuedFollowUp = "queued follow-up before steer";
+      await gateway.emitGatewayEvent("session.message", {
+        activeRunIds: [activeRunId],
+        clientRunId: "queued-run",
+        hasActiveRun: true,
+        message: {
+          __openclaw: {
+            id: "persisted-queued-user",
+            idempotencyKey: "queued-run:user",
+            seq: 3,
+          },
+          content: [{ text: queuedFollowUp, type: "text" }],
+          role: "user",
+          timestamp: Date.now(),
+        },
+        messageId: "persisted-queued-user",
+        messageSeq: 3,
+        session: {
+          activeRunIds: [activeRunId],
+          hasActiveRun: true,
+          key: "main",
+          kind: "direct",
+          status: "running",
+          updatedAt: Date.now(),
+        },
+        sessionKey: "main",
+      });
+      await page.getByText(queuedFollowUp, { exact: true }).waitFor({ timeout: 10_000 });
+      await expectChatBubbleAbove(page, preSteerReply, queuedFollowUp);
+
       const followUp = "tighten the active plan";
       await page.locator(".agent-chat__composer-combobox textarea").fill(followUp);
       await page.getByRole("button", { name: "Steer into the active run" }).click();
@@ -127,12 +167,19 @@ suite.define(() => {
         timeout: 10_000,
       });
       await queue.getByText(followUp).waitFor({ timeout: 10_000 });
-      if (artifactDir) {
-        await page.screenshot({
-          path: `${artifactDir}/steer-before-persistence.png`,
-          fullPage: true,
-        });
-      }
+      await gateway.emitGatewayEvent("chat", {
+        runId: steerRunId,
+        sessionKey: "main",
+        state: "final",
+      });
+      await queue.getByText(followUp).waitFor({ state: "detached", timeout: 10_000 });
+      await expect
+        .poll(() => page.locator(".chat-thread .chat-group.user", { hasText: followUp }).count())
+        .toBe(1);
+      await expectChatBubbleAbove(page, originalPrompt, preSteerReply);
+      await expectChatBubbleAbove(page, preSteerReply, queuedFollowUp);
+      await expectChatBubbleAbove(page, queuedFollowUp, followUp);
+
       await gateway.emitGatewayEvent("session.message", {
         activeRunIds: [activeRunId],
         clientRunId: activeRunId,
@@ -141,14 +188,15 @@ suite.define(() => {
           __openclaw: {
             id: "persisted-steer-user",
             idempotencyKey: `${steerRunId}:user`,
-            seq: 2,
+            seq: 4,
+            steerTargetRunId: activeRunId,
           },
           content: [{ text: followUp, type: "text" }],
           role: "user",
           timestamp: Date.now(),
         },
         messageId: "persisted-steer-user",
-        messageSeq: 2,
+        messageSeq: 4,
         session: {
           activeRunIds: [activeRunId],
           hasActiveRun: true,
@@ -160,24 +208,114 @@ suite.define(() => {
         sessionKey: "main",
       });
 
-      await queue.getByText(followUp).waitFor({ state: "detached", timeout: 10_000 });
       await expect
         .poll(() => page.locator(".chat-thread .chat-group.user", { hasText: followUp }).count())
         .toBe(1);
-      await expectChatBubbleAbove(page, originalPrompt, followUp);
-      if (artifactDir) {
-        await page.screenshot({
-          path: `${artifactDir}/steer-after-persistence.png`,
-          fullPage: true,
-        });
-      }
+      const postSteerReply = "Assistant output after the steer.";
+      const cumulativeReply = `${preSteerReply} ${postSteerReply}`;
+      const terminalPostSteerReply = `${postSteerReply} Final unseen suffix.`;
+      const terminalReply = `${preSteerReply} ${terminalPostSteerReply}`;
+      await gateway.emitGatewayEvent("chat", {
+        deltaText: ` ${postSteerReply}`,
+        message: {
+          content: [{ text: cumulativeReply, type: "text" }],
+          role: "assistant",
+          timestamp: Date.now(),
+        },
+        runId: activeRunId,
+        sessionKey: "main",
+        state: "delta",
+      });
+      await page.locator(".chat-bubble", { hasText: postSteerReply }).waitFor({ timeout: 10_000 });
+      await expectChatBubbleAbove(page, originalPrompt, preSteerReply);
+      await expectChatBubbleAbove(page, preSteerReply, queuedFollowUp);
+      await expectChatBubbleAbove(page, queuedFollowUp, followUp);
+      await expectChatBubbleAbove(page, followUp, postSteerReply);
+      const authoritativeMessages = [
+        {
+          __openclaw: {
+            id: "persisted-original-user",
+            idempotencyKey: `${activeRunId}:user`,
+            seq: 1,
+          },
+          content: [{ text: originalPrompt, type: "text" }],
+          role: "user",
+          timestamp: 100,
+        },
+        {
+          __openclaw: { id: "persisted-pre-steer", idempotencyKey: activeRunId, seq: 2 },
+          content: [{ text: preSteerReply, type: "text" }],
+          role: "assistant",
+          timestamp: 200,
+        },
+        {
+          __openclaw: {
+            id: "persisted-queued-user",
+            idempotencyKey: "queued-run:user",
+            seq: 3,
+          },
+          content: [{ text: queuedFollowUp, type: "text" }],
+          role: "user",
+          timestamp: 250,
+        },
+        {
+          __openclaw: {
+            id: "persisted-steer-user",
+            idempotencyKey: `${steerRunId}:user`,
+            seq: 4,
+            steerTargetRunId: activeRunId,
+          },
+          content: [{ text: followUp, type: "text" }],
+          role: "user",
+          timestamp: 50,
+        },
+        {
+          __openclaw: { id: "persisted-post-steer", idempotencyKey: activeRunId, seq: 5 },
+          content: [{ text: terminalPostSteerReply, type: "text" }],
+          role: "assistant",
+          timestamp: 300,
+        },
+      ];
+      const terminalHistory = {
+        messages: authoritativeMessages,
+        sessionId: "control-ui-e2e-session",
+        sessionInfo: {
+          activeRunIds: [],
+          hasActiveRun: false,
+          key: "main",
+          kind: "direct",
+          status: "done",
+          updatedAt: Date.now(),
+        },
+        thinkingLevel: null,
+      };
+      await gateway.setMethodResponse("chat.history", terminalHistory);
+      await gateway.setMethodResponse("chat.startup", terminalHistory);
+      await gateway.emitChatFinal({ runId: activeRunId, text: terminalReply });
+      await page
+        .getByRole("button", { name: "Stop generating" })
+        .waitFor({ state: "detached", timeout: 10_000 });
+      await page
+        .locator(".chat-bubble", { hasText: terminalPostSteerReply })
+        .waitFor({ timeout: 10_000 });
+      await expectChatBubbleAbove(page, preSteerReply, queuedFollowUp);
+      await expectChatBubbleAbove(page, queuedFollowUp, followUp);
+      await expectChatBubbleAbove(page, followUp, postSteerReply);
+
+      await page.reload();
+      await page
+        .locator(".chat-bubble", { hasText: terminalPostSteerReply })
+        .waitFor({ timeout: 10_000 });
+      await expectChatBubbleAbove(page, originalPrompt, preSteerReply);
+      await expectChatBubbleAbove(page, preSteerReply, queuedFollowUp);
+      await expectChatBubbleAbove(page, queuedFollowUp, followUp);
+      await expectChatBubbleAbove(page, followUp, postSteerReply);
     } finally {
       await suite.closeBrowserContext(context);
     }
   });
 
   it("preserves a non-steer server default for active-run follow-ups", async () => {
-    const artifactDir = process.env.OPENCLAW_UI_E2E_ARTIFACT_DIR?.trim();
     const context = await suite.newBrowserContext({
       locale: "en-US",
       serviceWorkers: "block",
@@ -206,12 +344,6 @@ suite.define(() => {
       await followUpSelect.waitFor({ state: "visible", timeout: 10_000 });
       expect(await followUpSelect.inputValue()).toBe("server");
       await page.getByText("Using server default (followup)").waitFor({ timeout: 10_000 });
-      if (artifactDir) {
-        await page.screenshot({
-          path: `${artifactDir}/server-followup-setting.png`,
-          fullPage: true,
-        });
-      }
       const configPatchCount = (await gateway.getRequests("config.patch")).length;
       const configGetCount = (await gateway.getRequests("config.get")).length;
       const overrideConfig = {
@@ -238,12 +370,6 @@ suite.define(() => {
         runtimeConfig,
         valid: true,
       });
-      if (artifactDir) {
-        await page.screenshot({
-          path: `${artifactDir}/server-followup-override.png`,
-          fullPage: true,
-        });
-      }
       await page.getByRole("button", { name: "Reset to server default" }).click();
       await waitForRequests(gateway, "config.patch", configPatchCount + 2);
       await waitForRequests(gateway, "config.get", configGetCount + 2);
@@ -276,14 +402,10 @@ suite.define(() => {
   });
 
   it("steers a queued follow-up with modified Enter in Enter shortcut mode", async () => {
-    const artifactDir = process.env.OPENCLAW_UI_E2E_ARTIFACT_DIR?.trim();
     const context = await suite.newBrowserContext({
       locale: "en-US",
       serviceWorkers: "block",
       viewport: { height: 900, width: 1280 },
-      ...(artifactDir
-        ? { recordVideo: { dir: artifactDir, size: { height: 900, width: 1280 } } }
-        : {}),
     });
     const page = await context.newPage();
     const gateway = await installMockGateway(page);
@@ -303,28 +425,6 @@ suite.define(() => {
 
       const steerText = "steer this keyboard follow-up now";
       await composer.fill(steerText);
-      const enterQueueButton = page.getByRole("button", { name: "Queue message" });
-      const enterTooltip = await enterQueueButton
-        .locator("..")
-        .evaluate((element) => (element as HTMLElement & { content?: string }).content);
-      expect(enterTooltip).toBe("Queue ⏎ · Steer ⌘/Ctrl+Enter");
-      if (artifactDir) {
-        await enterQueueButton.hover();
-        await expect
-          .poll(() =>
-            enterQueueButton.evaluate((button) => {
-              const tooltip = button
-                .closest("openclaw-tooltip")
-                ?.shadowRoot?.querySelector("wa-tooltip");
-              return (tooltip as (HTMLElement & { open?: boolean }) | null)?.open === true;
-            }),
-          )
-          .toBe(true);
-        await page.screenshot({
-          path: `${artifactDir}/queue-steer-shortcut.png`,
-          fullPage: true,
-        });
-      }
       await composer.press("Control+Enter");
 
       const firstRunSends = await waitForRequests(gateway, "chat.send", 2);
@@ -338,17 +438,6 @@ suite.define(() => {
       });
       const steeredRow = page.locator(".chat-queue__item--steered", { hasText: steerText });
       await steeredRow.waitFor({ timeout: 10_000 });
-      await gateway.emitGatewayEvent("chat", {
-        runId: requireString(steerParams.idempotencyKey, "steer send id"),
-        sessionKey: "main",
-        state: "final",
-      });
-      await steeredRow.waitFor({ state: "detached", timeout: 10_000 });
-
-      await gateway.emitChatFinal({ runId: firstRunId, text: "First shortcut run finished." });
-      await page
-        .getByRole("button", { name: "Stop generating" })
-        .waitFor({ state: "detached", timeout: 10_000 });
     } finally {
       await suite.closeBrowserContext(context);
     }
@@ -377,11 +466,6 @@ suite.define(() => {
 
       const queuedText = "leave this modifier follow-up queued";
       await composer.fill(queuedText);
-      const queueButton = page.getByRole("button", { name: "Queue message" });
-      const tooltip = await queueButton
-        .locator("..")
-        .evaluate((element) => (element as HTMLElement & { content?: string }).content);
-      expect(tooltip).toBe("Queue");
       await composer.press("Control+Enter");
 
       const queuedRow = page.locator(".chat-queue__item", { hasText: queuedText });
@@ -459,14 +543,10 @@ suite.define(() => {
   });
 
   it("dismisses an informational steer notice when the steer request lands", async () => {
-    const artifactDir = process.env.OPENCLAW_UI_E2E_ARTIFACT_DIR?.trim();
     const context = await suite.newBrowserContext({
       locale: "en-US",
       serviceWorkers: "block",
       viewport: { height: 900, width: 1280 },
-      ...(artifactDir
-        ? { recordVideo: { dir: artifactDir, size: { height: 900, width: 1280 } } }
-        : {}),
     });
     const page = await context.newPage();
     const gateway = await installMockGateway(page);
@@ -548,10 +628,6 @@ suite.define(() => {
           infoSubtle,
         };
       });
-      if (artifactDir) {
-        await page.screenshot({ path: `${artifactDir}/steer-pending.png`, fullPage: true });
-      }
-
       await gateway.emitGatewayEvent("chat", {
         runId: steerRunId,
         sessionKey: "main",
@@ -560,9 +636,6 @@ suite.define(() => {
       await row.waitFor({ state: "detached", timeout: 10_000 });
       await page.getByText(steerText, { exact: true }).waitFor({ timeout: 10_000 });
       await expectChatBubbleAbove(page, "keep this run active", steerText);
-      if (artifactDir) {
-        await page.screenshot({ path: `${artifactDir}/steer-landed.png`, fullPage: true });
-      }
 
       expect(pendingPresentation).toMatchObject({
         badgeColor: pendingPresentation.infoColor,

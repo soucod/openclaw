@@ -1,5 +1,5 @@
 {
-  "startupJsGzipBytes": 335452,
-  "reason": "chat delivery failures surface globally: toast + session-display naming joins startup chat path",
-  "updatedAt": "2026-08-16"
+  "startupJsGzipBytes": 343289,
+  "reason": "Typed update recovery state, failure projection, and sidebar review routing",
+  "updatedAt": "2026-08-18"
 }

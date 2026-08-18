@@ -2,6 +2,7 @@ import { normalizeSortedUniqueTrimmedStringList } from "@openclaw/normalization-
 import {
   type DesktopObserveParams,
   type EnvironmentSummary,
+  type WorkerMachineOption,
   ErrorCodes,
   errorShape,
   validateDesktopLaunchParams,
@@ -138,8 +139,22 @@ export function summarizeWorkerEnvironment(
 }
 async function listEnvironments(context: GatewayRequestContext): Promise<EnvironmentSummary[]> {
   const [devices, nodes] = await Promise.all([listDevicePairing(), listNodePairing()]);
+  const managedCloudNodeIds = new Set(
+    listWorkerEnvironments(context).flatMap((environment) =>
+      environment.providerId !== "device" &&
+      environment.nodeDeviceId &&
+      environment.state !== "destroyed" &&
+      environment.state !== "failed" &&
+      environment.state !== "orphaned"
+        ? [environment.nodeDeviceId]
+        : [],
+    ),
+  );
+  const visibleDevices = devices.paired.filter(
+    (device) => !managedCloudNodeIds.has(device.deviceId),
+  );
   const currentPairingStates = new Map<string, { identity: string; generation?: string }>();
-  for (const device of devices.paired) {
+  for (const device of visibleDevices) {
     const state = resolveNodePairingState(device);
     if (state) {
       currentPairingStates.set(state.identity.nodeId, {
@@ -167,9 +182,9 @@ async function listEnvironments(context: GatewayRequestContext): Promise<Environ
     connectedNodes,
   );
   const catalog = createKnownNodeCatalog({
-    pairedDevices: devices.paired,
-    pairedNodes: nodes.paired,
-    connectedNodes,
+    pairedDevices: visibleDevices,
+    pairedNodes: nodes.paired.filter((node) => !managedCloudNodeIds.has(node.nodeId)),
+    connectedNodes: connectedNodes.filter((node) => !managedCloudNodeIds.has(node.nodeId)),
     sessionHostNodeIds,
     workerBundleByNodeId,
     issuesByNodeId,
@@ -192,6 +207,14 @@ function listWorkerEnvironments(context: GatewayRequestContext): WorkerEnvironme
     return [];
   }
 }
+function projectWorkerMachineOption(option: WorkerMachineOption): WorkerMachineOption {
+  return {
+    id: option.id,
+    label: option.label,
+    ...(option.description === undefined ? {} : { description: option.description }),
+    ...(option.default === undefined ? {} : { default: option.default }),
+  };
+}
 export function listWorkerProfiles(context: GatewayRequestContext) {
   if (!context.workerEnvironmentService || !context.workerPlacementDispatchService) {
     return [];
@@ -203,6 +226,25 @@ export function listWorkerProfiles(context: GatewayRequestContext) {
       return id.trim() && providerId ? [{ id: id.trim(), providerId }] : [];
     })
     .toSorted((left, right) => left.id.localeCompare(right.id));
+}
+async function listWorkerProfilesWithMachines(context: GatewayRequestContext) {
+  const summaries = listWorkerProfiles(context);
+  return await Promise.all(
+    summaries.map(async (summary) => {
+      try {
+        const options = await context.workerEnvironmentService?.listMachineOptions?.(summary.id);
+        const machines = options?.map(projectWorkerMachineOption) ?? [];
+        return machines.length > 0
+          ? { id: summary.id, providerId: summary.providerId, machines }
+          : summary;
+      } catch (error) {
+        context.logGateway.warn(
+          `worker machine catalog unavailable (${summary.id}): ${formatForLog(error)}`,
+        );
+        return summary;
+      }
+    }),
+  );
 }
 async function respondWorkerMutation(
   respond: RespondFn,
@@ -422,7 +464,7 @@ export const environmentsHandlers: GatewayRequestHandlers = {
       environments.push(
         ...workers.map((record) => summarizeWorkerEnvironment(record, summarizedAtMs)),
       );
-      const profiles = listWorkerProfiles(context);
+      const profiles = await listWorkerProfilesWithMachines(context);
       respond(true, { environments, ...(profiles.length > 0 ? { profiles } : {}) }, undefined);
     });
   },

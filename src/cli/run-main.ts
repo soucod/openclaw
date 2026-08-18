@@ -1009,7 +1009,7 @@ async function resolveUnownedCliPrimaryError(params: {
     resolveCliCommandSurfaceOwner: () => cliCommandSurfaceOwner,
   });
   if (pluginPolicyMessage) {
-    return new Error(pluginPolicyMessage);
+    return await createExpectedPluginPolicyError(pluginPolicyMessage);
   }
   const sanitizedPrimary = sanitizeTerminalText(params.primary);
   const displayPrimary =
@@ -1021,6 +1021,11 @@ async function resolveUnownedCliPrimaryError(params: {
     argv: params.argv,
     ...(displayPrimary === params.primary ? {} : { commandNames: [] }),
   });
+}
+
+async function createExpectedPluginPolicyError(message: string): Promise<Error> {
+  const { ExpectedCliError } = await import("./failure-output.js");
+  return new ExpectedCliError({ message, humanOutput: message, machineOutput: message });
 }
 
 async function bootstrapCliProxyCaptureAndDispatcher(
@@ -1200,12 +1205,12 @@ async function runCliWithPreparedOutputMode(
   let unregisterProxySignalExitBarrier: (() => void) | null = null;
   let bestEffortConfigPromise: Promise<OpenClawConfig> | null = null;
   const isolateProxyConfigEnv = isGatewayRunInvocation;
-  const skipBestEffortConfigObservation = resolveCliStartupPolicyForArgv({
+  const bestEffortConfigStartupPolicy = resolveCliStartupPolicyForArgv({
     argv: normalizedArgv,
     commandPath: normalizedInvocation.commandPath,
     jsonOutputMode: options.builtInMachineOutput || hasJsonOutputFlag(normalizedArgv),
     env: process.env,
-  }).skipConfigGuard;
+  });
   const useSourceOnlyBestEffortConfig =
     normalizedInvocation.primary === "update" ||
     (normalizedInvocation.primary === "doctor" && hasFlag(normalizedArgv, "--lint"));
@@ -1216,7 +1221,10 @@ async function runCliWithPreparedOutputMode(
           ? configIo.readSourceConfigBestEffort()
           : configIo.readBestEffortConfig({
               ...(isolateProxyConfigEnv ? { isolateEnv: true, observe: false } : {}),
-              ...(skipBestEffortConfigObservation ? { observe: false } : {}),
+              ...(bestEffortConfigStartupPolicy.skipConfigGuard ||
+              bestEffortConfigStartupPolicy.validateConfigOnly
+                ? { observe: false }
+                : {}),
               skipPluginValidation: true,
             }),
       );
@@ -1641,7 +1649,7 @@ async function runCliWithPreparedOutputMode(
               },
             );
             if (missingPluginCommandMessage) {
-              throw new Error(missingPluginCommandMessage);
+              throw await createExpectedPluginPolicyError(missingPluginCommandMessage);
             }
           }
         }

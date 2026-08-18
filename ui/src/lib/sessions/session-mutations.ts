@@ -1,4 +1,10 @@
 import type {
+  SessionOwner,
+  SessionsAssignOwnerParams,
+  SessionsAssignOwnerResult,
+} from "../../../../packages/gateway-protocol/src/index.js";
+import type { GatewayBrowserClient } from "../../api/gateway.ts";
+import type {
   GatewaySessionRow,
   SessionsListResult,
   SessionsPatchResult,
@@ -44,6 +50,26 @@ type SessionMutationsHost = {
   notifyCreated: (key: string) => void;
   retirePullRequestSummary: (key: string) => void;
 };
+
+function scheduleDeletedComposerDraftRetirement(
+  client: GatewayBrowserClient,
+  key: string,
+  agentId?: string | null,
+) {
+  if (!client?.recoveryScopeReady || !client.recoveryScope) {
+    return;
+  }
+  const target = {
+    gatewayUrl: client.gatewayUrl,
+    recoveryScope: client.recoveryScope,
+    sessionKey: key,
+    ...(agentId ? { agentId } : {}),
+  };
+  void import("../chat/composer-draft-store.runtime.ts").then(
+    ({ retireDeletedComposerDraft }) => retireDeletedComposerDraft(target),
+    () => undefined,
+  );
+}
 
 export function createSessionMutations(host: SessionMutationsHost) {
   const pendingModelPatches = new Map<
@@ -408,6 +434,7 @@ export function createSessionMutations(host: SessionMutationsHost) {
       if (!host.connection.isCurrent(scope) || !confirmsSessionDeletion(response)) {
         return { deleted: false };
       }
+      scheduleDeletedComposerDraftRetirement(scope.client, key, options.agentId);
       host.retirePullRequestSummary(key);
       confirmedArchives.delete(key.trim());
       preparedWorkSessionKeys.delete(key.trim());
@@ -448,6 +475,7 @@ export function createSessionMutations(host: SessionMutationsHost) {
         }
         if (confirmsSessionDeletion(response)) {
           deleted.push(target.key);
+          scheduleDeletedComposerDraftRetirement(scope.client, target.key, target.agentId);
           if (response.worktreePreserved) {
             preservedWorktrees.push(response.worktreePreserved);
           }
@@ -496,6 +524,34 @@ export function createSessionMutations(host: SessionMutationsHost) {
     }
   };
 
+  const assignOwner = async (
+    key: string,
+    owner: SessionsAssignOwnerParams["owner"],
+    options: { agentId?: string | null } = {},
+  ): Promise<SessionOwner | null> => {
+    const scope = host.connection.capture();
+    if (!scope) {
+      return null;
+    }
+    try {
+      const result = await scope.client.request<SessionsAssignOwnerResult>("sessions.assignOwner", {
+        key,
+        owner,
+        ...(options.agentId ? { agentId: options.agentId } : {}),
+      });
+      if (!host.connection.isCurrent(scope)) {
+        return null;
+      }
+      patchRowLocal(result.key, { owner: result.owner });
+      return result.owner;
+    } catch (error) {
+      if (host.connection.isCurrent(scope)) {
+        host.publish({ ...host.readState(), error: formatUiError(error) }, "operation");
+      }
+      return null;
+    }
+  };
+
   return {
     create,
     createResult,
@@ -503,6 +559,7 @@ export function createSessionMutations(host: SessionMutationsHost) {
     delete: remove,
     deleteMany: removeMany,
     patch,
+    assignOwner,
     patchRowLocal,
     /**
      * Re-asserts in-flight pin intents over canonical Gateway rows: every
