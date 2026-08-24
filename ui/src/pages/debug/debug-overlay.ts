@@ -6,13 +6,15 @@ import { t } from "../../i18n/index.ts";
 import { OpenClawLightDomElement } from "../../lit/openclaw-element.ts";
 import { PollController } from "../../lit/poll-controller.ts";
 import "../../styles/debug.css";
-import { DEBUG_OVERLAY_TOGGLE_EVENT } from "./debug-overlay-contract.ts";
 import {
   DEBUG_OVERLAY_SECTIONS,
   type DebugOverlaySectionDescriptor,
+  type DebugOverlayStatusSample,
+  type DebugOverlayStatusSnapshot,
 } from "./debug-overlay-sections.ts";
 
 const DEBUG_OVERLAY_POLL_INTERVAL_MS = 2000;
+const DEBUG_OVERLAY_HISTORY_LIMIT = 90;
 
 type SectionState =
   | { status: "loading" }
@@ -29,6 +31,7 @@ export class DebugOverlay extends OpenClawLightDomElement {
   private requestController: AbortController | null = null;
   private requestActive = false;
   private requestGeneration = 0;
+  private statusHistory: DebugOverlayStatusSample[] = [];
   private eventLogSource: ApplicationContext["gateway"] | null = null;
   private unsubscribeEventLog: (() => void) | null = null;
   private readonly polling = new PollController(
@@ -38,13 +41,7 @@ export class DebugOverlay extends OpenClawLightDomElement {
     false,
   );
 
-  override connectedCallback(): void {
-    super.connectedCallback();
-    window.addEventListener(DEBUG_OVERLAY_TOGGLE_EVENT, this.handleToggle);
-  }
-
   override disconnectedCallback(): void {
-    window.removeEventListener(DEBUG_OVERLAY_TOGGLE_EVENT, this.handleToggle);
     this.close();
     super.disconnectedCallback();
   }
@@ -55,12 +52,13 @@ export class DebugOverlay extends OpenClawLightDomElement {
     }
   }
 
-  private readonly handleToggle = (): void => {
+  toggle(): void {
     if (this.open) {
       this.close();
       return;
     }
     this.open = true;
+    this.statusHistory = [];
     document.addEventListener("keydown", this.handleKeydown, true);
     this.syncEventLogSubscription();
     this.sections = new Map(
@@ -68,7 +66,7 @@ export class DebugOverlay extends OpenClawLightDomElement {
     );
     void this.refreshSections();
     this.polling.start();
-  };
+  }
 
   private readonly handleKeydown = (event: KeyboardEvent): void => {
     if (event.key !== "Escape" || event.defaultPrevented) {
@@ -141,6 +139,14 @@ export class DebugOverlay extends OpenClawLightDomElement {
     if (!this.open || generation !== this.requestGeneration) {
       return;
     }
+    if (id === "status" && state.status === "ready") {
+      // SAFETY: The status descriptor owns this section id and always returns a status snapshot.
+      const snapshot = state.value as DebugOverlayStatusSnapshot;
+      this.statusHistory = [
+        ...this.statusHistory.slice(-(DEBUG_OVERLAY_HISTORY_LIMIT - 1)),
+        { at: Date.now(), status: snapshot },
+      ];
+    }
     const next = new Map(this.sections);
     next.set(id, state);
     this.sections = next;
@@ -155,7 +161,7 @@ export class DebugOverlay extends OpenClawLightDomElement {
           ? html`<div class="debug-overlay__empty">${t("common.loading")}</div>`
           : state.status === "unavailable"
             ? html`<div class="debug-overlay__empty">${t("debug.overlay.unavailable")}</div>`
-            : section.render(state.value)}
+            : section.render(state.value, this.statusHistory)}
       </section>
     `;
   }
