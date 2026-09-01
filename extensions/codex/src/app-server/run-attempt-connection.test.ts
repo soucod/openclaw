@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 import * as appServerPolicy from "./app-server-policy.js";
 import { applyCodexAppServerAuthProfile } from "./auth-bridge.js";
 import * as bindingConnection from "./binding-connection.js";
+import * as codexRequirements from "./config-requirements.js";
 import { prepareCodexAttemptConnection } from "./run-attempt-connection.js";
 import {
   createCodexRuntimePlanFixture,
@@ -27,6 +28,82 @@ import {
 setupRunAttemptTestHooks();
 
 describe("prepareCodexAttemptConnection", () => {
+  it.each([
+    "local",
+    "loopback-server",
+    "ordinary-loopback-server",
+    "forwarded-server",
+    "unix-server",
+    "remote-server",
+    "sandbox",
+    "remote",
+    "remote-only",
+  ])("handles an installation target for %s execution before native startup", async (placement) => {
+    const sessionFile = path.join(tempDir, "installation-target.jsonl");
+    const params = createParams(sessionFile, path.join(tempDir, "workspace-installation-target"));
+    const localProcessEnv = Object.freeze({
+      OPENCLAW_STATE_DIR: "/fixture/diagnosed",
+      OPENCLAW_CONFIG_PATH: "/fixture/custom.json",
+      OPENCLAW_WORKSPACE_DIR: "/fixture/default-workspace",
+    });
+    params.hostCapabilities = Object.freeze({
+      ...params.hostCapabilities,
+      preparedEnvironment: () => ({
+        credentialScrubEnv: {},
+        localIdentityEnv: {},
+        managedLocalIdentity: false,
+        localProcessEnv: placement === "ordinary-loopback-server" ? undefined : localProcessEnv,
+      }),
+    });
+    if (["sandbox", "remote", "remote-only"].includes(placement)) {
+      params.sandbox = {
+        ...createSandboxContext({}),
+        ...(placement.startsWith("remote") ? { placementExecutionMode: "remote-exec" } : {}),
+        ...(placement === "remote-only" ? { enabled: false } : {}),
+      } as NonNullable<typeof params.sandbox>;
+    }
+    registerCodexTestSessionIdentity(sessionFile, params.sessionId, params.sessionKey);
+    const pending = prepareCodexAttemptConnection({
+      params,
+      options: {
+        bindingStore: testCodexAppServerBindingStore,
+        ...(placement.endsWith("-server")
+          ? {
+              pluginConfig: {
+                appServer:
+                  placement === "unix-server"
+                    ? { transport: "unix", homeScope: "user", url: "unix:///fixture/native.sock" }
+                    : {
+                        transport: "websocket",
+                        url:
+                          placement === "remote-server"
+                            ? "wss://fixture.invalid/native"
+                            : "ws://127.0.0.1:19400",
+                        authToken: "fixture-token",
+                        ...(placement === "forwarded-server"
+                          ? { remoteWorkspaceRoot: "/remote/workspace" }
+                          : {}),
+                      },
+              },
+            }
+          : {}),
+      },
+    });
+    if (!["local", "ordinary-loopback-server", "unix-server"].includes(placement)) {
+      await expect(pending).rejects.toThrow("saved prompt");
+      return;
+    }
+    const connection = await pending;
+    if (placement === "ordinary-loopback-server") {
+      expect(connection.shellEnvironment).toBeUndefined();
+      expect(connection.appServer.start.env ?? {}).not.toHaveProperty("OPENCLAW_STATE_DIR");
+      expect(connection.disableLoginShell).toBe(false);
+      return;
+    }
+    expect(connection.shellEnvironment).toEqual(localProcessEnv);
+    expect(connection.appServer.start.env).toMatchObject(localProcessEnv);
+    expect(connection.disableLoginShell).toBe(true);
+  });
   it("preserves native process environment and login-shell behavior for an empty overlay", async () => {
     const sessionFile = path.join(tempDir, "native-local-no-overlay.jsonl");
     const workspaceDir = path.join(tempDir, "workspace-native-local-no-overlay");
@@ -354,7 +431,7 @@ describe("prepareCodexAttemptConnection", () => {
     expect(resolveModelPolicy).toHaveBeenCalledTimes(2);
   });
 
-  it("does not give OpenClaw ownership of an explicit operator approval policy", async () => {
+  it("rejects the retired explicit untrusted approval policy with Doctor remediation", async () => {
     initializeGlobalHookRunner(
       createMockPluginRegistry([{ hookName: "before_tool_call", handler: vi.fn() }]),
     );
@@ -364,18 +441,20 @@ describe("prepareCodexAttemptConnection", () => {
     params.agentDir = path.join(tempDir, "agent");
     registerCodexTestSessionIdentity(sessionFile, params.sessionId, params.sessionKey);
 
-    const connection = await prepareCodexAttemptConnection({
-      params,
-      options: {
-        bindingStore: testCodexAppServerBindingStore,
-        pluginConfig: { appServer: { approvalPolicy: "untrusted" } },
-      },
-    });
-
-    expect(connection.appServer.approvalPolicy).toBe("untrusted");
+    await expect(
+      prepareCodexAttemptConnection({
+        params,
+        options: {
+          bindingStore: testCodexAppServerBindingStore,
+          pluginConfig: { appServer: { approvalPolicy: "untrusted" } },
+        },
+      }),
+    ).rejects.toThrow(
+      'plugins.entries.codex.config.appServer.approvalPolicy="untrusted" is retired; run "openclaw doctor --fix" to migrate it to "on-request".',
+    );
   });
 
-  it("lets a workspace session mode override explicitly configured full exec", async () => {
+  it("defaults a rootless workspace session boundary while overriding full exec", async () => {
     const sessionFile = path.join(tempDir, "workspace-session-policy.jsonl");
     const workspaceDir = path.join(tempDir, "workspace-session-policy");
     const params = createParams(sessionFile, workspaceDir);
@@ -384,7 +463,6 @@ describe("prepareCodexAttemptConnection", () => {
     // Dispatch owns mode→exec preparation; connection consumes the prepared override.
     params.execOverrides = { ...params.execOverrides, mode: "auto" };
     params.permissionMode = "workspace";
-    params.sessionRoot = workspaceDir;
     registerCodexTestSessionIdentity(sessionFile, params.sessionId, params.sessionKey);
 
     const resolveConnection = vi.spyOn(bindingConnection, "resolveCodexBindingAppServerConnection");
@@ -423,6 +501,72 @@ describe("prepareCodexAttemptConnection", () => {
 
     // Upstream 28f10c00b4e keeps YOLO approvals disabled despite generic tool hooks.
     expect(connection.appServer.approvalPolicy).toBe("never");
+  });
+
+  it("rejects native execution denied by the retained global policy owner", async () => {
+    const workspaceDir = path.join(tempDir, "policy-workspace");
+    const sessionFile = path.join(tempDir, "policy-session.jsonl");
+    const params = createParams(sessionFile, workspaceDir);
+    params.agentId = "main";
+    params.agentDir = path.join(tempDir, "main-agent");
+    params.sandboxSessionKey = "global";
+    params.sandboxAgentId = "policy";
+    params.config = {
+      agents: {
+        entries: {
+          main: {},
+          policy: { tools: { exec: { mode: "deny" } } },
+        },
+      },
+    };
+    registerCodexTestSessionIdentity(sessionFile, params.sessionId, params.sessionKey);
+
+    await expect(
+      prepareCodexAttemptConnection({
+        params,
+        options: { bindingStore: testCodexAppServerBindingStore },
+      }),
+    ).rejects.toThrow("effective tools.exec.mode=deny");
+  });
+
+  it("prepares one Guardian policy when requirements clamp an explicitly full session", async () => {
+    vi.mocked(codexRequirements.readCodexRequirementsToml).mockReturnValue(
+      [
+        'allowed_sandbox_modes = ["workspace-write"]',
+        'allowed_approval_policies = ["on-request"]',
+        'allowed_approvals_reviewers = ["auto_review"]',
+      ].join("\n"),
+    );
+    const workspaceDir = path.join(tempDir, "requirements-clamped-workspace");
+    const sessionFile = path.join(tempDir, "requirements-clamped-session.jsonl");
+    const params = createParams(sessionFile, workspaceDir);
+    params.agentDir = path.join(tempDir, "agent");
+    params.provider = "openai";
+    params.permissionMode = "full";
+    params.sessionRoot = workspaceDir;
+    params.execOverrides = { ...params.execOverrides, mode: "full" };
+    registerCodexTestSessionIdentity(sessionFile, params.sessionId, params.sessionKey);
+
+    const connection = await prepareCodexAttemptConnection({
+      params,
+      options: { bindingStore: testCodexAppServerBindingStore },
+    });
+
+    expect(connection.appServer).toMatchObject({
+      sandbox: "workspace-write",
+      approvalPolicy: "on-request",
+      approvalsReviewer: "auto_review",
+    });
+    expect(connection.sessionPermissionPolicy).toEqual({
+      mode: "workspace",
+      root: workspaceDir,
+      execMode: "auto",
+    });
+    expect(params).toMatchObject({
+      permissionMode: "workspace",
+      sessionRoot: workspaceDir,
+      execOverrides: { mode: "auto" },
+    });
   });
 
   it.each([

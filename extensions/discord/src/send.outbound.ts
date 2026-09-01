@@ -71,6 +71,8 @@ type DiscordSendOpts = {
   onDeliveryResult?: (result: DiscordSendResult) => Promise<void> | void;
   /** @internal Refresh durable custody immediately before Discord REST I/O. */
   onPlatformSendDispatch?: () => Promise<void>;
+  /** @internal Synchronously fence custody after refresh and immediately before Discord REST I/O. */
+  assertPlatformSendAuthorized?: () => void;
 };
 
 type DiscordClientRequest = ReturnType<typeof createDiscordClient>["request"];
@@ -94,6 +96,7 @@ async function sendDiscordThreadTextChunks(params: {
   allowedMentions?: DiscordAllowedMentions;
   onResult?: DiscordSendProgress;
   onPlatformSendDispatch?: () => Promise<void>;
+  assertPlatformSendAuthorized?: () => void;
 }): Promise<void> {
   for (const chunk of params.chunks) {
     await sendDiscordText({
@@ -109,6 +112,7 @@ async function sendDiscordThreadTextChunks(params: {
       maxChars: params.maxChars,
       onResult: params.onResult,
       onPlatformSendDispatch: params.onPlatformSendDispatch,
+      assertPlatformSendAuthorized: params.assertPlatformSendAuthorized,
     });
   }
 }
@@ -208,6 +212,17 @@ export async function sendMessageDiscord(
 
   // Forum/Media channels reject POST /messages; auto-create a thread post instead.
   const channel = await resolveDiscordChannel(rest, channelId);
+  const deliveredResults: DiscordSendResult[] = [];
+  let deliveryThreadId: string | undefined;
+  const reportResult: DiscordSendProgress = async (progressResult, kind, replyToId) => {
+    const deliveredResult = toDiscordSendResult(progressResult, deliveryThreadId ?? channelId, {
+      kind,
+      threadId: deliveryThreadId,
+      reply: createReusableDiscordReplyReference(replyToId),
+    });
+    deliveredResults.push(deliveredResult);
+    await opts.onDeliveryResult?.(deliveredResult);
+  };
 
   if (isForumLikeChannel(channel)) {
     if (((channel.flags ?? 0) & DISCORD_FORUM_REQUIRE_TAG_FLAG) !== 0) {
@@ -245,6 +260,7 @@ export async function sendMessageDiscord(
       threadRes = (await request(
         async () => {
           await opts.onPlatformSendDispatch?.();
+          opts.assertPlatformSendAuthorized?.();
           return createThread<{ id: string; message?: { id: string; channel_id: string } }>(
             rest,
             channelId,
@@ -275,6 +291,7 @@ export async function sendMessageDiscord(
     }
 
     const threadId = threadRes.id;
+    deliveryThreadId = threadId;
     const messageId = threadRes.message?.id ?? threadId;
     const resultChannelId = threadRes.message?.channel_id ?? threadId;
     const remainingChunks = chunks.slice(1);
@@ -286,13 +303,8 @@ export async function sendMessageDiscord(
       channelId,
       { kind: "text", threadId },
     );
-    const deliveredResults: DiscordSendResult[] = [starterResult];
+    deliveredResults.push(starterResult);
     await opts.onDeliveryResult?.(starterResult);
-    const reportThreadResult: DiscordSendProgress = async (result, kind) => {
-      const deliveredResult = toDiscordSendResult(result, threadId, { kind, threadId });
-      deliveredResults.push(deliveredResult);
-      await opts.onDeliveryResult?.(deliveredResult);
-    };
 
     try {
       if (opts.mediaUrl) {
@@ -314,8 +326,9 @@ export async function sendMessageDiscord(
           suppressEmbeds,
           allowedMentions: opts.allowedMentions,
           maxChars: textLimit,
-          onResult: reportThreadResult,
+          onResult: reportResult,
           onPlatformSendDispatch: opts.onPlatformSendDispatch,
+          assertPlatformSendAuthorized: opts.assertPlatformSendAuthorized,
         });
         await sendDiscordThreadTextChunks({
           rest,
@@ -328,8 +341,9 @@ export async function sendMessageDiscord(
           silent: opts.silent,
           suppressEmbeds,
           allowedMentions: opts.allowedMentions,
-          onResult: reportThreadResult,
+          onResult: reportResult,
           onPlatformSendDispatch: opts.onPlatformSendDispatch,
+          assertPlatformSendAuthorized: opts.assertPlatformSendAuthorized,
         });
       } else {
         await sendDiscordThreadTextChunks({
@@ -343,8 +357,9 @@ export async function sendMessageDiscord(
           silent: opts.silent,
           suppressEmbeds,
           allowedMentions: opts.allowedMentions,
-          onResult: reportThreadResult,
+          onResult: reportResult,
           onPlatformSendDispatch: opts.onPlatformSendDispatch,
+          assertPlatformSendAuthorized: opts.assertPlatformSendAuthorized,
         });
       }
     } catch (err) {
@@ -369,14 +384,6 @@ export async function sendMessageDiscord(
   }
 
   let result: DiscordChannelMessageResult;
-  const reportResult: DiscordSendProgress = async (progressResult, kind, replyToId) => {
-    await opts.onDeliveryResult?.(
-      toDiscordSendResult(progressResult, channelId, {
-        kind,
-        reply: createReusableDiscordReplyReference(replyToId),
-      }),
-    );
-  };
   try {
     if (opts.mediaUrl) {
       result = await sendDiscordMedia({
@@ -401,6 +408,7 @@ export async function sendMessageDiscord(
         maxChars: textLimit,
         onResult: reportResult,
         onPlatformSendDispatch: opts.onPlatformSendDispatch,
+        assertPlatformSendAuthorized: opts.assertPlatformSendAuthorized,
       });
     } else {
       result = await sendDiscordText({
@@ -419,6 +427,7 @@ export async function sendMessageDiscord(
         maxChars: textLimit,
         onResult: reportResult,
         onPlatformSendDispatch: opts.onPlatformSendDispatch,
+        assertPlatformSendAuthorized: opts.assertPlatformSendAuthorized,
       });
     }
   } catch (err) {
@@ -436,10 +445,11 @@ export async function sendMessageDiscord(
     accountId: accountInfo.accountId,
     direction: "outbound",
   });
-  return toDiscordSendResult(result, channelId, {
-    kind: opts.mediaUrl ? "media" : opts.components || opts.embeds ? "card" : "text",
-    reply: opts.reply,
-  });
+  return {
+    messageId: result.id || "unknown",
+    channelId: result.channel_id ?? channelId,
+    receipt: createDiscordSendReceiptFromResults({ results: deliveredResults }),
+  };
 }
 
 export async function sendStickerDiscord(
@@ -450,7 +460,7 @@ export async function sendStickerDiscord(
   const context = await resolveDiscordStructuredSendContext(to, opts);
   const { rewrittenContent, suppressEmbeds } = context;
   const stickers = normalizeStickerIds(stickerIds);
-  const flags = resolveDiscordMessageFlags({ suppressEmbeds });
+  const flags = resolveDiscordMessageFlags({ silent: opts.silent, suppressEmbeds });
   const body = {
     content: rewrittenContent || undefined,
     sticker_ids: stickers,
@@ -510,6 +520,7 @@ async function resolveDiscordStructuredSendContext(
       const result = (await request(
         async () => {
           await opts.onPlatformSendDispatch?.();
+          opts.assertPlatformSendAuthorized?.();
           return createChannelMessage<{ id: string; channel_id: string }>(rest, channelId, {
             body,
           });

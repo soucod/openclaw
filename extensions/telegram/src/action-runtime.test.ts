@@ -171,6 +171,8 @@ const sendDurableMessageBatch = vi.fn(
             index: 0,
           },
         ],
+        threadId: params.threadId == null ? undefined : String(params.threadId),
+        replyToId: params.reply?.replyToId ?? params.replyToId,
         sentAt: Date.now(),
       },
     } as const;
@@ -1017,6 +1019,7 @@ describe("handleTelegramAction", () => {
         action: "sendMessage",
         to: "@testchannel",
         content: "Hello, Telegram!",
+        messageThreadId: 77,
       },
       telegramConfig(),
       {
@@ -1036,12 +1039,14 @@ describe("handleTelegramAction", () => {
     const options = requireRecord(call[2], "text message options");
     expect(options.token).toBe("tok");
     expect(options.mediaUrl).toBeUndefined();
+    expect(options.messageThreadId).toBe(77);
     const durableCall = mockCall(sendDurableMessageBatch, 0, "durable text message");
     expect(requireRecord(durableCall[0], "durable text message params")).toMatchObject({
       channel: "telegram",
       to: "@testchannel",
       durability: "required",
       gatewayClientScopes: ["operator.write"],
+      threadId: 77,
       // The gateway-owned plugin send must inherit the caller's retry ownership,
       // or the failed row stays replay-eligible and duplicates (#124279).
       deliveryRetryOwner: "caller",
@@ -1049,17 +1054,21 @@ describe("handleTelegramAction", () => {
       reply: { replyToId: "456", source: "implicit", mode: "first" },
       payloads: [{ text: "Hello, Telegram!" }],
     });
-    expect(result.content).toStrictEqual([
-      {
-        type: "text",
-        text: '{\n  "ok": true,\n  "messageId": "789",\n  "chatId": "123"\n}',
-      },
-    ]);
-    expect(result.details).toStrictEqual({
+    const details = resultDetails(result);
+    // Source-reply reconciliation reads `receipt` off this result (#133051); dropping it
+    // makes a successfully delivered Telegram reply look unconfirmed and fail closed.
+    expect(details).toStrictEqual({
       ok: true,
       messageId: "789",
       chatId: "123",
+      receipt: {
+        threadId: "77",
+        replyToId: "456",
+      },
     });
+    expect(result.content).toStrictEqual([
+      { type: "text", text: JSON.stringify(details, null, 2) },
+    ]);
   });
 
   it("persists sendMessage action deliveries before Telegram platform send", async () => {
@@ -1843,7 +1852,7 @@ describe("handleTelegramAction", () => {
     },
   );
 
-  it("stores created forum topic names in the account-scoped cache", async () => {
+  it("stores created forum topic thread names in the account-scoped cache", async () => {
     createForumTopicTelegram.mockResolvedValueOnce({
       topicId: 99,
       name: "Topic",
@@ -1855,7 +1864,7 @@ describe("handleTelegramAction", () => {
     } as OpenClawConfig;
 
     await handleTelegramAction(
-      { action: "createForumTopic", accountId: "work", chatId: "alias-chat", name: "Topic" },
+      { action: "createForumTopic", accountId: "work", chatId: "alias-chat", threadName: "Topic" },
       cfg,
     );
 
@@ -1864,7 +1873,7 @@ describe("handleTelegramAction", () => {
     await expect(getTopicName("alias-chat", 99, scope)).resolves.toBeUndefined();
   });
 
-  it("stores edited forum topic names in the account-scoped cache", async () => {
+  it("stores edited forum topic thread names in the account-scoped cache", async () => {
     editForumTopicTelegram.mockResolvedValueOnce({
       ok: true,
       chatId: "-100123",
@@ -1882,12 +1891,68 @@ describe("handleTelegramAction", () => {
         accountId: "work",
         chatId: "alias-chat",
         messageThreadId: 42,
-        name: "New",
+        threadName: "New",
       },
       cfg,
     );
 
     await expect(getTopicName("-100123", 42, topicCacheScopeFor(cfg, "work"))).resolves.toBe("New");
+  });
+
+  it("prefers name over threadName for forum topic actions", async () => {
+    const cfg = telegramConfig({
+      actions: { createForumTopic: true, editForumTopic: true },
+    });
+
+    await handleTelegramAction(
+      { action: "createForumTopic", chatId: "123", name: "Primary", threadName: "Alias" },
+      cfg,
+    );
+    await handleTelegramAction(
+      {
+        action: "editForumTopic",
+        chatId: "123",
+        messageThreadId: 42,
+        name: "Primary",
+        threadName: "Alias",
+      },
+      cfg,
+    );
+
+    expect(mockCall(createForumTopicTelegram, 0, "topic create")[1]).toBe("Primary");
+    expect(mockCall(editForumTopicTelegram, 0, "topic edit")[2]).toMatchObject({
+      name: "Primary",
+    });
+  });
+
+  it("preserves structured validation when a created topic has no name", async () => {
+    const cfg = telegramConfig({ actions: { createForumTopic: true } });
+
+    await expect(
+      handleTelegramAction({ action: "createForumTopic", chatId: "123" }, cfg),
+    ).rejects.toMatchObject({
+      name: "ToolInputError",
+      status: 400,
+      message: "name required",
+    });
+  });
+
+  it("preserves icon-only forum topic edits", async () => {
+    const cfg = telegramConfig({ actions: { editForumTopic: true } });
+    await handleTelegramAction(
+      {
+        action: "editForumTopic",
+        chatId: "123",
+        messageThreadId: 42,
+        iconCustomEmojiId: "emoji-1",
+      },
+      cfg,
+    );
+
+    expect(mockCall(editForumTopicTelegram, 0, "icon-only topic edit")[2]).toMatchObject({
+      name: undefined,
+      iconCustomEmojiId: "emoji-1",
+    });
   });
 
   it.each([
@@ -1904,19 +1969,35 @@ describe("handleTelegramAction", () => {
       expectedOptions: { mediaUrl: "https://example.com/image.jpg" },
     },
     {
-      name: "quoteText",
+      name: "quoteText preserving exact whitespace",
       params: {
         action: "sendMessage",
         to: "123456",
         content: "Replying now",
         replyToMessageId: 144,
-        quoteText: "The text you want to quote",
+        quoteText: "  The text you want to quote\n  ",
       },
       expectedTo: "123456",
       expectedContent: "Replying now",
       expectedOptions: {
         replyToMessageId: 144,
-        quoteText: "The text you want to quote",
+        quoteText: "  The text you want to quote\n  ",
+      },
+    },
+    {
+      name: "snake-case quoteText preserving exact whitespace",
+      params: {
+        action: "sendMessage",
+        to: "123456",
+        content: "Replying now",
+        replyToMessageId: 144,
+        quote_text: " \nThe text you want to quote  ",
+      },
+      expectedTo: "123456",
+      expectedContent: "Replying now",
+      expectedOptions: {
+        replyToMessageId: 144,
+        quoteText: " \nThe text you want to quote  ",
       },
     },
     {

@@ -86,7 +86,7 @@ function hasNonEmptyValue(value: unknown): boolean {
   if (!value || typeof value !== "object") {
     return value != null;
   }
-  return Object.values(value as Record<string, unknown>).some(hasNonEmptyValue);
+  return Object.values(value).some(hasNonEmptyValue);
 }
 
 function hasExplicitMessageToolRoute(args: Record<string, unknown>): boolean {
@@ -503,7 +503,11 @@ export function mirrorMessageToolVisibleReplies(messages: unknown[]): unknown[] 
           succeeded: false,
         });
       }
-    } else if (deliveryMirrorText === undefined && isRenderableAssistantDisplayMessage(record)) {
+    } else if (
+      pending.length > 0 &&
+      deliveryMirrorText === undefined &&
+      isRenderableAssistantDisplayMessage(record)
+    ) {
       clearPending();
     }
 

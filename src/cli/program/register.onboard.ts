@@ -44,23 +44,24 @@ const MODERN_ONBOARD_OPTION_KEYS = new Set([
   "json",
 ]);
 
-function validateRecommendationParentOptions(
+async function validateRecommendationParentOptions(
   command: Command,
   runtime: RuntimeEnv,
-  allowJson = false,
-): boolean {
+  json = false,
+): Promise<boolean> {
   const unsupported = listExplicitOptionFlagsExcept(
     command,
-    allowJson ? RECOMMENDATION_READ_PARENT_OPTIONS : NO_RECOMMENDATION_PARENT_OPTIONS,
+    json ? RECOMMENDATION_READ_PARENT_OPTIONS : NO_RECOMMENDATION_PARENT_OPTIONS,
   );
   if (unsupported.length === 0) {
     return true;
   }
-  runtime.error(
+  const { rejectOnboardingOption } = await import("../../commands/onboard-options.js");
+  return rejectOnboardingOption(
+    { json },
+    runtime,
     `This recommendations command does not support parent option(s): ${unsupported.join(", ")}.`,
   );
-  runtime.exit(1);
-  return false;
 }
 
 const AUTH_CHOICE_HELP = formatAuthChoiceChoicesForCli({ includeSkip: true });
@@ -178,7 +179,7 @@ export function registerOnboardRuntimeOptions(
     .option("--install-daemon", "Install gateway service")
     .option("--no-install-daemon", "Skip gateway service install")
     .option("--skip-daemon", "Skip gateway service install")
-    .option("--daemon-runtime <runtime>", "Daemon runtime: node")
+    .option("--daemon-runtime <runtime>", "Daemon runtime: node|bun (default: node)")
     .option("--skip-channels", "Skip channel setup")
     .option("--skip-skills", "Skip skills setup")
     .option("--skip-bootstrap", "Skip creating default agent workspace files")
@@ -226,10 +227,16 @@ function pickOnboardAuthOptionValues(opts: Record<string, unknown>): Partial<Onb
   };
 }
 
-export function resolveOnboardCommandOptions(
+export async function resolveOnboardCommandOptions(
   opts: Record<string, unknown>,
   command: Command,
-): OnboardOptions {
+  runtime: RuntimeEnv,
+): Promise<OnboardOptions | false> {
+  if (opts.customImageInput === true && opts.customTextInput === true) {
+    const { rejectOnboardingOption } = await import("../../commands/onboard-options.js");
+    const message = "Use either --custom-image-input or --custom-text-input, not both.";
+    return rejectOnboardingOption({ json: opts.json === true }, runtime, message);
+  }
   return {
     workspace: readStringValue(opts.workspace),
     agentName: readStringValue(opts.agentName),
@@ -268,18 +275,6 @@ export function resolveOnboardCommandOptions(
     importSecrets: Boolean(opts.importSecrets),
     json: Boolean(opts.json),
   };
-}
-
-export function validateOnboardAuthOptionValues(
-  opts: Record<string, unknown>,
-  runtime: RuntimeEnv,
-): boolean {
-  if (opts.customImageInput === true && opts.customTextInput === true) {
-    runtime.error("Use either --custom-image-input or --custom-text-input, not both.");
-    runtime.exit(1);
-    return false;
-  }
-  return true;
 }
 
 export function registerOnboardCommand(program: Command): void {
@@ -326,17 +321,13 @@ export function registerOnboardCommand(program: Command): void {
     .action(async (opts, recommendationsCommand: Command) => {
       const { defaultRuntime } = await import("../../runtime.js");
       await runCommandWithRuntime(defaultRuntime, async () => {
-        if (!validateRecommendationParentOptions(command, defaultRuntime, true)) {
+        const json = Boolean(opts.json || recommendationsCommand.parent?.opts().json);
+        if (!(await validateRecommendationParentOptions(command, defaultRuntime, json))) {
           return;
         }
         const { onboardRecommendationsCommand } =
           await import("../../commands/onboard-recommendations.js");
-        onboardRecommendationsCommand(
-          {
-            json: Boolean(opts.json || recommendationsCommand.parent?.opts().json),
-          },
-          defaultRuntime,
-        );
+        onboardRecommendationsCommand({ json }, defaultRuntime);
       });
     });
 
@@ -348,8 +339,8 @@ export function registerOnboardCommand(program: Command): void {
       const { defaultRuntime } = await import("../../runtime.js");
       await runCommandWithRuntime(defaultRuntime, async () => {
         if (
-          !validateRecommendationParentOptions(command, defaultRuntime) ||
-          !validateRecommendationParentOptions(recommendations, defaultRuntime)
+          !(await validateRecommendationParentOptions(command, defaultRuntime)) ||
+          !(await validateRecommendationParentOptions(recommendations, defaultRuntime))
         ) {
           return;
         }
@@ -366,8 +357,8 @@ export function registerOnboardCommand(program: Command): void {
       const { defaultRuntime } = await import("../../runtime.js");
       await runCommandWithRuntime(defaultRuntime, async () => {
         if (
-          !validateRecommendationParentOptions(command, defaultRuntime) ||
-          !validateRecommendationParentOptions(recommendations, defaultRuntime)
+          !(await validateRecommendationParentOptions(command, defaultRuntime)) ||
+          !(await validateRecommendationParentOptions(recommendations, defaultRuntime))
         ) {
           return;
         }
@@ -380,30 +371,31 @@ export function registerOnboardCommand(program: Command): void {
   command.action(async (opts, commandRuntime: Command) => {
     const { defaultRuntime } = await import("../../runtime.js");
     await runCommandWithRuntime(defaultRuntime, async () => {
+      const { rejectOnboardingOption } = await import("../../commands/onboard-options.js");
+      const rejectOption = (message: string) =>
+        rejectOnboardingOption({ json: Boolean(opts.json) }, defaultRuntime, message);
       if (opts.modern) {
         const unsupportedOptions = listExplicitOptionFlagsExcept(
           commandRuntime,
           MODERN_ONBOARD_OPTION_KEYS,
         );
         if (unsupportedOptions.length > 0) {
-          defaultRuntime.error(
+          rejectOption(
             [
               `--modern cannot be combined with: ${unsupportedOptions.join(", ")}.`,
               "Run those setup options without --modern, or remove them to open OpenClaw.",
             ].join("\n"),
           );
-          defaultRuntime.exit(1);
           return;
         }
         if (opts.nonInteractive && opts.acceptRisk !== true) {
-          defaultRuntime.error(
+          rejectOption(
             [
               "Non-interactive setup requires explicit risk acknowledgement.",
               "Read: https://docs.openclaw.ai/security",
               `Re-run with: ${formatCliCommand("openclaw onboard --modern --non-interactive --accept-risk ...")}`,
             ].join("\n"),
           );
-          defaultRuntime.exit(1);
           return;
         }
         const { runSystemAgentWithInference } =
@@ -426,13 +418,14 @@ export function registerOnboardCommand(program: Command): void {
         );
         return;
       }
-      if (!validateOnboardAuthOptionValues(opts as Record<string, unknown>, defaultRuntime)) {
-        return;
-      }
-      const onboardingOptions = resolveOnboardCommandOptions(
+      const onboardingOptions = await resolveOnboardCommandOptions(
         opts as Record<string, unknown>,
         commandRuntime,
+        defaultRuntime,
       );
+      if (!onboardingOptions) {
+        return;
+      }
       const { setupWizardCommand } = await import("../../commands/onboard.js");
       await setupWizardCommand(onboardingOptions, defaultRuntime);
     });

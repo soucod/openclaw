@@ -13,7 +13,6 @@ import {
   registerOnboardRemoteOptions,
   registerOnboardRuntimeOptions,
   resolveOnboardCommandOptions,
-  validateOnboardAuthOptionValues,
 } from "./register.onboard.js";
 
 const SYSTEM_AGENT_OPTION_NAMES = new Set(["message", "yes", "json"]);
@@ -92,8 +91,9 @@ async function runOnboardingEntry(
   if (options.baseline) {
     const unsupportedOptions = listExplicitOptionFlagsExcept(commandRuntime, BASELINE_OPTION_NAMES);
     if (unsupportedOptions.length > 0) {
-      runtime.error(`--baseline cannot be combined with: ${unsupportedOptions.join(", ")}.`);
-      runtime.exit(1);
+      const { rejectOnboardingOption } = await import("../../commands/onboard-options.js");
+      const message = `--baseline cannot be combined with: ${unsupportedOptions.join(", ")}.`;
+      rejectOnboardingOption({ json: options.json === true }, runtime, message);
       return;
     }
     const { setupCommand } = await import("../../commands/setup.js");
@@ -103,10 +103,10 @@ async function runOnboardingEntry(
     );
     return;
   }
-  if (!validateOnboardAuthOptionValues(options, runtime)) {
+  const onboardingOptions = await resolveOnboardCommandOptions(options, commandRuntime, runtime);
+  if (!onboardingOptions) {
     return;
   }
-  const onboardingOptions = resolveOnboardCommandOptions(options, commandRuntime);
   const { setupWizardCommand } = await import("../../commands/onboard.js");
   await setupWizardCommand(onboardingOptions, runtime);
 }
