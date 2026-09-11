@@ -8,6 +8,7 @@ import {
   emitAssistantTextEnd,
 } from "./embedded-agent-subscribe.e2e-harness.js";
 import { subscribeEmbeddedAgentSession } from "./embedded-agent-subscribe.js";
+import { textAssistant } from "./test-helpers/sparse-transcript.test-support.js";
 
 describe("subscribeEmbeddedAgentSession reply tags", () => {
   type ReplyPayload = { text?: string; replyToCurrent?: boolean; replyToTag?: boolean };
@@ -56,10 +57,7 @@ describe("subscribeEmbeddedAgentSession reply tags", () => {
     emitAssistantTextDelta({ emit, delta: "[[reply_to_current]]\nHello" });
     emitAssistantTextEnd({ emit });
 
-    const assistantMessage = {
-      role: "assistant",
-      content: [{ type: "text", text: "[[reply_to_current]]\nHello" }],
-    } as AssistantMessage;
+    const assistantMessage = textAssistant("[[reply_to_current]]\nHello") as AssistantMessage;
     emit({ type: "message_end", message: assistantMessage });
 
     expect(onBlockReply).toHaveBeenCalledTimes(1);
@@ -124,7 +122,17 @@ describe("subscribeEmbeddedAgentSession reply tags", () => {
     }
   });
 
-  it("streams partial replies past reply_to tags split across chunks", () => {
+  it.each([
+    { name: "a split reply tag", chunks: ["[[reply_to:1897", "]] Hello", " world"] },
+    {
+      name: "held whitespace before hidden reasoning",
+      chunks: [" \nHello \t", "<think>private</think> [[reply_to_current]] world  "],
+    },
+    {
+      name: "held whitespace before a split reasoning tag",
+      chunks: [" \nHello \t<think", ">private</think> [[reply_to_current]] world  "],
+    },
+  ])("streams partial replies past $name", ({ chunks }) => {
     // Split tags are buffered until complete so partial replies never expose raw
     // directive syntax.
     const { session, emit } = createStubSessionHarness();
@@ -138,11 +146,12 @@ describe("subscribeEmbeddedAgentSession reply tags", () => {
     });
 
     emit({ type: "message_start", message: { role: "assistant" } });
-    emitAssistantTextDelta({ emit, delta: "[[reply_to:1897" });
-    emitAssistantTextDelta({ emit, delta: "]] Hello" });
-    emitAssistantTextDelta({ emit, delta: " world" });
-    emitAssistantTextEnd({ emit });
+    for (const delta of chunks) {
+      emitAssistantTextDelta({ emit, delta });
+    }
 
+    expect(replyTexts(onPartialReply)).toEqual(["Hello", "Hello world"]);
+    emitAssistantTextEnd({ emit });
     expect(lastReplyPayload(onPartialReply).text).toBe("Hello world");
     for (const call of onPartialReply.mock.calls) {
       expect(call[0]?.text?.includes("[[reply_to")).toBe(false);
@@ -181,10 +190,7 @@ describe("subscribeEmbeddedAgentSession reply tags", () => {
     emitAssistantTextDelta({ emit, delta: "current] Visible reply" });
     emitAssistantTextEnd({ emit });
 
-    const assistantMessage = {
-      role: "assistant",
-      content: [{ type: "text", text: "[[reply_to_current] Visible reply" }],
-    } as AssistantMessage;
+    const assistantMessage = textAssistant("[[reply_to_current] Visible reply") as AssistantMessage;
     emit({ type: "message_end", message: assistantMessage });
     await subscription.waitForPendingEvents();
 

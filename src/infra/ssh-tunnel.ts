@@ -6,6 +6,7 @@ import { normalizeStringEntries } from "@openclaw/normalization-core/string-norm
 import { createAbortError, isAbortError, racePromiseWithAbortSignal } from "./abort-signal.js";
 import { sleepWithAbort } from "./backoff.js";
 import { formatErrorMessage, isErrno } from "./errors.js";
+import { tryListenOnPort } from "./ports-probe.js";
 import { ensurePortAvailable, PortInUseError } from "./ports.js";
 import { resolveSshClient } from "./ssh-client.js";
 
@@ -95,23 +96,6 @@ export function parseSshTarget(raw: string): SshParsedTarget | null {
   return { user: userPart, host: hostPart, port: 22 };
 }
 
-async function pickEphemeralPort(): Promise<number> {
-  return await new Promise<number>((resolve, reject) => {
-    const server = net.createServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const addr = server.address();
-      server.close(() => {
-        if (!addr || typeof addr === "string") {
-          reject(new Error("failed to allocate a local port"));
-          return;
-        }
-        resolve(addr.port);
-      });
-    });
-  });
-}
-
 async function canConnectLocal(port: number, signal: AbortSignal): Promise<boolean> {
   signal.throwIfAborted();
   return await new Promise<boolean>((resolve) => {
@@ -138,8 +122,8 @@ async function waitForLocalListener(
   timeoutMs: number,
   signal: AbortSignal,
 ): Promise<void> {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs) {
+  const startedAt = performance.now(); // Clock adjustments must not change the polling budget.
+  while (performance.now() - startedAt < timeoutMs) {
     if (await canConnectLocal(port, signal)) {
       return;
     }
@@ -171,7 +155,7 @@ export async function startSshPortForward(opts: {
     await ensurePortAvailable(localPort, "127.0.0.1");
   } catch (err) {
     if (err instanceof PortInUseError || (isErrno(err) && err.code === "EADDRINUSE")) {
-      localPort = await pickEphemeralPort();
+      localPort = await tryListenOnPort({ port: 0, host: "127.0.0.1" });
     } else {
       throw err;
     }
@@ -218,10 +202,7 @@ export async function startSshPortForward(opts: {
   // stream error cannot become an uncaught exception during active use or teardown.
   stderrStream?.on("error", () => {});
   stderrStream?.setEncoding("utf8");
-  stderrStream?.on("data", (chunk) => {
-    const lines = normalizeStringEntries(String(chunk).split("\n"));
-    stderr.push(...lines);
-  });
+  stderrStream?.on("data", (chunk: string) => stderr.push(chunk));
 
   const exited = new Promise<void>((resolve) => {
     child.once("exit", () => resolve());
@@ -279,7 +260,9 @@ export async function startSshPortForward(opts: {
     if (isAbortError(err)) {
       throw err;
     }
-    const suffix = stderr.length > 0 ? `\n${stderr.join("\n")}` : "";
+    // Pipe chunks can split diagnostic lines; normalize only after joining them.
+    const lines = normalizeStringEntries(stderr.join("").split("\n"));
+    const suffix = lines.length > 0 ? `\n${lines.join("\n")}` : "";
     throw new Error(`${formatErrorMessage(err)}${suffix}`, { cause: err });
   }
 

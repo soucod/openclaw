@@ -16,17 +16,14 @@ import * as manifestNormalization from "../plugins/manifest-model-id-normalizati
 import { normalizeManifestModelPricing } from "../plugins/manifest-model-provider-normalizers.js";
 import * as pluginMetadata from "../plugins/plugin-metadata-snapshot.js";
 import { createPluginMetadataSnapshotFixture } from "../plugins/plugin-metadata.test-support.js";
-import { buildStatusMessageParts } from "../status/status-message.js";
+import { buildStatusMessageParts, statusModelRefs } from "../status/status-message.test-support.js";
 import {
   estimateAggregateUsageCost,
   resetUsageFormatCachesForTest,
   resolveModelCostConfig,
   resolveModelCostConfigFingerprint,
 } from "../utils/usage-format.js";
-import {
-  resetRemoteModelCatalogOverlayForTest,
-  setRemoteModelCatalogOverlaySourcesForTest,
-} from "./remote-overlay.test-support.js";
+import { setRemoteModelCatalogOverlaySourcesForTest } from "./remote-overlay.test-support.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const readStoredCatalog = vi.fn();
@@ -34,7 +31,6 @@ const readStoredCatalog = vi.fn();
 beforeEach(() => {
   clearRuntimeConfigSnapshot();
   resetUsageFormatCachesForTest();
-  resetRemoteModelCatalogOverlayForTest();
   readStoredCatalog.mockReset().mockReturnValue({
     source_url: "https://catalog.openclaw.ai/models/v1/catalog.json",
     bundle_json: JSON.stringify({
@@ -104,7 +100,6 @@ afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
   setRemoteModelCatalogOverlaySourcesForTest();
-  resetRemoteModelCatalogOverlayForTest();
 });
 
 function configFor(baseUrl: string): OpenClawConfig {
@@ -598,7 +593,7 @@ describe("hosted model pricing", () => {
         const discoverySpies = allowPluginNormalization
           ? []
           : [
-              vi.spyOn(manifestNormalization, "normalizeProviderModelIdWithManifest"),
+              vi.spyOn(manifestNormalization, "resolveManifestModelIdNormalizationPolicies"),
               vi.spyOn(runtimeNormalization, "normalizeProviderModelIdWithRuntime"),
               vi.spyOn(pluginMetadata, "resolvePluginMetadataSnapshot"),
             ];
@@ -628,6 +623,7 @@ describe("hosted model pricing", () => {
           spy.mockRestore();
         }
         const status = buildStatusMessageParts({
+          modelRefs: statusModelRefs({ provider: "openai", model: "gpt-authored" }),
           config,
           agent: { model: "openai/gpt-authored" },
           modelAuth: "api-key",
@@ -934,7 +930,6 @@ describe("hosted model pricing", () => {
       source_url: "https://catalog.openclaw.ai/models/v1/catalog.json",
       bundle_json: bundleJson,
     });
-    resetRemoteModelCatalogOverlayForTest();
 
     const fingerprint = resolveModelCostConfigFingerprint(configFor("https://api.openai.com/v1"));
     const withoutHostedPricing = configFor("https://api.openai.com/v1");

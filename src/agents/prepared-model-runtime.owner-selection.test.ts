@@ -33,7 +33,7 @@ let state: OpenClawTestState;
 describe("prepared model runtime owner selection", () => {
   beforeEach(async () => {
     state = await createOpenClawTestState({ label: "prepared-model-runtime" });
-    resetPreparedModelRuntimeHarness(state);
+    await resetPreparedModelRuntimeHarness(state);
   });
 
   it("serializes live catalog sources for owners sharing one agent directory", async () => {
@@ -190,8 +190,7 @@ describe("prepared model runtime owner selection", () => {
           workspaceDir: state.workspaceDir,
           loadRuntimePlugins: true,
         },
-        undefined,
-        catalogMode,
+        { catalogMode },
       );
       try {
         expect(lease.snapshot.modelCatalog.entries.map(({ id }) => id)).toEqual(
@@ -720,6 +719,11 @@ describe("prepared model runtime owner selection", () => {
 
     expect(mocks.ensureOpenClawModelsJson).not.toHaveBeenCalled();
     expect(mocks.loadAgentRuntimePluginRegistryHandle).toHaveBeenCalledTimes(4);
+    expect(
+      mocks.loadAgentRuntimePluginRegistryHandle.mock.calls.map(
+        ([params]) => params.configuredHarnessRuntimes,
+      ),
+    ).toEqual([["codex"], ["codex"], ["codex"], ["codex"]]);
     expect(mocks.resolveAmbientCredentials).toHaveBeenCalledTimes(2);
     expect(mocks.prepareStaticCatalog).toHaveBeenCalledTimes(2);
     expect(mocks.resolveStaticCatalogModel).toHaveBeenCalledTimes(2);

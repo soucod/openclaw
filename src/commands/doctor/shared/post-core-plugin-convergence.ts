@@ -1,5 +1,6 @@
 // Reconciles configured plugin installs after the core package update has completed.
 import path from "node:path";
+import { PLUGIN_CAPABILITY_CONSENT_REQUIRED } from "../../../../packages/gateway-protocol/src/capability-consent-error-details.js";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 import type { PluginInstallRecord } from "../../../config/types.plugins.js";
 import {
@@ -73,32 +74,60 @@ function smokeFailureGuidance(failure: PluginPayloadSmokeFailure): string[] {
 async function repairInstalledNpmOpenClawHostLinks(params: {
   env: NodeJS.ProcessEnv;
   installRecords: Record<string, PluginInstallRecord>;
+  beforePersistentEffect?: () => void | Promise<void>;
 }): Promise<{
   changes: string[];
   warnings: PostCoreConvergenceWarning[];
   packageReadFailures: Array<{ error: unknown; packageDir: string }>;
 }> {
   const packageReadFailures: Array<{ error: unknown; packageDir: string }> = [];
+  let effectFailure: { error: unknown } | undefined;
+  const beforePersistentEffect = params.beforePersistentEffect
+    ? async () => {
+        if (effectFailure) {
+          throw effectFailure.error;
+        }
+        try {
+          await params.beforePersistentEffect?.();
+        } catch (error) {
+          effectFailure ??= { error };
+          throw effectFailure.error;
+        }
+      }
+    : undefined;
   try {
     const npmRoots = await listManagedPluginNpmRoots(resolveDefaultPluginNpmDir(params.env));
-    const results = await Promise.all(
+    const results = await Promise.allSettled(
       npmRoots.map((npmRoot) =>
         relinkOpenClawPeerDependenciesInManagedNpmRoot({
           npmRoot,
           logger: {},
+          beforePersistentEffect,
           onPackageReadError: (error, packageDir) => {
             packageReadFailures.push({ error, packageDir });
           },
         }),
       ),
     );
-    const repaired = results.reduce((total, result) => total + result.repaired, 0);
+    // Join every admitted repair before reporting failure; Promise.all would
+    // leave sibling link mutations running after convergence rejected.
+    if (effectFailure) {
+      throw effectFailure.error;
+    }
+    let repaired = 0;
+    for (const result of results) {
+      if (result.status === "rejected") {
+        throw result.reason;
+      }
+      repaired += result.value.repaired;
+    }
     // Legacy npm-owned installs live under extensions/, outside every managed npm project root.
     const registeredRepair = await reconcileRegisteredOpenClawHostLinks({
       installRecords: params.installRecords,
       extensionsDir: resolveDefaultPluginExtensionsDir(params.env),
       env: params.env,
       mode: "repair",
+      beforePersistentEffect,
       onPackageReadError: (error, packageDir) => {
         packageReadFailures.push({ error, packageDir });
       },
@@ -118,6 +147,9 @@ async function repairInstalledNpmOpenClawHostLinks(params: {
       packageReadFailures,
     };
   } catch (err) {
+    if (effectFailure) {
+      throw effectFailure.error;
+    }
     const message = `Failed to repair managed npm OpenClaw host peer links: ${err instanceof Error ? err.message : String(err)}`;
     return {
       changes: [],
@@ -145,9 +177,8 @@ function formatPeerLinkPackageReadWarning(failure: { error: unknown }): PostCore
 /**
  * Mandatory post-core convergence pass. Runs AFTER the core package files
  * are swapped and the in-update doctor pass has already returned, but BEFORE
- * the gateway is restarted. Transient missing-plugin fetch failures stay
- * nonblocking. Consent that prevents activation retains its typed update
- * outcome and, like payload smoke failure, blocks explicit update completion.
+ * the gateway is restarted. Transient repair fetch failures stay nonblocking;
+ * consent that prevents activation and payload smoke failures are errors.
  * Gateway startup quarantines known payload failures before any module import,
  * then boots with those plugins marked configured-unavailable.
  */
@@ -165,6 +196,7 @@ export async function runPostCorePluginConvergence(params: {
    */
   baselineInstallRecords?: Record<string, PluginInstallRecord>;
   onCapabilityConsent?: PluginCapabilityConsentHandler;
+  beforePersistentEffect?: () => void | Promise<void>;
 }): Promise<PostCoreConvergenceResult> {
   const env: NodeJS.ProcessEnv = {
     ...params.env,
@@ -173,6 +205,7 @@ export async function runPostCorePluginConvergence(params: {
   };
   // Retire obsolete managed shadows before relinking or smoke-checking them. A package that
   // became bundled with the new core must not survive into the next startup's contract graph.
+  await params.beforePersistentEffect?.();
   const staleManagedNpmBundledPluginRepair = maybeRepairStaleManagedNpmBundledPlugins({
     config: params.cfg,
     env,
@@ -193,6 +226,7 @@ export async function runPostCorePluginConvergence(params: {
     env,
     ...(prunedBaseline ? { baselineRecords: prunedBaseline.records } : {}),
     onCapabilityConsent: params.onCapabilityConsent,
+    beforePersistentEffect: params.beforePersistentEffect,
   });
 
   const warnings: PostCoreConvergenceWarning[] = repair.warnings.map((message) => ({
@@ -203,6 +237,7 @@ export async function runPostCorePluginConvergence(params: {
   const peerLinkRepair = await repairInstalledNpmOpenClawHostLinks({
     env,
     installRecords: repair.records,
+    beforePersistentEffect: params.beforePersistentEffect,
   });
   warnings.push(...peerLinkRepair.warnings);
   const notices: PostCoreConvergenceWarning[] = (repair.notices ?? []).map((message) => ({
@@ -276,7 +311,11 @@ export async function runPostCorePluginConvergence(params: {
     notices,
     warnings,
     outcomes: repair.outcomes,
-    errored: repair.capabilityConsentRequired === true || smoke.failures.length > 0,
+    errored:
+      repair.outcomes?.some(
+        (outcome) =>
+          outcome.status === "error" && outcome.code === PLUGIN_CAPABILITY_CONSENT_REQUIRED,
+      ) === true || smoke.failures.length > 0,
     smokeFailures: smoke.failures,
     installRecords: records,
   };

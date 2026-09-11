@@ -1,3 +1,4 @@
+import { readAssistantThinkingAppend } from "@openclaw/ai/internal/shared";
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import type { InlineCodeState } from "../../packages/markdown-core/src/code-spans.js";
 import {
@@ -11,6 +12,7 @@ import { emitAgentEvent } from "../infra/agent-events.js";
 import { splitMediaFromOutput } from "../media/parse.js";
 import { findFinalTagMatches } from "../shared/text/final-tags.js";
 import { hasOrphanReasoningCloseBoundary } from "../shared/text/reasoning-tags.js";
+import { createTextProjection, trimTextFilter } from "../shared/text/text-projection.js";
 import {
   isMessagingToolDuplicateNormalized,
   normalizeTextForComparison,
@@ -98,6 +100,7 @@ type StreamRenderingParams = {
   log: EmbeddedAgentSubscribeContext["log"];
   blockChunker: EmbeddedAgentSubscribeContext["blockChunker"];
   emitBlockReply: EmbeddedAgentSubscribeContext["emitBlockReply"];
+  flushAssistantStream: EmbeddedAgentSubscribeContext["flushAssistantStream"];
   pendingBlockReplyTasks: Set<Promise<void>>;
   pushAssistantText: (text: string, normalizedText?: string) => void;
   shouldSkipAssistantText: (text: string, normalizedText?: string) => boolean;
@@ -109,6 +112,7 @@ export function createStreamRendering({
   log,
   blockChunker,
   emitBlockReply,
+  flushAssistantStream,
   pendingBlockReplyTasks,
   pushAssistantText,
   shouldSkipAssistantText,
@@ -117,6 +121,10 @@ export function createStreamRendering({
   const messagingToolSourceReplyPayloads = state.messagingToolSourceReplyPayloads;
   const replyDirectiveAccumulator = createStreamingDirectiveAccumulator();
   const partialReplyDirectiveAccumulator = createStreamingDirectiveAccumulator();
+  let reasoningProjection = createTextProjection([trimTextFilter("both")]);
+  // Retain the producer snapshot for eligibility; the projection builds its own
+  // source, and comparing a reconstructed growing prefix can restore prefix work.
+  let reasoningRaw: string | undefined;
 
   const stripBlockTags = (
     text: string,
@@ -351,6 +359,7 @@ export function createStreamRendering({
   const emitBlockChunk = (
     text: string,
     options?: {
+      sourceText?: string;
       assistantMessageIndex?: number;
       final?: boolean;
       completeMarkdownChunk?: boolean;
@@ -396,7 +405,9 @@ export function createStreamRendering({
     const blockReplySuffix = lastDeliveredBlockReplyText
       ? blockReplyText.slice(lastDeliveredBlockReplyText.length)
       : "";
+    // A deferred prefix was never delivered and may be superseded at terminal release.
     const prefixReplayCandidate = Boolean(
+      !state.deferBlockReplyDelivery &&
       state.blockReplyBreak === "text_end" &&
       state.toolExecutionSinceLastBlockReply &&
       lastDeliveredBlockReplyText &&
@@ -510,6 +521,8 @@ export function createStreamRendering({
       },
       {
         assistantMessageIndex: options?.assistantMessageIndex ?? state.assistantMessageIndex,
+        blockSourceText:
+          chunk === text.trimEnd() && cleanedText === chunk ? options?.sourceText : undefined,
         consumePendingToolMedia:
           options?.finalReply !== undefined || Boolean(mediaUrls?.length || audioAsVoice),
       },
@@ -527,29 +540,32 @@ export function createStreamRendering({
   const flushBlockReplyBuffer: EmbeddedAgentSubscribeContext["flushBlockReplyBuffer"] = (
     options,
   ) => {
+    flushAssistantStream();
     if (!params.onBlockReply) {
       return undefined;
     }
-    let pendingChunk: string | undefined;
+    let pendingChunk: { text: string; sourceText?: string } | undefined;
     if (blockChunker.hasBuffered()) {
       blockChunker.drain({
         force: true,
-        emit: (text) => {
+        emit: (text, metadata) => {
           if (pendingChunk !== undefined) {
-            emitBlockChunk(pendingChunk, {
+            emitBlockChunk(pendingChunk.text, {
+              sourceText: pendingChunk.sourceText,
               assistantMessageIndex: options?.assistantMessageIndex,
               completeMarkdownChunk: true,
             });
           }
-          pendingChunk = text;
+          pendingChunk = { text, sourceText: metadata?.sourceText };
         },
       });
     }
     if (pendingChunk !== undefined || options?.final) {
       // Only the final chunk can select attachments or consume fallback tool
       // media. Intermediate chunks remain text-only until that selection exists.
-      emitBlockChunk(pendingChunk ?? "", {
+      emitBlockChunk(pendingChunk?.text ?? "", {
         ...options,
+        sourceText: pendingChunk?.sourceText,
         completeMarkdownChunk: options?.final === true,
       });
     }
@@ -563,21 +579,41 @@ export function createStreamRendering({
     })();
   };
 
-  const emitReasoningStream = (text: string) => {
+  const emitReasoningStream: EmbeddedAgentSubscribeContext["emitReasoningStream"] = (
+    input,
+    fallback,
+  ) => {
     if (params.silentExpected) {
       return;
     }
-    const trimmed = text.trim();
-    if (!trimmed) {
+    const text = typeof input === "string" ? input : input.thinking;
+    const append =
+      typeof input !== "string" && reasoningRaw !== undefined
+        ? readAssistantThinkingAppend(input, reasoningRaw)
+        : undefined;
+    const previousProjectedText = reasoningProjection.text;
+    let projected =
+      append !== undefined ? reasoningProjection.append(append) : reasoningProjection.replace(text);
+    reasoningRaw = text;
+    if (!projected.text && fallback?.trim()) {
+      // Empty native summaries have always fallen back to event payloads. That
+      // replacement must not seed a later append against a different raw prefix.
+      projected = reasoningProjection.replace(fallback);
+      reasoningRaw = undefined;
+    }
+    const trimmed = projected.text;
+    if (!trimmed || trimmed === state.lastStreamedReasoning) {
       return;
     }
-    if (trimmed === state.lastStreamedReasoning) {
-      return;
-    }
-    // Compute delta: new text since the last emitted reasoning.
-    // Guard against non-prefix changes (e.g. trim altering earlier content).
+    flushAssistantStream();
+    // Partial callbacks can advance reasoning while the assistant scope flushes.
     const prior = state.lastStreamedReasoning ?? "";
-    const delta = trimmed.startsWith(prior) ? trimmed.slice(prior.length) : trimmed;
+    const delta =
+      previousProjectedText === prior && projected.delta !== null
+        ? projected.delta
+        : trimmed.startsWith(prior)
+          ? trimmed.slice(prior.length)
+          : trimmed;
     state.lastStreamedReasoning = trimmed;
 
     // Emit-always: the thinking stream always reaches the bus and session
@@ -612,6 +648,7 @@ export function createStreamRendering({
   };
 
   const resetAssistantMessageState = (nextAssistantTextBaseline: number) => {
+    flushAssistantStream();
     state.deltaBuffer = "";
     state.streamBlockText = "";
     state.streamBlockOffset = 0;
@@ -627,11 +664,12 @@ export function createStreamRendering({
       final: false,
       inlineCode: createInlineCodeState(),
     };
-    state.lastStreamedAssistant = undefined;
-    state.lastStreamedAssistantCleaned = undefined;
+    state.assistantStream = undefined;
     state.currentSourceMessagingToolHeldPartial = undefined;
     state.lastBlockReplyText = undefined;
     state.lastStreamedReasoning = undefined;
+    reasoningProjection = createTextProjection([trimTextFilter("both")]);
+    reasoningRaw = undefined;
     state.lastReasoningSent = undefined;
     state.reasoningStreamOpen = false;
     state.suppressBlockChunks = false;

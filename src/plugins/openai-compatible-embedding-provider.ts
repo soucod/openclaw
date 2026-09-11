@@ -3,15 +3,23 @@ import { normalizeProviderId } from "@openclaw/model-catalog-core/provider-id";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { readEmbeddingVectors } from "../../packages/memory-host-sdk/src/host/embedding-vectors.js";
-import { readProviderJsonArrayFieldResponse } from "../agents/provider-http-errors.js";
+import { withRemoteHttpResponse } from "../../packages/memory-host-sdk/src/host/remote-http.js";
+import {
+  MEMORY_SEARCH_DEADLINE_CONTROL,
+  type MemorySearchDeadlineControl,
+} from "../../packages/memory-host-sdk/src/host/search-deadline-control.js";
+import {
+  createProviderHttpError,
+  readProviderJsonArrayFieldResponse,
+} from "../agents/provider-http-errors.js";
 import type {
   AcquireConfiguredProviderLocalService,
   ConfiguredProviderLocalServiceTarget,
-} from "../agents/provider-local-service.js";
+} from "../agents/provider-local-service-target.js";
+import { redactProviderResponseErrorText } from "../agents/provider-request-header-redaction.js";
 import type { ModelProviderLocalServiceConfig } from "../config/types.models.js";
 import { normalizeResolvedSecretInputString } from "../config/types.secrets.js";
 import { readResponseTextPrefix } from "../infra/http-body.js";
-import { fetchWithSsrFGuard } from "../infra/net/fetch-guard.js";
 import { ssrfPolicyFromHttpBaseUrlAllowedHostname, type SsrFPolicy } from "../infra/net/ssrf.js";
 import type {
   EmbeddingInput,
@@ -301,11 +309,27 @@ async function readEmbeddingErrorBodySnippet(response: Response): Promise<string
   return truncated ? `${text}${EMBEDDING_ERROR_TRUNCATED_SUFFIX}` : text;
 }
 
-async function createEmbeddingHttpError(response: Response): Promise<Error> {
+async function createEmbeddingHttpError(
+  response: Response,
+  requestHeaders: HeadersInit,
+): Promise<Error> {
   const snippet = await readEmbeddingErrorBodySnippet(response);
-  return new Error(
-    `openai-compatible embeddings failed: HTTP ${response.status}${snippet ? `: ${snippet}` : ""}`,
+  const error = await createProviderHttpError(
+    new Response(snippet, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    }),
+    "openai-compatible embeddings failed",
+    { requestHeaders },
   );
+  const safeSnippet = snippet
+    ? redactProviderResponseErrorText(snippet, requestHeaders, {
+        sourceTruncated: snippet.endsWith(EMBEDDING_ERROR_TRUNCATED_SUFFIX),
+      })
+    : undefined;
+  error.message = `openai-compatible embeddings failed: HTTP ${response.status}${safeSnippet ? `: ${safeSnippet}` : ""}`;
+  return error;
 }
 
 async function postEmbeddingRequest(params: {
@@ -313,8 +337,9 @@ async function postEmbeddingRequest(params: {
   input: string[];
   signal?: AbortSignal;
   inputType?: EmbeddingProviderCallOptions["inputType"];
+  deadlineControl?: MemorySearchDeadlineControl;
 }): Promise<number[][]> {
-  const { client, input } = params;
+  const { client, input, deadlineControl } = params;
   const inputType = resolveRequestInputType(client, params.inputType);
   const body = {
     model: client.model,
@@ -324,10 +349,21 @@ async function postEmbeddingRequest(params: {
   };
   const localServiceLease =
     client.localServiceTarget && client.acquireLocalService
-      ? await client.acquireLocalService(client.localServiceTarget, params.signal)
+      ? await client.acquireLocalService(
+          {
+            ...client.localServiceTarget,
+            ...(deadlineControl
+              ? {
+                  onReadinessWait: (waiting: boolean) =>
+                    deadlineControl.report(waiting ? "pause" : "resume"),
+                }
+              : {}),
+          },
+          params.signal,
+        )
       : undefined;
   try {
-    const { response, release } = await fetchWithSsrFGuard({
+    return await withRemoteHttpResponse({
       url: client.endpointUrl,
       init: {
         method: "POST",
@@ -335,25 +371,23 @@ async function postEmbeddingRequest(params: {
         body: JSON.stringify(body),
       },
       signal: params.signal,
-      policy: client.ssrfPolicy,
+      ssrfPolicy: client.ssrfPolicy,
       auditContext: "embedding-provider:openai-compatible",
-    });
-    try {
-      if (!response.ok) {
-        throw await createEmbeddingHttpError(response);
-      }
-      return readEmbeddingVectors(
-        await readProviderJsonArrayFieldResponse(
-          response,
+      onResponse: async (response) => {
+        if (!response.ok) {
+          throw await createEmbeddingHttpError(response, client.headers);
+        }
+        return readEmbeddingVectors(
+          await readProviderJsonArrayFieldResponse(
+            response,
+            "openai-compatible embeddings failed",
+            "data",
+          ),
+          input.length,
           "openai-compatible embeddings failed",
-          "data",
-        ),
-        input.length,
-        "openai-compatible embeddings failed",
-      );
-    } finally {
-      await release();
-    }
+        );
+      },
+    });
   } finally {
     localServiceLease?.release();
   }
@@ -440,6 +474,7 @@ async function createOpenAICompatibleEmbeddingProvider(
       input: inputs.map(embeddingInputToText),
       signal: callOptions?.signal,
       inputType: callOptions?.inputType,
+      deadlineControl: callOptions?.[MEMORY_SEARCH_DEADLINE_CONTROL],
     });
   };
   return {
