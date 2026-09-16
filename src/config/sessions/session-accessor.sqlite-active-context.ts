@@ -4,15 +4,15 @@ import {
   executeSqliteQuerySync,
   executeSqliteQueryTakeFirstSync,
 } from "../../infra/kysely-sync.js";
-import {
-  getActiveTranscriptKysely,
-  withCurrentProjectionSnapshot,
-  type CurrentTranscriptProjection,
-} from "./session-accessor.sqlite-active-projection.js";
+import { withCurrentProjectionSnapshot } from "./session-accessor.sqlite-active-projection.js";
 import type {
   SessionTranscriptReadScope,
   TranscriptEvent,
 } from "./session-accessor.sqlite-contract.js";
+import {
+  getActiveTranscriptKysely,
+  type CurrentTranscriptProjection,
+} from "./session-accessor.sqlite-projection-read.js";
 import { resolveTranscriptBoundaryWindow } from "./session-accessor.sqlite-reset-window.js";
 import {
   readTranscriptContextVersionInTransaction,
@@ -89,9 +89,19 @@ function readBoundedRetentionRanges(
     if (firstSeq === undefined) {
       continue;
     }
-    const start = rows.findIndex(({ seq }, index) => index < cut.endIndex && seq >= firstSeq);
+    // An injected boundary can precede the sorted rows, so honor its first-match position.
+    let start = cut.endIndex > 0 && rows[0]!.seq >= firstSeq ? 0 : Math.min(1, cut.endIndex);
+    let end = start === 0 ? 0 : cut.endIndex;
+    while (start < end) {
+      const middle = Math.floor((start + end) / 2);
+      if (rows[middle]!.seq < firstSeq) {
+        start = middle + 1;
+      } else {
+        end = middle;
+      }
+    }
     ranges.set(cut.id, {
-      startIndex: (start < 0 ? cut.endIndex : start) + headerOffset,
+      startIndex: start + headerOffset,
       endIndex: cut.endIndex + headerOffset,
     });
   }

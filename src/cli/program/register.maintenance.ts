@@ -135,7 +135,7 @@ export function registerMaintenanceCommands(program: Command) {
         typeof opts.sessionSqlite !== "string";
       const unsupportedNode =
         !process.versions.bun &&
-        Boolean(nodeRuntimeFailure(process.versions.node, detectCurrentSqliteCapabilities()));
+        Boolean(nodeRuntimeFailure(process.versions.node, await detectCurrentSqliteCapabilities()));
       const lintMode =
         opts.lint === true || unsupportedNode ? "--lint" : jsonImpliesLint ? "--json" : undefined;
       const mutationOption =
@@ -152,6 +152,32 @@ export function registerMaintenanceCommands(program: Command) {
         return exitDoctorError(
           `doctor ${lintMode} runs read-only lint checks and cannot be combined with ${mutationOption}.`,
           opts.json === true || !process.stdout.isTTY,
+        );
+      }
+      const stateSqlite = parseDoctorStateSqliteMode(opts.stateSqlite, opts.json === true);
+      const sessionSqlite = parseDoctorSessionSqliteMode(opts.sessionSqlite, opts.json === true);
+      if (opts.githubIssue === true && sessionSqlite !== "recover") {
+        return exitDoctorError(
+          "--github-issue requires --session-sqlite recover.",
+          opts.json === true,
+        );
+      }
+      // Each handler completes one operation. Reject competing requests before
+      // importing a handler so its precedence cannot silently discard another.
+      const requestedOperationCount = [
+        opts.lint === true,
+        opts.postUpgrade === true,
+        stateSqlite !== undefined,
+        sessionSqlite !== undefined,
+        opts.repair === true ||
+          opts.fix === true ||
+          opts.force === true ||
+          opts.generateGatewayToken === true,
+      ].filter(Boolean).length;
+      if (requestedOperationCount > 1) {
+        return exitDoctorError(
+          "doctor operations are mutually exclusive: choose one of --lint, --fix/--repair, --post-upgrade, --state-sqlite, or --session-sqlite.",
+          opts.json === true || (opts.lint === true && !process.stdout.isTTY),
         );
       }
       if (opts.lint !== true && hasLintOnlyDoctorOptions(opts)) {
@@ -183,11 +209,6 @@ export function registerMaintenanceCommands(program: Command) {
         defaultRuntime,
         async () => {
           const { doctorCommand } = await import("../../commands/doctor.js");
-          const stateSqlite = parseDoctorStateSqliteMode(opts.stateSqlite, opts.json === true);
-          const sessionSqlite = parseDoctorSessionSqliteMode(
-            opts.sessionSqlite,
-            opts.json === true,
-          );
           await doctorCommand(defaultRuntime, {
             workspaceSuggestions: opts.workspaceSuggestions,
             yes: Boolean(opts.yes),
@@ -227,7 +248,7 @@ export function registerMaintenanceCommands(program: Command) {
     )
     .option("--json", "Output sanitized handoff paths, finding counts, and commands as JSON", false)
     .option("--no-export", "Skip the sanitized diagnostics archive")
-    .option("--agent <name>", "Select a coding agent (claude|codex|opencode|pi)")
+    .option("--agent <name>", "Select a coding agent (claude|codex|cursor|grok|muse|opencode|pi)")
     .option("--run", "Run one embedded agent turn after verifying model inference", false)
     .option(
       "--non-interactive",
@@ -250,11 +271,14 @@ export function registerMaintenanceCommands(program: Command) {
         agent !== undefined &&
         agent !== "claude" &&
         agent !== "codex" &&
+        agent !== "cursor" &&
+        agent !== "grok" &&
+        agent !== "muse" &&
         agent !== "opencode" &&
         agent !== "pi"
       ) {
         return exitDoctorError(
-          "Invalid --agent. Use claude, codex, opencode, or pi.",
+          "Invalid --agent. Use claude, codex, cursor, grok, muse, opencode, or pi.",
           opts.json === true,
         );
       }

@@ -189,7 +189,7 @@ describe("compactEmbeddedRunForRecovery", () => {
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       },
       auth: { apiKey: "test-api-key", source: "test", mode: "api-key" },
-      release: vi.fn(),
+      async [Symbol.asyncDispose]() {},
     });
     completionMocks.completeWithPreparedSimpleCompletionModel.mockResolvedValue({
       content: [{ type: "text", text: "done" }],
@@ -523,11 +523,12 @@ describe("createEmbeddedRunCompactionRuntime", () => {
       sessionTarget: currentTarget,
       sessionManager: SessionManager.inMemory(baseRunParams.workspaceDir),
     };
-    const sessionPromptState = createEmbeddedRunSessionPromptState({
+    const sessionPromptState = await createEmbeddedRunSessionPromptState({
       runParams,
       sessionAgentId: "main",
       resolvedSessionKey: baseRunParams.sessionKey,
       lifecycleGeneration: getAgentRunLifecycleGeneration(),
+      onInterrupt: () => {},
     });
     const runtime = createEmbeddedRunCompactionRuntime({
       runParams,

@@ -1,7 +1,6 @@
 import { html, noChange, nothing } from "lit";
 import { keyed } from "lit/directives/keyed.js";
 import type { ApplicationContext } from "../../app/context.ts";
-import { nativeGatewaysCapability } from "../../app/native-gateways.runtime.ts";
 import type { BoardFace } from "../../lib/board/settings.ts";
 import { resolveSessionDisplayName } from "../../lib/session-display.ts";
 import { resolveSessionKey } from "../../lib/sessions/index.ts";
@@ -29,7 +28,7 @@ type ChatPagePaneRenderOptions = {
   onboarding: boolean;
   onClosePane?: (paneId: string) => void;
   onFaceChange: (paneId: string, sessionKey: string, face: BoardFace) => void;
-  onFocusPane: (paneId: string) => void;
+  onFocusPane: (paneId: string, intent?: "review-edit") => void;
   onOpenSplitView?: () => void;
   onPaneSessionChange: (
     paneId: string,
@@ -48,21 +47,19 @@ type ChatPagePaneRenderOptions = {
   ownerKey: string;
   pane: ChatSplitPane;
   sessionSlots: readonly (string | undefined)[];
-  showGatewayPicker: boolean;
   splitMode: boolean;
   weight: number;
 };
 
 export function renderChatPagePaneCell(options: ChatPagePaneRenderOptions) {
-  const nativeGateways = options.showGatewayPicker ? nativeGatewaysCapability() : null;
-  const sessions = options.context?.sessions?.state.result?.sessions ?? [];
+  const sessions = options.context?.sessions?.presentation.result?.sessions ?? [];
   return html`
     <div
       class="chat-split-view__cell ${
         options.splitMode && options.active ? "chat-split-view__cell--active" : ""
       } ${options.narrow && !options.active ? "chat-split-view__cell--narrow-hidden" : ""}"
       aria-current=${options.splitMode && options.active ? "true" : nothing}
-      style="flex: ${options.weight} 1 0"
+      style="flex: ${options.narrow ? 1 : options.weight} 1 0"
       @pointerdown=${() => options.onFocusPane(options.pane.id)}
       @focusin=${() => options.onFocusPane(options.pane.id)}
     >
@@ -105,6 +102,7 @@ export function renderChatPagePaneCell(options: ChatPagePaneRenderOptions) {
               .chatMessagesBySession=${options.chatMessagesBySession}
               .sessionSnapshotStore=${options.sessionSnapshotStore}
               .sessionKey=${sessionKey}
+              .routeLoadingSkeleton=${routeData?.routeLoadingSkeleton ?? noChange}
               .presented=${presented}
               .visuallyPresented=${presented}
               .active=${active}
@@ -121,8 +119,6 @@ export function renderChatPagePaneCell(options: ChatPagePaneRenderOptions) {
               .narrow=${options.narrow}
               .mergedChrome=${options.mergedChrome && active}
               .navDrawerOpen=${options.navDrawerOpen && active}
-              .nativeGateways=${nativeGateways}
-              .gatewaysSnapshot=${nativeGateways?.snapshot ?? null}
               .onboarding=${options.onboarding}
               .onOpenSplitView=${options.onOpenSplitView}
               .onSplitDown=${options.onSplitDown}
