@@ -7,6 +7,7 @@ import { moduleResolve } from "import-meta-resolve";
 import type { JitiOptions } from "jiti";
 import { isPathInside } from "../infra/path-guards.js";
 import { createJiti } from "./jiti-factory.js";
+import { createPluginGenerationSourceLookup } from "./plugin-generation-source-lookup.js";
 import {
   capturePluginPackageMetadata,
   capturePluginDependencies,
@@ -583,10 +584,7 @@ export function capturePluginGenerationArtifact(
       capturePluginModuleSource(filename, (root, source) => copyPackage(root, source, false, true)),
     );
   const packageForFile = (filename: string) =>
-    // Every captured package root and dependency link belongs to this artifact.
-    isPathInside(directory, filename)
-      ? findPluginCapturedPackage(packages.values(), filename)?.owner
-      : undefined;
+    findPluginCapturedPackage(packages, filename, directory)?.owner;
 
   try {
     const sourceRoot = fs.realpathSync(rootDir);
@@ -612,14 +610,6 @@ export function capturePluginGenerationArtifact(
     assertSourceCurrent();
     pendingInputs.clear();
     additions.clear();
-    const resolveCaptured = (source: string) => {
-      const lexical = path.resolve(source);
-      const canonical = isPathInside(path.resolve(rootDir), lexical)
-        ? path.join(sourceRoot, path.relative(path.resolve(rootDir), lexical))
-        : lexical;
-      const captured = capturedPaths.get(canonical);
-      return captured && isPathInside(root, captured) ? captured : undefined;
-    };
     const captures = [moduleCaptures, hardlinkedSources, metadataCapture, packages];
     const clearCaptures = () => captures.forEach((capture) => capture.clear());
     return {
@@ -631,8 +621,16 @@ export function capturePluginGenerationArtifact(
       boundaryRoot: directory,
       // The receipt attests the initial snapshot; first-demand inputs extend only its identity ledger.
       sourceDigest: digest.copy().digest("hex"),
+      ...createPluginGenerationSourceLookup({
+        rootDir,
+        sourceRoot,
+        capturedRoot: root,
+        boundaryRoot: directory,
+        capturedPaths,
+        hardlinkedSources,
+        assertModuleAvailable,
+      }),
       assertSourceCurrent,
-      hasSource: (source: string) => resolveCaptured(source) !== undefined,
       moduleRoot: (filename: string) =>
         originalSources.has(filename) ? packageForFile(filename)?.capturedRoot : undefined,
       assertModuleAvailable,
@@ -680,7 +678,7 @@ export function capturePluginGenerationArtifact(
           return known;
         }
         return captureAdmitted(() => {
-          const captured = findPluginCapturedPackage(packages.values(), filename);
+          const captured = findPluginCapturedPackage(packages, filename, directory);
           // import.meta.url can name a deferred peer through a private dependency link.
           const original = captured
             ? path.join(captured.owner.sourceRoot, path.relative(captured.root, filename))
@@ -692,19 +690,6 @@ export function capturePluginGenerationArtifact(
           }
           return target;
         }).value;
-      },
-      resolve: (source: string, rejectHardlinks = false) => {
-        // Public exports may be loaded for the first time after the original package
-        // has been edited or removed. Resolve only through facts captured with it.
-        const captured = resolveCaptured(source);
-        if (!captured) {
-          throw new Error("Plugin entry is outside its captured source package");
-        }
-        if (rejectHardlinks && hardlinkedSources.has(captured)) {
-          throw new Error("Plugin source is hardlinked; use a separate file and reload.");
-        }
-        assertModuleAvailable(captured);
-        return captured;
       },
       dispose: () => {
         sourceCapture.dispose();

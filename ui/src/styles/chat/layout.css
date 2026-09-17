@@ -3,7 +3,8 @@
    ============================================= */
 
 /* Main chat card - flex column layout, transparent background */
-openclaw-chat-page {
+openclaw-chat-page,
+openclaw-pending-session-create {
   display: flex;
   flex: 1 1 0;
   min-width: 0;
@@ -3189,6 +3190,8 @@ openclaw-chat-ci-details {
 }
 
 .chat-annotation-editor .btn,
+.chat-annotation-editor .btn.primary,
+.chat-annotation-editor .btn.primary:hover,
 .chat-annotation-editor .btn:hover {
   border: 0;
   box-shadow: none;
