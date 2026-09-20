@@ -1,4 +1,1 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" role="img" aria-label="Spreadsheet file overlay">
-  <rect x="3.75" y="4" width="16.5" height="16" rx="2.25" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M3.75 9.25h16.5M3.75 14.5h16.5M9.25 4v16M14.75 4v16" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"/>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="none" aria-label="Spreadsheet file overlay" role="img" viewBox="0 0 24 24"><rect width="16.5" height="16" x="3.75" y="4" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.25" rx="2.25"/><path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.25" d="M3.75 9.25h16.5M3.75 14.5h16.5M9.25 4v16M14.75 4v16"/></svg>
