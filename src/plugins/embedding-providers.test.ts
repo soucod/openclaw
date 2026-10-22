@@ -1,4 +1,3 @@
-// Covers plugin embedding provider registration and lookup.
 import { beforeEach, describe, expect, it } from "vitest";
 import { collectRegisteredEmbeddingProviderIds } from "./channel-plugin-ids.js";
 import { CORE_EMBEDDING_PROVIDERS } from "./core-embedding-providers.js";
@@ -18,10 +17,7 @@ import {
 } from "./runtime.js";
 
 function createAdapter(id: string): EmbeddingProviderAdapter {
-  return {
-    id,
-    create: async () => ({ provider: null }),
-  };
+  return { id, create: async () => ({ provider: null }) };
 }
 
 beforeEach(({ onTestFinished }) => {
@@ -35,10 +31,7 @@ beforeEach(({ onTestFinished }) => {
 describe("embedding provider registry", () => {
   it("preserves owner metadata in registered snapshots", () => {
     const adapter = createAdapter("local-compatible");
-    const entry = {
-      adapter,
-      ownerPluginId: "local-compatible",
-    };
+    const entry = { adapter, ownerPluginId: "local-compatible" };
 
     restoreRegisteredEmbeddingProviders([entry]);
 
@@ -52,27 +45,12 @@ describe("embedding provider registry", () => {
       const adapter = createAdapter(coreEntry.adapter.id);
 
       expect(() =>
-        restoreRegisteredEmbeddingProviders([
-          {
-            adapter,
-            ownerPluginId: "shadow",
-          },
-        ]),
+        restoreRegisteredEmbeddingProviders([{ adapter, ownerPluginId: "shadow" }]),
       ).toThrow(`embedding provider already registered: ${adapter.id} (owner: core)`);
 
       expect(getRegisteredEmbeddingProvider(adapter.id)).toBe(coreEntry);
     },
   );
-
-  it("stores adapters in the active registry", () => {
-    const adapter = createAdapter("local-protocol");
-    registerEmbeddingProvider(adapter, { ownerPluginId: "local-protocol" });
-
-    expect(getRegisteredEmbeddingProvider("local-protocol")).toEqual({
-      adapter,
-      ownerPluginId: "local-protocol",
-    });
-  });
 
   it("uses builder ownership without displacing another plugin's adapter", () => {
     const building = createEmptyPluginRegistry();
@@ -98,20 +76,17 @@ describe("embedding provider registry", () => {
 });
 
 describe("collectRegisteredEmbeddingProviderIds", () => {
-  // Boot-equivalence: the shared helper unions the same three sources the gateway
-  // startup "configured but unregistered" warning uses, so the /status drift line and
-  // the boot warning agree on what counts as "registered".
+  // /status and the boot warning must agree on registered providers.
   it("unions registry embedding providers with the global registry", () => {
-    registerEmbeddingProvider(createAdapter("global-embed"), { ownerPluginId: "p" });
-    const registry = {
+    const adapter = createAdapter("global-embed");
+    registerEmbeddingProvider(adapter, { ownerPluginId: "p" });
+    const ids = collectRegisteredEmbeddingProviderIds({
       embeddingProviders: [{ provider: { id: "gen-embed" } }],
-    } as never;
-
-    const ids = collectRegisteredEmbeddingProviderIds(registry);
+    } as never);
 
     expect(ids.has("gen-embed")).toBe(true);
     expect(ids.has("global-embed")).toBe(true);
-    // Every globally registered provider (core + plugin-registered) is always included.
+    expect(getRegisteredEmbeddingProvider("global-embed")).toEqual({ adapter, ownerPluginId: "p" });
     for (const entry of listRegisteredEmbeddingProviders()) {
       expect(ids.has(entry.adapter.id)).toBe(true);
     }

@@ -1,18 +1,9 @@
-// Xai plugin module implements code execution shared behavior.
-import { XAI_DEFAULT_MODEL_ID } from "../model-definitions.js";
 import {
   requestXaiResponsesTool,
   resolveXaiToolDefaultReasoningEffort,
   requireXaiResponseTextAndCitations,
   XAI_RESPONSES_ENDPOINT,
 } from "./responses-tool-shared.js";
-import {
-  resolveNormalizedXaiToolModel,
-  resolvePositiveIntegerToolConfig,
-} from "./tool-config-shared.js";
-
-const XAI_CODE_EXECUTION_ENDPOINT = XAI_RESPONSES_ENDPOINT;
-const XAI_DEFAULT_CODE_EXECUTION_MODEL = XAI_DEFAULT_MODEL_ID;
 
 type XaiCodeExecutionResult = {
   content: string;
@@ -20,40 +11,6 @@ type XaiCodeExecutionResult = {
   usedCodeExecution: boolean;
   outputTypes: string[];
 };
-
-export function resolveXaiCodeExecutionModel(config?: Record<string, unknown>): string {
-  return resolveNormalizedXaiToolModel({
-    config,
-    defaultModel: XAI_DEFAULT_CODE_EXECUTION_MODEL,
-  });
-}
-
-export function resolveXaiCodeExecutionMaxTurns(
-  config?: Record<string, unknown>,
-): number | undefined {
-  return resolvePositiveIntegerToolConfig(config, "maxTurns");
-}
-
-export function buildXaiCodeExecutionPayload(params: {
-  task: string;
-  model: string;
-  tookMs: number;
-  content: string;
-  citations: string[];
-  usedCodeExecution: boolean;
-  outputTypes: string[];
-}): Record<string, unknown> {
-  return {
-    task: params.task,
-    provider: "xai",
-    model: params.model,
-    tookMs: params.tookMs,
-    content: params.content,
-    citations: params.citations,
-    usedCodeExecution: params.usedCodeExecution,
-    outputTypes: params.outputTypes,
-  };
-}
 
 export async function requestXaiCodeExecution(params: {
   apiKey: string;
@@ -65,7 +22,7 @@ export async function requestXaiCodeExecution(params: {
   return await requestXaiResponsesTool(
     {
       ...params,
-      endpoint: XAI_CODE_EXECUTION_ENDPOINT,
+      endpoint: XAI_RESPONSES_ENDPOINT,
       inputText: params.task,
       tools: [{ type: "code_interpreter" }],
       reasoningEffort: resolveXaiToolDefaultReasoningEffort(params.model, "low"),

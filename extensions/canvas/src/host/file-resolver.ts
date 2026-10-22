@@ -1,6 +1,3 @@
-/**
- * Safe file resolution helpers for Canvas-hosted static assets.
- */
 import path from "node:path";
 import { root as fsRoot, FsSafeError } from "openclaw/plugin-sdk/security-runtime";
 
@@ -48,40 +45,21 @@ export async function resolveFileWithinRoot(
     return null;
   }
   const rel = normalized.replace(/^\/+/, "");
-  if (rel.split("/").some((p) => p === "..")) {
-    return null;
-  }
   const root = await fsRoot(rootReal);
 
-  const tryOpen = async (relative: string) => {
-    try {
-      return await root.open(relative);
-    } catch (err) {
-      if (err instanceof FsSafeError) {
-        return null;
-      }
-      throw err;
-    }
-  };
-
-  if (normalized.endsWith("/")) {
-    return await tryOpen(path.posix.join(rel, "index.html"));
-  }
-
   try {
+    if (normalized.endsWith("/")) {
+      return await root.open(path.posix.join(rel, "index.html"));
+    }
     const st = await root.stat(rel);
     if (st.isSymbolicLink) {
       return null;
     }
-    if (st.isDirectory) {
-      return await tryOpen(path.posix.join(rel, "index.html"));
-    }
+    return await root.open(st.isDirectory ? path.posix.join(rel, "index.html") : rel);
   } catch (err) {
     if (err instanceof FsSafeError) {
       return null;
     }
     throw err;
   }
-
-  return await tryOpen(rel);
 }

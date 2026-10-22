@@ -12,6 +12,7 @@ import {
   asOptionalRecord,
   normalizeOptionalString,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { resolveGoogleEnvApiKey } from "./gemini-auth.js";
 import { GOOGLE_REALTIME_VOICE_METADATA } from "./realtime-voice-metadata.js";
 
 const loadGoogleRealtimeVoiceProvider = createLazyRuntimeSurface(
@@ -46,13 +47,6 @@ function resolveGoogleRealtimeProviderConfig(
   };
 }
 
-function resolveGoogleRealtimeEnvApiKey(): string | undefined {
-  return (
-    normalizeOptionalString(process.env.GEMINI_API_KEY) ??
-    normalizeOptionalString(process.env.GOOGLE_API_KEY)
-  );
-}
-
 const GOOGLE_REALTIME_LAZY_MAX_PENDING_USER_MESSAGES = 128;
 const GOOGLE_REALTIME_LAZY_MAX_PENDING_USER_MESSAGE_BYTES = 256 * 1024;
 
@@ -60,7 +54,6 @@ function createLazyGoogleRealtimeVoiceBridge(
   req: RealtimeVoiceBridgeCreateRequest,
 ): RealtimeVoiceBridge {
   let bridgeReady = false;
-  let latestMediaTimestamp: number | undefined;
   let pendingGreeting: string | undefined;
   // Lazy startup keeps the newest microphone tail when loading stalls.
   const pendingAudio = createRealtimeVoiceAudioQueue("drop-oldest");
@@ -76,7 +69,6 @@ function createLazyGoogleRealtimeVoiceBridge(
       pendingUserMessages.length = 0;
       pendingUserMessageBytes = 0;
       pendingGreeting = undefined;
-      latestMediaTimestamp = undefined;
     },
     onProviderReady: (bridge) => {
       if (bridge) {
@@ -95,9 +87,6 @@ function createLazyGoogleRealtimeVoiceBridge(
   const flushPending = (loadedBridge: RealtimeVoiceBridge) => {
     if (!lifecycle.isActive()) {
       return;
-    }
-    if (typeof latestMediaTimestamp === "number") {
-      loadedBridge.setMediaTimestamp(latestMediaTimestamp);
     }
     for (const audio of pendingAudio.drain()) {
       loadedBridge.sendAudio(audio);
@@ -130,13 +119,7 @@ function createLazyGoogleRealtimeVoiceBridge(
       }
       pendingAudio.enqueue(audio);
     },
-    setMediaTimestamp: (ts) => {
-      if (!lifecycle.isActive()) {
-        return;
-      }
-      latestMediaTimestamp = ts;
-      lifecycle.bridge?.setMediaTimestamp(ts);
-    },
+    setMediaTimestamp: () => {},
     sendUserMessage: (text) => {
       if (!lifecycle.isActive()) {
         return;
@@ -181,26 +164,30 @@ function createLazyGoogleRealtimeVoiceBridge(
       }
       return requireBridge().submitToolResult(callId, result, options);
     },
-    acknowledgeMark: () => {
-      if (lifecycle.isActive()) {
-        requireBridge().acknowledgeMark();
-      }
-    },
+    acknowledgeMark: () => {},
     close: lifecycle.close,
     isConnected: () => lifecycle.isActive() && (lifecycle.bridge?.isConnected() ?? false),
   };
 }
 
 export function createLazyGoogleRealtimeVoiceProvider(): RealtimeVoiceProviderPlugin {
+  const resolveConfig: NonNullable<RealtimeVoiceProviderPlugin["resolveConfig"]> = ({
+    cfg,
+    rawConfig,
+  }) => resolveGoogleRealtimeProviderConfig(rawConfig, cfg);
+  const isConfigured: RealtimeVoiceProviderPlugin["isConfigured"] = ({ cfg, providerConfig }) =>
+    Boolean(
+      normalizeOptionalString(providerConfig.apiKey) ??
+      normalizeOptionalString(cfg?.models?.providers?.google?.apiKey) ??
+      resolveGoogleEnvApiKey(),
+    );
   return {
     ...GOOGLE_REALTIME_VOICE_METADATA,
-    resolveConfig: ({ cfg, rawConfig }) => resolveGoogleRealtimeProviderConfig(rawConfig, cfg),
-    isConfigured: ({ cfg, providerConfig }) =>
-      Boolean(
-        normalizeOptionalString(providerConfig.apiKey) ??
-        normalizeOptionalString(cfg?.models?.providers?.google?.apiKey) ??
-        resolveGoogleRealtimeEnvApiKey(),
-      ),
+    // Retained for public synchronous SDK calls through 2026-12-31.
+    resolveConfig,
+    isConfigured,
+    resolveConfigAsync: async (context) => resolveConfig(context),
+    isConfiguredAsync: async (context) => isConfigured(context),
     createBridge: createLazyGoogleRealtimeVoiceBridge,
     createBrowserSession: async (req) => {
       const provider = await loadGoogleRealtimeVoiceProvider();

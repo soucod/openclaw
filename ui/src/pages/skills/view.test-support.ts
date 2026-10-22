@@ -26,61 +26,67 @@ export function createSkill(overrides: Partial<SkillStatusEntry> = {}): SkillSta
     modelVisible: true,
     userInvocable: true,
     commandVisible: true,
-    requirements: {
-      anyBins: [],
-      bins: [],
-      env: [],
-      config: [],
-      os: [],
-    },
-    missing: {
-      anyBins: [],
-      bins: [],
-      env: [],
-      config: [],
-      os: [],
-    },
+    requirements: { anyBins: [], bins: [], env: [], config: [], os: [] },
+    missing: { anyBins: [], bins: [], env: [], config: [], os: [] },
     configChecks: [],
     install: [],
     ...overrides,
   };
 }
 
-export function createProps(overrides: Partial<SkillsProps> = {}): SkillsProps {
-  const report: SkillStatusReport = {
-    workspaceDir: "/tmp/workspace",
-    managedSkillsDir: "/tmp/skills",
-    skills: [createSkill()],
+type SkillsTestOverrides = Partial<Omit<SkillsProps, "state">> & Record<string, unknown>;
+
+export function createReport(skills = [createSkill()]): SkillStatusReport {
+  return { workspaceDir: "/tmp/workspace", managedSkillsDir: "/tmp/skills", skills };
+}
+
+export function createProps(overrides: SkillsTestOverrides = {}): SkillsProps {
+  const value = <T>(key: string, fallback: T): T =>
+    key in overrides ? (overrides[key] as T) : fallback;
+  const state: SkillsProps["state"] = {
+    client: null,
+    connected: value("connected", true),
+    runtimeConfig: {} as SkillsProps["state"]["runtimeConfig"],
+    skillsAgentId: null,
+    skillsAgentRevision: 0,
+    skillsLoading: value("loading", false),
+    skillsReport: value("report", createReport()),
+    skillsError: value("error", null),
+    skillsFilter: value("filter", ""),
+    skillsStatusFilter: value("statusFilter", "all"),
+    skillsDetailKey: value("detailKey", null),
+    skillsDetailTab: value("detailTab", "overview"),
+    skillOperation: value("operation", null),
+    skillEdits: value("edits", {}),
+    skillMessages: value("messages", {}),
+    clawhubSearchQuery: value("clawhubQuery", ""),
+    clawhubSearchResults: value("clawhubResults", null),
+    clawhubSearchLoading: value("clawhubSearchLoading", false),
+    clawhubSearchError: value("clawhubSearchError", null),
+    clawhubIconUrls: value("clawhubIconUrls", {}),
+    clawhubDetail: value("clawhubDetail", null),
+    clawhubDetailRef: value("clawhubDetailRef", null),
+    clawhubDetailError: value("clawhubDetailError", null),
+    clawhubInstallMessage: value("clawhubInstallMessage", null),
+    clawhubVerdicts: value("clawhubVerdicts", {}),
+    clawhubVerdictsLoading: value("clawhubVerdictsLoading", false),
+    clawhubVerdictsError: value("clawhubVerdictsError", null),
+    skillCardContents: value("skillCardContents", {}),
+    skillCardContentKeys: {},
+    skillCardLoadingKey: value("skillCardLoadingKey", null),
+    skillCardErrors: value("skillCardErrors", {}),
   };
   return {
+    readClawHubDetail: () => {
+      if (state.clawhubDetailError) {
+        throw new Error(state.clawhubDetailError);
+      }
+      return state.clawhubDetail;
+    },
     canUpdate: true,
     canInstall: true,
-    connected: true,
-    loading: false,
-    report,
-    error: null,
-    filter: "",
-    statusFilter: "all",
-    edits: {},
-    operation: null,
-    messages: {},
-    detailKey: null,
-    detailTab: "overview",
-    clawhubVerdicts: {},
-    clawhubVerdictsLoading: false,
-    clawhubVerdictsError: null,
-    skillCardContents: {},
-    skillCardLoadingKey: null,
-    skillCardErrors: {},
-    clawhubQuery: "",
-    clawhubResults: null,
-    clawhubSearchLoading: false,
-    clawhubSearchError: null,
-    clawhubDetail: null,
-    clawhubDetailRef: null,
-    clawhubDetailLoading: false,
-    clawhubDetailError: null,
-    clawhubInstallMessage: null,
+    loading: state.skillsLoading,
+    error: state.skillsError,
     onFilterChange: () => undefined,
     onStatusFilterChange: () => undefined,
     onRefresh: () => undefined,
@@ -96,31 +102,25 @@ export function createProps(overrides: Partial<SkillsProps> = {}): SkillsProps {
     onClawHubDetailClose: () => undefined,
     onClawHubInstall: () => undefined,
     ...overrides,
-  };
+    state,
+  } as SkillsProps;
 }
 
-/**
- * Each split test file owns its own cleanup stack, so a patched dialog prototype from one file
- * can never leak into the other when Vitest runs them in a shared environment.
- */
+// Keep prototype restoration scoped to each split file's cleanup stack.
 export function createDialogMethodInstaller(restores: Array<() => void>) {
   return function installDialogMethod(
     name: "showModal" | "close",
     value: (this: HTMLDialogElement) => void,
   ) {
-    const proto = HTMLDialogElement.prototype as HTMLDialogElement & Record<string, unknown>;
+    const proto = HTMLDialogElement.prototype;
     const original = Object.getOwnPropertyDescriptor(proto, name);
-    Object.defineProperty(proto, name, {
-      configurable: true,
-      writable: true,
-      value,
-    });
+    Object.defineProperty(proto, name, { configurable: true, writable: true, value });
     restores.push(() => {
       if (original) {
         Object.defineProperty(proto, name, original);
-        return;
+      } else {
+        Reflect.deleteProperty(proto, name);
       }
-      delete proto[name];
     });
   };
 }

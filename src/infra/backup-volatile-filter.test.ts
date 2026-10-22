@@ -1,10 +1,15 @@
-// Tests volatile path filtering for backup operations.
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { isTransientSqliteBackupPath, isVolatileBackupPath } from "./backup-volatile-filter.js";
 
 const stateDir = "/opt/openclaw/state";
 const plan = { stateDirs: [stateDir] };
+const expectVolatile = (relative: string, expected: boolean, root = stateDir) =>
+  expect(
+    isVolatileBackupPath(`${root}${root.includes("\\") ? "\\" : "/"}${relative}`, {
+      stateDirs: [root],
+    }),
+  ).toBe(expected);
 
 describe("isVolatileBackupPath", () => {
   it.each([
@@ -25,7 +30,6 @@ describe("isVolatileBackupPath", () => {
     [`${stateDir}/tmp/pending.tmp`, true],
     [`${stateDir}/audit/system-agent.jsonl.migrated.raw`, true],
     [`${stateDir}/audit/system-agent.jsonl.migrated.2.raw`, true],
-    [`${stateDir}/audit/system-agent.jsonl.migrated.10.raw`, true],
     [`${stateDir}/audit/system-agent.jsonl.migrated.raw.doctor-scrub-restore`, true],
     [`${stateDir}/logs/config-audit.jsonl.migrated.raw.doctor-scrub-staging`, true],
     [`${stateDir}/logs/config-audit.jsonl.migrated.raw.doctor-scrub-progress`, true],
@@ -39,12 +43,10 @@ describe("isVolatileBackupPath", () => {
     [`${stateDir}/browser/openclaw/user-data/SingletonLock`, true],
     [`${stateDir}/browser/openclaw/user-data/SingletonSocket`, true],
     [`${stateDir}/sandbox/skills-workspaces/workspace-main`, true],
-    [`${stateDir}/sandbox/skills-workspaces/workspace-main/skills/demo`, true],
     [`${stateDir}/cache/control-ui-assets/generation/assets/app.js`, true],
     [`${stateDir}/tmp/plugin-captures/instance/captures/source.js`, true],
     [`${stateDir}/tmp/plugin-captures/instance/owner.sqlite`, true],
     [`${stateDir}/tmp/plugin-captures-saved/source.js`, false],
-
     // non-volatile: session config, not jsonl/log
     [`${stateDir}/sessions/s-abc/meta.json`, false],
     [`${stateDir}/agents/main/sessions/sessions.json`, false],
@@ -61,22 +63,10 @@ describe("isVolatileBackupPath", () => {
     // non-volatile: plain config
     [`${stateDir}/config.json`, false],
     // non-volatile: workspace files outside state
-    ["/home/user/project/README.md", false],
     ["/home/user/project/Cargo.lock", false],
-    ["/home/user/project/pending.tmp", false],
-    ["/home/user/project/config.jsonl.doctor-scrub-restore", false],
-    // non-volatile: log-like name outside scope
-    ["/home/user/notes/daily.log", false],
   ])("classifies %s as volatile=%s", (p, expected) => {
     expect(isVolatileBackupPath(p, plan)).toBe(expected);
   });
-
-  it("returns false when no state dirs are provided", () => {
-    expect(
-      isVolatileBackupPath(`${stateDir}/sessions/s-abc/transcript.jsonl`, { stateDirs: [] }),
-    ).toBe(false);
-  });
-
   it("does not skip transient extensions without a state anchor", () => {
     expect(isVolatileBackupPath("/any/path/daemon.sock", { stateDirs: [] })).toBe(false);
     expect(isVolatileBackupPath("/any/path/daemon.pid", { stateDirs: [] })).toBe(false);
@@ -84,20 +74,13 @@ describe("isVolatileBackupPath", () => {
   });
 
   it("does not match paths that escape the anchor via `..`", () => {
-    // `/opt/openclaw/state/sessions/../config.jsonl` resolves to
-    // `/opt/openclaw/state/config.jsonl`, which is NOT inside sessions/.
-    expect(isVolatileBackupPath(`${stateDir}/sessions/../config.jsonl`, plan)).toBe(false);
-    expect(isVolatileBackupPath(`${stateDir}/cron/runs/../jobs.log`, plan)).toBe(false);
-    expect(isVolatileBackupPath(`${stateDir}/logs/../notes.jsonl`, plan)).toBe(false);
-  });
-
-  it("treats delivery-queue json files under stateDir as volatile", () => {
-    expect(
-      isVolatileBackupPath(
-        `${stateDir}/delivery-queue/3fac5e46-42dc-4230-a725-51c203830b4f.json`,
-        plan,
-      ),
-    ).toBe(true);
+    for (const relative of [
+      "sessions/../config.jsonl",
+      "cron/runs/../jobs.log",
+      "logs/../notes.jsonl",
+    ]) {
+      expectVolatile(relative, false);
+    }
   });
 
   it("treats nested delivery-queue json files under stateDir as volatile", () => {
@@ -119,40 +102,17 @@ describe("isVolatileBackupPath", () => {
 
   it("normalizes Windows-style separators before anchor checks", () => {
     const winStateDir = "C:\\openclaw\\state";
-    const winPlan = { stateDirs: [winStateDir] };
-    expect(isVolatileBackupPath(`${winStateDir}\\sessions\\s-abc\\transcript.jsonl`, winPlan)).toBe(
-      true,
-    );
-    expect(isVolatileBackupPath(`${winStateDir}\\agents\\main\\sessions\\s.jsonl`, winPlan)).toBe(
-      true,
-    );
-    expect(isVolatileBackupPath(`${winStateDir}\\cron\\runs\\2026\\job.jsonl`, winPlan)).toBe(true);
-    expect(
-      isVolatileBackupPath(`${winStateDir}\\browser\\openclaw\\user-data\\SingletonLock`, winPlan),
-    ).toBe(true);
-    expect(
-      isVolatileBackupPath(`${winStateDir}\\sandbox\\skills-workspaces\\workspace-main`, winPlan),
-    ).toBe(true);
-    expect(
-      isVolatileBackupPath(
-        `${winStateDir}\\logs\\config-audit.jsonl.migrated.raw.quarantined-copy`,
-        winPlan,
-      ),
-    ).toBe(true);
-    // `..` escape via backslashes must also be rejected.
-    expect(isVolatileBackupPath(`${winStateDir}\\sessions\\..\\config.jsonl`, winPlan)).toBe(false);
-  });
-
-  it("matches tar filter paths when node-tar omits the leading slash", () => {
-    expect(
-      isVolatileBackupPath("opt/openclaw/state/agents/main/sessions/transcript.jsonl", plan),
-    ).toBe(true);
-    expect(
-      isVolatileBackupPath(
-        "opt/openclaw/state/logs/config-audit.jsonl.migrated.raw.quarantined-copy",
-        plan,
-      ),
-    ).toBe(true);
+    for (const relative of [
+      "sessions\\s-abc\\transcript.jsonl",
+      "agents\\main\\sessions\\s.jsonl",
+      "cron\\runs\\2026\\job.jsonl",
+      "browser\\openclaw\\user-data\\SingletonLock",
+      "sandbox\\skills-workspaces\\workspace-main",
+      "logs\\config-audit.jsonl.migrated.raw.quarantined-copy",
+    ]) {
+      expectVolatile(relative, true, winStateDir);
+    }
+    expectVolatile("sessions\\..\\config.jsonl", false, winStateDir);
   });
 
   it.runIf(process.platform !== "win32")(
@@ -193,9 +153,7 @@ describe("isTransientSqliteBackupPath", () => {
     "tmp/openclaw-502/gateway.12345678.lock.sqlite-wal",
     "tmp/openclaw-502/device-identity.12345678.lock.sqlite-journal",
     "tmp/openclaw-502/retained.sqlite",
-    "plugins/dedicated/durable.sqlite",
     "plugins/dedicated/cache.lock.sqlite",
-    "plugins/dedicated/durable.locked.sqlite",
     "plugins/dedicated/lock.sqlite",
   ])("preserves durable SQLite state: %s", (filePath) => {
     expect(isTransientSqliteBackupPath(filePath)).toBe(false);

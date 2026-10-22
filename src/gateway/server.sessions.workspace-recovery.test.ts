@@ -1,13 +1,11 @@
-import path from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { executeSqliteQuerySync, getNodeSqliteKysely } from "../infra/kysely-sync.js";
 import type { DB as StateDatabase } from "../state/openclaw-state-db.generated.js";
-import {
-  closeOpenClawStateDatabaseForTest,
-  openOpenClawStateDatabase,
-} from "../state/openclaw-state-db.js";
+import { openOpenClawStateDatabase } from "../state/openclaw-state-db.js";
+import { closeStateDatabaseForTest } from "../test-utils/database-cleanup.js";
+import { disposeSessionReadContexts } from "./server-methods/sessions-read-cache.test-support.js";
 import type { GatewayRequestContext } from "./server-methods/types.js";
-import { loadSessionEntry } from "./session-utils.js";
+import { loadSessionEntryAsync } from "./session-entry-load.test-support.js";
 import { writeSessionStore } from "./test-helpers.js";
 import {
   directSessionReq,
@@ -26,9 +24,10 @@ import type { WorkerPlacementDispatchContract } from "./worker-environments/serv
 
 const { createSessionStoreDir } = setupGatewaySessionsHandlerTestHarness();
 
-afterEach(() => {
+afterEach(async () => {
+  await disposeSessionReadContexts();
   vi.restoreAllMocks();
-  closeOpenClawStateDatabaseForTest();
+  await closeStateDatabaseForTest();
 });
 
 type RecoveryScenario =
@@ -41,10 +40,10 @@ type RecoveryScenario =
   | "stale pending epoch";
 
 async function seedPendingWorkspace(scenario: RecoveryScenario) {
-  const { dir } = await createSessionStoreDir();
+  await createSessionStoreDir();
   const { sessionId, sessionKey, agentId } = REQUEST;
   await writeSessionStore({ entries: { [sessionKey]: sessionStoreEntry(sessionId) } });
-  const database = openOpenClawStateDatabase({ path: path.join(dir, "placements.sqlite") });
+  const database = openOpenClawStateDatabase();
   const placements = createWorkerSessionPlacementStore({ database });
   const { attached } = createDispatchEnvironmentFixtures();
   const environment = {
@@ -52,10 +51,11 @@ async function seedPendingWorkspace(scenario: RecoveryScenario) {
     providerId: "device",
     profileId: "device:runner-1",
     nodeDeviceId: "runner-1",
+    sshEndpoint: null,
   };
   writePlacementEnvironmentFixture(database, environment);
-  seedActivePlacement(placements, environment);
-  const claim = placements.claimTurn({
+  await seedActivePlacement(placements, environment);
+  const claim = await placements.claimTurn({
     sessionId,
     sessionKey,
     agentId,
@@ -67,11 +67,11 @@ async function seedPendingWorkspace(scenario: RecoveryScenario) {
       ownerEpoch: environment.ownerEpoch,
     },
   });
-  placements.markWorkspaceResultPending(claim);
+  await placements.markWorkspaceResultPending(claim);
   if (scenario === "accepted result on offline runner") {
-    placements.acceptWorkspaceResult(claim);
+    await placements.acceptWorkspaceResult(claim);
   }
-  placements.handoffWorkspaceResultRecovery(claim);
+  await placements.handoffWorkspaceResultRecovery(claim);
   const staleFields = {
     "stale pending generation": { placement_generation: claim.placementGeneration - 1 },
     "stale pending environment": { environment_id: "previous-environment" },
@@ -113,9 +113,9 @@ async function seedPendingWorkspace(scenario: RecoveryScenario) {
     | "workerPlacementDispatchService"
   >;
   const before = {
-    entry: loadSessionEntry(sessionKey).entry,
+    entry: (await loadSessionEntryAsync(sessionKey)).entry,
     placement: placements.get(sessionId),
-    pending: placements.listPendingWorkspaceResults(),
+    pending: await placements.listPendingWorkspaceResultsAsync(),
   };
   expect(before.entry?.sessionId).toBe(sessionId);
   expect(before.pending).toHaveLength(1);
@@ -128,10 +128,10 @@ async function seedPendingWorkspace(scenario: RecoveryScenario) {
     },
     reclaim,
     waitForTurnClaimRelease,
-    expectPreserved() {
-      expect(loadSessionEntry(sessionKey).entry).toEqual(before.entry);
+    async expectPreserved() {
+      expect((await loadSessionEntryAsync(sessionKey)).entry).toEqual(before.entry);
       expect(placements.get(sessionId)).toEqual(before.placement);
-      expect(placements.listPendingWorkspaceResults()).toEqual(before.pending);
+      expect(await placements.listPendingWorkspaceResultsAsync()).toEqual(before.pending);
     },
   };
 }
@@ -164,17 +164,21 @@ describe.each([
     });
     expect(fixture.waitForTurnClaimRelease).not.toHaveBeenCalled();
     expect(fixture.reclaim).not.toHaveBeenCalled();
-    fixture.expectPreserved();
+    await fixture.expectPreserved();
   });
 
-  test.each([
-    "accepted result on offline runner",
-    "available runner",
-    "unknown runner",
-    "stale pending generation",
-    "stale pending environment",
-    "stale pending epoch",
-  ] as const)("keeps the ordinary drain for %s", async (scenario) => {
+  // Both RPCs use the same drain owner; cover each ordinary-drain branch once.
+  const scenarios: RecoveryScenario[] =
+    method === "sessions.patch"
+      ? ["accepted result on offline runner"]
+      : [
+          "available runner",
+          "unknown runner",
+          "stale pending generation",
+          "stale pending environment",
+          "stale pending epoch",
+        ];
+  test.each(scenarios)("keeps the ordinary drain for %s", async (scenario) => {
     const fixture = await seedPendingWorkspace(scenario);
     const result = await directSessionReq(
       method,
@@ -186,6 +190,6 @@ describe.each([
     expect(result.error?.details).toBeUndefined();
     expect(fixture.waitForTurnClaimRelease).toHaveBeenCalledOnce();
     expect(fixture.reclaim).not.toHaveBeenCalled();
-    fixture.expectPreserved();
+    await fixture.expectPreserved();
   });
 });

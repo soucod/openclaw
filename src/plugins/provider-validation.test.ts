@@ -1,225 +1,105 @@
-/** Covers provider registration validation for ids, duplicates, and required hooks. */
-import { describe, expect, it } from "vitest";
+import { expect, it } from "vitest";
 import type { PluginDiagnostic } from "./manifest-types.js";
 import { normalizeRegisteredProvider } from "./provider-validation.js";
-import type { ProviderPlugin } from "./types.js";
+import type { ProviderAuthMethod, ProviderPlugin } from "./types.js";
 
-function collectDiagnostics() {
+function normalize(overrides: Partial<ProviderPlugin>) {
   const diagnostics: PluginDiagnostic[] = [];
-  return {
-    diagnostics,
-    pushDiagnostic: (diag: PluginDiagnostic) => {
-      diagnostics.push(diag);
-    },
-  };
-}
-
-function makeProvider(overrides: Partial<ProviderPlugin>): ProviderPlugin {
-  return {
-    id: "demo",
-    label: "Demo",
-    auth: [],
-    ...overrides,
-  };
-}
-
-function expectDiagnosticMessages(
-  diagnostics: PluginDiagnostic[],
-  expectedDiagnostics: ReadonlyArray<{ level: PluginDiagnostic["level"]; message: string }>,
-) {
-  expect(diagnostics.map((diag) => ({ level: diag.level, message: diag.message }))).toEqual(
-    expectedDiagnostics,
-  );
-}
-
-function expectDiagnosticText(diagnostics: PluginDiagnostic[], messages: readonly string[]) {
-  expect(diagnostics.map((diag) => diag.message)).toEqual([...messages]);
-}
-
-function normalizeProviderFixture(provider: ProviderPlugin) {
-  const { diagnostics, pushDiagnostic } = collectDiagnostics();
-  const normalizedProvider = normalizeRegisteredProvider({
+  const provider = normalizeRegisteredProvider({
     pluginId: "demo-plugin",
     source: "/tmp/demo/index.ts",
-    provider,
-    pushDiagnostic,
+    provider: { id: "demo", label: "Demo", auth: [], ...overrides },
+    pushDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
   });
-  return {
-    diagnostics,
-    provider: normalizedProvider,
-  };
+  return { provider, diagnostics };
 }
 
-function expectNormalizedProviderFixture(params: {
-  provider: ProviderPlugin;
-  expectedProvider?: unknown;
-  expectedDiagnostics?: ReadonlyArray<{ level: PluginDiagnostic["level"]; message: string }>;
-  expectedDiagnosticText?: readonly string[];
-}) {
-  const result = normalizeProviderFixture(params.provider);
-  if (params.expectedProvider) {
-    expect(result.provider).toEqual(params.expectedProvider);
-  }
-  if (params.expectedDiagnostics) {
-    expectDiagnosticMessages(result.diagnostics, params.expectedDiagnostics);
-  }
-  if (params.expectedDiagnosticText) {
-    expectDiagnosticText(result.diagnostics, params.expectedDiagnosticText);
-  }
-  return result;
-}
-
-function expectProviderNormalizationResult(params: {
-  provider: ProviderPlugin;
-  expectedProvider?: unknown;
-  expectedDiagnostics?: ReadonlyArray<{ level: PluginDiagnostic["level"]; message: string }>;
-  expectedDiagnosticText?: readonly string[];
-  assert?: (
-    provider: ReturnType<typeof normalizeRegisteredProvider>,
-    diagnostics: PluginDiagnostic[],
-    inputProvider: ProviderPlugin,
-  ) => void;
-}) {
-  const { diagnostics, provider } = expectNormalizedProviderFixture(params);
-  params.assert?.(provider, diagnostics, params.provider);
-}
-
-describe("normalizeRegisteredProvider", () => {
-  const primaryAuthRun = async () => ({ profiles: [] });
-
-  const cases = [
-    {
-      name: "drops invalid and duplicate auth methods, and clears bad wizard method bindings",
-      provider: makeProvider({
-        id: " demo ",
-        label: " Demo Provider ",
-        aliases: [" alias-one ", "alias-one", ""],
-        deprecatedProfileIds: [" demo:legacy ", "demo:legacy", ""],
-        envVars: [" DEMO_API_KEY ", "DEMO_API_KEY"],
-        auth: [
-          {
-            id: " primary ",
-            label: " Primary ",
-            kind: "custom",
-            wizard: {
-              choiceId: " demo-primary ",
-              modelTarget: "utility",
-              assistantVisibility: "detected-only",
-              onboardingFeatured: true,
-              modelAllowlist: {
-                allowedKeys: [" demo/model ", "demo/model"],
-                initialSelections: [" demo/model "],
-                loadCatalog: true,
-                message: " Demo models ",
-              },
-            },
-            run: primaryAuthRun,
-          },
-          {
-            id: "primary",
-            label: "Duplicate",
-            kind: "custom",
-            run: async () => ({ profiles: [] }),
-          },
-          { id: "   ", label: "Missing", kind: "custom", run: async () => ({ profiles: [] }) },
-        ],
-        wizard: {
-          setup: {
-            choiceId: " demo-choice ",
-            onboardingFeatured: true,
-            methodId: " missing ",
-          },
-          modelPicker: {
-            label: " Demo models ",
-            methodId: " missing ",
-          },
-        },
-      }),
-      expectedProvider: makeProvider({
-        id: "demo",
-        label: "Demo Provider",
-        aliases: ["alias-one"],
-        deprecatedProfileIds: ["demo:legacy"],
-        envVars: ["DEMO_API_KEY"],
-        auth: [
-          {
-            id: "primary",
-            label: "Primary",
-            kind: "custom",
-            wizard: {
-              choiceId: "demo-primary",
-              modelTarget: "utility",
-              assistantVisibility: "detected-only",
-              onboardingFeatured: true,
-              modelAllowlist: {
-                allowedKeys: ["demo/model"],
-                initialSelections: ["demo/model"],
-                loadCatalog: true,
-                message: "Demo models",
-              },
-            },
-            run: primaryAuthRun,
-          },
-        ],
-        wizard: {
-          setup: {
-            choiceId: "demo-choice",
-            onboardingFeatured: true,
-          },
-          modelPicker: {
-            label: "Demo models",
-          },
-        },
-      }),
-      expectedDiagnostics: [
-        {
-          level: "error",
-          message: 'provider "demo" auth method duplicated id "primary"',
-        },
-        {
-          level: "error",
-          message: 'provider "demo" auth method missing id',
-        },
-        {
-          level: "warn",
-          message:
-            'provider "demo" setup method "missing" not found; falling back to available methods',
-        },
-        {
-          level: "warn",
-          message:
-            'provider "demo" model-picker method "missing" not found; falling back to available methods',
-        },
-      ],
-    },
-    {
-      name: "drops wizard metadata when a provider has no auth methods",
-      provider: makeProvider({
-        wizard: {
-          setup: {
-            choiceId: "demo",
-          },
-          modelPicker: {
-            label: "Demo",
-          },
-        },
-      }),
-      assert: (
-        provider: ReturnType<typeof normalizeRegisteredProvider>,
-        diagnostics: PluginDiagnostic[],
-      ) => {
-        expect(provider?.wizard).toBeUndefined();
-        expectDiagnosticText(diagnostics, [
-          'provider "demo" setup metadata ignored because it has no auth methods',
-          'provider "demo" model-picker metadata ignored because it has no auth methods',
-        ]);
+it("drops invalid and duplicate auth methods, and clears bad wizard method bindings", () => {
+  const method: ProviderAuthMethod = {
+    id: "primary",
+    label: "Primary",
+    kind: "custom",
+    run: async () => ({ profiles: [] }),
+    wizard: {
+      choiceId: "demo-primary",
+      modelTarget: "utility",
+      assistantVisibility: "detected-only",
+      onboardingFeatured: true,
+      modelSelection: { promptWhenAuthChoiceProvided: true, allowKeepCurrent: false },
+      modelAllowlist: {
+        allowedKeys: ["demo/model"],
+        initialSelections: ["demo/model"],
+        loadCatalog: true,
+        message: "Demo models",
       },
     },
-  ] satisfies readonly (Parameters<typeof expectProviderNormalizationResult>[0] & {
-    name: string;
-  })[];
-
-  it.each(cases)("$name", (testCase) => {
-    expectProviderNormalizationResult(testCase);
+  };
+  const expected: ProviderPlugin = {
+    id: "demo",
+    label: "Demo Provider",
+    aliases: ["alias-one"],
+    deprecatedProfileIds: ["demo:legacy"],
+    envVars: ["DEMO_API_KEY"],
+    auth: [method],
+    wizard: {
+      setup: {
+        choiceId: "demo-choice",
+        onboardingFeatured: true,
+        modelSelection: { promptWhenAuthChoiceProvided: false, allowKeepCurrent: true },
+      },
+      modelPicker: { label: "Demo models" },
+    },
+  };
+  const { provider, diagnostics } = normalize({
+    ...expected,
+    id: " demo ",
+    label: " Demo Provider ",
+    aliases: [" alias-one ", "alias-one", ""],
+    deprecatedProfileIds: [" demo:legacy ", "demo:legacy", ""],
+    envVars: [" DEMO_API_KEY ", "DEMO_API_KEY"],
+    auth: [
+      {
+        ...method,
+        id: " primary ",
+        label: " Primary ",
+        wizard: {
+          ...method.wizard,
+          choiceId: " demo-primary ",
+          modelAllowlist: {
+            ...method.wizard?.modelAllowlist,
+            allowedKeys: [" demo/model ", "demo/model"],
+            initialSelections: [" demo/model "],
+            message: " Demo models ",
+          },
+        },
+      },
+      { ...method, id: "primary", label: "Duplicate", wizard: undefined },
+      { ...method, id: "   ", label: "Missing", wizard: undefined },
+    ],
+    wizard: {
+      setup: { ...expected.wizard?.setup, choiceId: " demo-choice ", methodId: " missing " },
+      modelPicker: { label: " Demo models ", methodId: " missing " },
+    },
   });
+  expect(provider).toEqual(expected);
+  expect(diagnostics.map(({ level, message }) => [level, message])).toEqual([
+    ["error", 'provider "demo" auth method duplicated id "primary"'],
+    ["error", 'provider "demo" auth method missing id'],
+    ["warn", 'provider "demo" setup method "missing" not found; falling back to available methods'],
+    [
+      "warn",
+      'provider "demo" model-picker method "missing" not found; falling back to available methods',
+    ],
+  ]);
+});
+
+it("drops wizard metadata when a provider has no auth methods", () => {
+  const { provider, diagnostics } = normalize({
+    wizard: { setup: { choiceId: "demo" }, modelPicker: { label: "Demo" } },
+  });
+  expect(provider?.wizard).toBeUndefined();
+  expect(diagnostics.map((diagnostic) => diagnostic.message)).toEqual([
+    'provider "demo" setup metadata ignored because it has no auth methods',
+    'provider "demo" model-picker metadata ignored because it has no auth methods',
+  ]);
 });

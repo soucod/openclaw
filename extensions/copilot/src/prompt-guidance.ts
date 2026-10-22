@@ -19,6 +19,7 @@ const COPILOT_HARNESS_IDENTITY =
 export function buildCopilotPromptGuidance(params: {
   attempt: AttemptParamsLike;
   callableToolNames: Iterable<string>;
+  toolSchemaDirectoryPrompt?: string;
   workspaceBootstrapInstructions?: string;
   requireExplicitMessageTarget?: boolean;
 }): string | undefined {
@@ -47,6 +48,7 @@ export function buildCopilotPromptGuidance(params: {
       : undefined;
   const sections = [
     COPILOT_HARNESS_IDENTITY,
+    params.toolSchemaDirectoryPrompt,
     callableTools.has(SKILL_WORKSHOP_TOOL_NAME)
       ? buildSkillWorkshopPromptSection().join("\n")
       : undefined,
@@ -54,6 +56,12 @@ export function buildCopilotPromptGuidance(params: {
     buildHarnessVisibleReplyGuidance({
       sourceReplyDeliveryMode: params.attempt.sourceReplyDeliveryMode,
       messageToolAvailable: callableTools.has("message"),
+      currentConversation: {
+        agentSessionKey: params.attempt.sessionKey,
+        currentChannelProvider: params.attempt.messageChannel ?? params.attempt.messageProvider,
+        currentChannelId: params.attempt.currentChannelId,
+        currentMessagingTarget: params.attempt.currentMessagingTarget,
+      },
       requireExplicitMessageTarget: params.requireExplicitMessageTarget,
     }),
     buildCredentialSafetyPrompt({

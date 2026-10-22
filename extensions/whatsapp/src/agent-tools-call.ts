@@ -9,12 +9,14 @@ import type {
   OpenClawPluginApi,
   OpenClawPluginToolContext,
 } from "openclaw/plugin-sdk/core";
+import { safeStat } from "openclaw/plugin-sdk/path-existence-runtime";
 import { mulawToPcm } from "openclaw/plugin-sdk/realtime-voice";
 import { detectBinary } from "openclaw/plugin-sdk/setup-tools";
 import { resolveOAuthDir } from "openclaw/plugin-sdk/state-paths";
+import { shellEscape } from "openclaw/plugin-sdk/string-normalization-runtime";
 import { resolvePreferredOpenClawTmpDir } from "openclaw/plugin-sdk/temp-path";
 import { jsonResult } from "openclaw/plugin-sdk/tool-results";
-import { Type } from "typebox";
+import { Type, type Static } from "typebox";
 import { resolveWhatsAppAccount } from "./accounts.js";
 import { getWhatsAppConnectionController } from "./connection-controller-runtime-context.js";
 import { resolveJidToE164 } from "./targets-runtime.js";
@@ -52,33 +54,7 @@ const WhatsAppCallToolSchema = Type.Object(
   { additionalProperties: false },
 );
 
-type WhatsAppCallToolParams = {
-  action: "status" | "call";
-  message?: string;
-};
-
-type WhatsAppCallToolDependencies = {
-  detectMeowCaller: () => Promise<boolean>;
-  resolveStateDir: (accountId: string) => string;
-};
-
-const defaultDependencies: WhatsAppCallToolDependencies = {
-  detectMeowCaller: () => detectBinary(MEOWCALLER_COMMAND),
-  resolveStateDir: (accountId) =>
-    path.join(resolveOAuthDir(), "whatsapp-calls", normalizeAccountId(accountId)),
-};
-
-async function isRegularFile(filePath: string): Promise<boolean> {
-  try {
-    return (await fs.stat(filePath)).isFile();
-  } catch {
-    return false;
-  }
-}
-
-function quotePosixShellArg(value: string): string {
-  return `'${value.replaceAll("'", `'"'"'`)}'`;
-}
+type WhatsAppCallToolParams = Static<typeof WhatsAppCallToolSchema>;
 
 function quotePowerShellArg(value: string): string {
   return `'${value.replaceAll("'", "''")}'`;
@@ -92,8 +68,8 @@ function resolveSetupCommand(
   if (platform === "win32") {
     return `meowcaller pair --store ${quotePowerShellArg(sessionStorePath)}`;
   }
-  const quotedStateDir = quotePosixShellArg(stateDir);
-  const quotedStorePath = quotePosixShellArg(sessionStorePath);
+  const quotedStateDir = shellEscape(stateDir);
+  const quotedStorePath = shellEscape(sessionStorePath);
   return `mkdir -p ${quotedStateDir} && chmod 700 ${quotedStateDir} && meowcaller pair --store ${quotedStorePath}`;
 }
 
@@ -141,57 +117,13 @@ function resolveCallWindowMs(pcmBytes: number, sampleRate: number): number {
   return Math.min(MAX_CALL_WINDOW_MS, Math.ceil(audioDurationMs + MIN_CALL_WINDOW_MS));
 }
 
-async function resolveRequesterE164(params: {
-  accountId: string;
-  cfg: NonNullable<OpenClawPluginToolContext["config"]>;
-  requesterSenderId: string;
-}): Promise<string | null> {
-  const senderId = params.requesterSenderId.trim();
-  if (!senderId.includes("@")) {
-    try {
-      return normalizeE164(senderId.replace(/^whatsapp:/i, ""));
-    } catch {
-      return null;
-    }
-  }
-
-  const account = resolveWhatsAppAccount({ cfg: params.cfg, accountId: params.accountId });
-  const lidLookup = getWhatsAppConnectionController(params.accountId)?.getCurrentSock()
-    ?.signalRepository.lidMapping;
-  return await resolveJidToE164(senderId, { authDir: account.authDir, lidLookup });
-}
-
-async function resolveLinkedWhatsAppSelfE164(params: {
-  accountId: string;
-  cfg: NonNullable<OpenClawPluginToolContext["config"]>;
-}): Promise<string | null> {
-  const controller = getWhatsAppConnectionController(params.accountId);
-  if (!controller) {
-    return null;
-  }
-  const identity = controller.getSelfIdentity();
-  if (!identity) {
-    return null;
-  }
-  if (identity.e164) {
-    return normalizeE164(identity.e164);
-  }
-  const account = resolveWhatsAppAccount({ cfg: params.cfg, accountId: params.accountId });
-  const lidLookup = controller.getCurrentSock()?.signalRepository.lidMapping;
-  return await resolveJidToE164(identity.jid ?? identity.lid, {
-    authDir: account.authDir,
-    lidLookup,
-  });
-}
-
 function resolveRuntimeConfig(api: OpenClawPluginApi, context: OpenClawPluginToolContext) {
   return context.getRuntimeConfig?.() ?? context.runtimeConfig ?? context.config ?? api.config;
 }
 
-function createWhatsAppCallToolWithDependencies(
+function createWhatsAppCallTool(
   api: OpenClawPluginApi,
   context: OpenClawPluginToolContext,
-  dependencies: WhatsAppCallToolDependencies,
 ): AnyAgentTool | null {
   const cfg = resolveRuntimeConfig(api, context);
   const isActionEnabled = createActionGate(cfg.channels?.whatsapp?.actions);
@@ -205,8 +137,39 @@ function createWhatsAppCallToolWithDependencies(
   }
 
   const accountId = normalizeAccountId(context.agentAccountId);
-  const stateDir = dependencies.resolveStateDir(accountId);
+  const stateDir = path.join(resolveOAuthDir(), "whatsapp-calls", accountId);
   const sessionStorePath = path.join(stateDir, SESSION_DATABASE);
+
+  const resolveRequesterE164 = async (): Promise<string | null> => {
+    const senderId = requesterSenderId.trim();
+    if (!senderId.includes("@")) {
+      return normalizeE164(senderId.replace(/^whatsapp:/i, ""));
+    }
+
+    const account = resolveWhatsAppAccount({ cfg, accountId });
+    const lidLookup =
+      getWhatsAppConnectionController(accountId)?.getCurrentSock()?.signalRepository.lidMapping;
+    return await resolveJidToE164(senderId, { authDir: account.authDir, lidLookup });
+  };
+  const resolveLinkedWhatsAppSelfE164 = async (): Promise<string | null> => {
+    const controller = getWhatsAppConnectionController(accountId);
+    if (!controller) {
+      return null;
+    }
+    const identity = controller.getSelfIdentity();
+    if (!identity) {
+      return null;
+    }
+    if (identity.e164) {
+      return identity.e164;
+    }
+    const account = resolveWhatsAppAccount({ cfg, accountId });
+    const lidLookup = controller.getCurrentSock()?.signalRepository.lidMapping;
+    return await resolveJidToE164(identity.jid ?? identity.lid, {
+      authDir: account.authDir,
+      lidLookup,
+    });
+  };
 
   return {
     name: "whatsapp_call",
@@ -216,8 +179,8 @@ function createWhatsAppCallToolWithDependencies(
     parameters: WhatsAppCallToolSchema,
     async execute(_toolCallId, rawParams, signal) {
       const params = rawParams as WhatsAppCallToolParams;
-      const binaryFound = await dependencies.detectMeowCaller();
-      const sessionStoreFound = await isRegularFile(sessionStorePath);
+      const binaryFound = await detectBinary(MEOWCALLER_COMMAND);
+      const sessionStoreFound = (await safeStat(sessionStorePath))?.isFile() === true;
       if (params.action === "status") {
         return jsonResult({
           binaryFound,
@@ -248,15 +211,11 @@ function createWhatsAppCallToolWithDependencies(
         );
       }
 
-      const target = await resolveRequesterE164({
-        accountId,
-        cfg,
-        requesterSenderId,
-      });
+      const target = await resolveRequesterE164();
       if (!target) {
         throw new Error("Could not resolve the current WhatsApp requester to a phone number");
       }
-      const linkedSelf = await resolveLinkedWhatsAppSelfE164({ accountId, cfg });
+      const linkedSelf = await resolveLinkedWhatsAppSelfE164();
       if (linkedSelf === target) {
         throw new Error(
           "WhatsApp cannot call the linked account itself; use a dedicated OpenClaw WhatsApp number",
@@ -330,13 +289,6 @@ function createWhatsAppCallToolWithDependencies(
       }
     },
   };
-}
-
-function createWhatsAppCallTool(
-  api: OpenClawPluginApi,
-  context: OpenClawPluginToolContext,
-): AnyAgentTool | null {
-  return createWhatsAppCallToolWithDependencies(api, context, defaultDependencies);
 }
 
 export function registerWhatsAppCallTool(api: OpenClawPluginApi): void {

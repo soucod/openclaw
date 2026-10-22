@@ -1,42 +1,50 @@
 /** Spawns bundled LSP server processes with sanitized environment and platform handling. */
-import { sanitizeHostExecEnv } from "../infra/host-env-security.js";
+import { logWarn } from "../logger.js";
 import {
   materializeWindowsSpawnProgram,
   resolveWindowsSpawnProgram,
 } from "../plugin-sdk/windows-spawn.js";
 import { createOwnedStdioProcess, type OwnedStdioProcess } from "../process/owned-stdio.js";
+import {
+  collectWithheldLspEnvNames,
+  formatWithheldLspEnvHints,
+  LSP_ENV_PASSTHROUGH_DOCS_URL,
+  resolveLspServerEnv,
+} from "./agent-bundle-lsp-env.js";
 import type { StdioMcpServerLaunchConfig } from "./mcp-stdio.js";
 
-type LspSpawnDependencies = {
-  spawn: typeof createOwnedStdioProcess;
-  sanitizeHostExecEnv: typeof sanitizeHostExecEnv;
-  resolveWindowsSpawnProgram: typeof resolveWindowsSpawnProgram;
-  materializeWindowsSpawnProgram: typeof materializeWindowsSpawnProgram;
-};
+// Servers restart every turn; repeat a warning only when its server or names change.
+const warnedWithheldEnv = new Set<string>();
 
-const defaultLspSpawnDependencies: LspSpawnDependencies = {
-  spawn: createOwnedStdioProcess,
-  sanitizeHostExecEnv,
-  resolveWindowsSpawnProgram,
-  materializeWindowsSpawnProgram,
-};
+function warnWithheldLspEnvOnce(serverName: string, childEnv: Record<string, string>): void {
+  const hints = formatWithheldLspEnvHints(
+    collectWithheldLspEnvNames({ parentEnv: process.env, childEnv }),
+  ).join(" ");
+  const key = `${serverName}\0${hints}`;
+  if (!hints || warnedWithheldEnv.has(key)) {
+    return;
+  }
+  warnedWithheldEnv.add(key);
+  logWarn(
+    `bundle-lsp: server "${serverName}" starts without these Gateway environment variables. ${hints} See ${LSP_ENV_PASSTHROUGH_DOCS_URL}`,
+  );
+}
 
 export async function spawnLspServerProcess(
   config: StdioMcpServerLaunchConfig,
-  options: { abortSignal?: AbortSignal; dependencies?: LspSpawnDependencies } = {},
+  options: { abortSignal?: AbortSignal; serverName?: string } = {},
 ): Promise<OwnedStdioProcess> {
-  const dependencies = options.dependencies ?? defaultLspSpawnDependencies;
-  const mergedEnv = dependencies.sanitizeHostExecEnv({
-    baseEnv: process.env,
-    overrides: config.env ?? null,
-  });
-  const program = dependencies.resolveWindowsSpawnProgram({
+  const mergedEnv = resolveLspServerEnv(config.env);
+  if (options.serverName !== undefined) {
+    warnWithheldLspEnvOnce(options.serverName, mergedEnv);
+  }
+  const program = resolveWindowsSpawnProgram({
     command: config.command,
     env: mergedEnv,
     allowShellFallback: true,
   });
-  const invocation = dependencies.materializeWindowsSpawnProgram(program, config.args ?? []);
-  return await dependencies.spawn({
+  const invocation = materializeWindowsSpawnProgram(program, config.args ?? []);
+  return await createOwnedStdioProcess({
     argv: [invocation.command, ...invocation.argv],
     env: mergedEnv,
     exactEnv: true,

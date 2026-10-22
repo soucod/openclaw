@@ -1,9 +1,9 @@
-// Migrate Claude plugin module implements source behavior.
 import crypto from "node:crypto";
 import type { Dirent } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { extractErrorCode } from "openclaw/plugin-sdk/error-runtime";
 import { exists, isDirectory, readJsonObject, resolveHomePath } from "./helpers.js";
 
 type ClaudeArchivePath = {
@@ -75,7 +75,7 @@ async function addArchivePath(
   candidate: string,
   relativePath: string,
 ): Promise<void> {
-  if ((await exists(candidate)) || (await isDirectory(candidate))) {
+  if (await exists(candidate)) {
     archivePaths.push({ id, path: candidate, relativePath });
   }
 }
@@ -84,10 +84,7 @@ async function safeReadDir(dir: string): Promise<Dirent[]> {
   try {
     return await fs.readdir(dir, { withFileTypes: true });
   } catch (error) {
-    const code =
-      error && typeof error === "object" && "code" in error
-        ? String((error as { code?: unknown }).code)
-        : undefined;
+    const code = extractErrorCode(error);
     if (code === "ENOENT" || code === "ENOTDIR") {
       return [];
     }
@@ -95,7 +92,7 @@ async function safeReadDir(dir: string): Promise<Dirent[]> {
   }
 }
 
-export async function readMemoryDir(dir: string): Promise<Dirent[]> {
+async function readMemoryDir(dir: string): Promise<Dirent[]> {
   try {
     return await fs.readdir(dir, { withFileTypes: true });
   } catch (error) {
@@ -109,10 +106,7 @@ async function isConfiguredAutoMemoryDirectory(dir: string): Promise<boolean> {
   try {
     return (await fs.stat(dir)).isDirectory();
   } catch (error) {
-    const code =
-      error && typeof error === "object" && "code" in error
-        ? String((error as { code?: unknown }).code)
-        : undefined;
+    const code = extractErrorCode(error);
     if (code === "ENOENT" || code === "ENOTDIR") {
       return false;
     }
@@ -122,28 +116,43 @@ async function isConfiguredAutoMemoryDirectory(dir: string): Promise<boolean> {
   }
 }
 
-async function probeMarkdownFiles(root: string): Promise<"found" | "absent" | "truncated"> {
-  const pending = [root];
+type MarkdownFileScan = {
+  files: string[];
+  truncatedBy?: "files" | "entries";
+};
+
+export async function listMarkdownFiles(root: string, maxFiles: number): Promise<MarkdownFileScan> {
+  const files: string[] = [];
+  const pending = [""];
   let visited = 0;
-  while (pending.length > 0) {
-    const current = pending.pop();
-    if (!current) {
+  let truncatedBy: MarkdownFileScan["truncatedBy"];
+  scan: while (pending.length > 0) {
+    const relativeDir = pending.pop();
+    if (relativeDir === undefined) {
       break;
     }
-    for (const entry of await readMemoryDir(current)) {
+    for (const entry of await readMemoryDir(path.join(root, relativeDir))) {
       visited += 1;
       if (visited > CLAUDE_AUTO_MEMORY_MAX_SCAN_ENTRIES) {
-        return "truncated";
+        truncatedBy = "entries";
+        break scan;
       }
-      if (entry.isFile() && entry.name.toLowerCase().endsWith(".md")) {
-        return "found";
-      }
+      const relativePath = path.join(relativeDir, entry.name);
       if (entry.isDirectory()) {
-        pending.push(path.join(current, entry.name));
+        pending.push(relativePath);
+      } else if (entry.isFile() && entry.name.toLowerCase().endsWith(".md")) {
+        files.push(relativePath);
+        if (files.length > maxFiles) {
+          truncatedBy = "files";
+          break scan;
+        }
       }
     }
   }
-  return "absent";
+  return {
+    files: files.toSorted((left, right) => left.localeCompare(right)),
+    ...(truncatedBy ? { truncatedBy } : {}),
+  };
 }
 
 function autoMemorySourceId(sourcePath: string): string {
@@ -200,7 +209,8 @@ async function discoverAutoMemorySources(params: {
     }
     // A capped discovery probe must remain conservative: planning performs the
     // full bounded scan and reports oversized trees instead of hiding them.
-    if ((await probeMarkdownFiles(candidate.path)) === "absent") {
+    const scan = await listMarkdownFiles(candidate.path, 0);
+    if (scan.files.length === 0 && !scan.truncatedBy) {
       continue;
     }
     const canonical = await fs.realpath(candidate.path).catch(() => path.resolve(candidate.path));
@@ -255,41 +265,39 @@ export async function discoverClaudeSource(input?: string): Promise<ClaudeSource
     ...(homeDir && (await isDirectory(homeDir)) ? { homeDir } : {}),
     ...(homeProjectsDir && (await isDirectory(homeProjectsDir)) ? { homeProjectsDir } : {}),
     ...(projectDir ? { projectDir } : {}),
-    ...(userSettingsPath && (await exists(userSettingsPath)) ? { userSettingsPath } : {}),
-    ...(userLocalSettingsPath && (await exists(userLocalSettingsPath))
-      ? { userLocalSettingsPath }
-      : {}),
-    ...(userClaudeJsonPath && (await exists(userClaudeJsonPath)) ? { userClaudeJsonPath } : {}),
-    ...(userMemoryPath && (await exists(userMemoryPath)) ? { userMemoryPath } : {}),
-    ...(userSkillsDir && (await isDirectory(userSkillsDir)) ? { userSkillsDir } : {}),
-    ...(userCommandsDir && (await isDirectory(userCommandsDir)) ? { userCommandsDir } : {}),
-    ...(userAgentsDir && (await isDirectory(userAgentsDir)) ? { userAgentsDir } : {}),
-    ...(desktopConfigPath && (await exists(desktopConfigPath)) ? { desktopConfigPath } : {}),
   };
+  for (const [key, candidate, probe] of [
+    ["userSettingsPath", userSettingsPath, exists],
+    ["userLocalSettingsPath", userLocalSettingsPath, exists],
+    ["userClaudeJsonPath", userClaudeJsonPath, exists],
+    ["userMemoryPath", userMemoryPath, exists],
+    ["userSkillsDir", userSkillsDir, isDirectory],
+    ["userCommandsDir", userCommandsDir, isDirectory],
+    ["userAgentsDir", userAgentsDir, isDirectory],
+    ["desktopConfigPath", desktopConfigPath, exists],
+  ] as const) {
+    if (candidate && (await probe(candidate))) {
+      source[key] = candidate;
+    }
+  }
 
   if (projectDir) {
-    const projectSettingsPath = path.join(projectDir, ".claude", "settings.json");
-    const projectLocalSettingsPath = path.join(projectDir, ".claude", "settings.local.json");
-    const projectMcpPath = path.join(projectDir, ".mcp.json");
-    const projectMemoryPath = path.join(projectDir, "CLAUDE.md");
-    const projectDotClaudeMemoryPath = path.join(projectDir, ".claude", "CLAUDE.md");
-    const projectLocalMemoryPath = path.join(projectDir, "CLAUDE.local.md");
-    const projectRulesDir = path.join(projectDir, ".claude", "rules");
-    const projectSkillsDir = path.join(projectDir, ".claude", "skills");
-    const projectCommandsDir = path.join(projectDir, ".claude", "commands");
-    const projectAgentsDir = path.join(projectDir, ".claude", "agents");
-    Object.assign(source, {
-      ...((await exists(projectSettingsPath)) ? { projectSettingsPath } : {}),
-      ...((await exists(projectLocalSettingsPath)) ? { projectLocalSettingsPath } : {}),
-      ...((await exists(projectMcpPath)) ? { projectMcpPath } : {}),
-      ...((await exists(projectMemoryPath)) ? { projectMemoryPath } : {}),
-      ...((await exists(projectDotClaudeMemoryPath)) ? { projectDotClaudeMemoryPath } : {}),
-      ...((await exists(projectLocalMemoryPath)) ? { projectLocalMemoryPath } : {}),
-      ...((await isDirectory(projectRulesDir)) ? { projectRulesDir } : {}),
-      ...((await isDirectory(projectSkillsDir)) ? { projectSkillsDir } : {}),
-      ...((await isDirectory(projectCommandsDir)) ? { projectCommandsDir } : {}),
-      ...((await isDirectory(projectAgentsDir)) ? { projectAgentsDir } : {}),
-    });
+    for (const [key, candidate, probe] of [
+      ["projectSettingsPath", path.join(projectDir, ".claude", "settings.json"), exists],
+      ["projectLocalSettingsPath", path.join(projectDir, ".claude", "settings.local.json"), exists],
+      ["projectMcpPath", path.join(projectDir, ".mcp.json"), exists],
+      ["projectMemoryPath", path.join(projectDir, "CLAUDE.md"), exists],
+      ["projectDotClaudeMemoryPath", path.join(projectDir, ".claude", "CLAUDE.md"), exists],
+      ["projectLocalMemoryPath", path.join(projectDir, "CLAUDE.local.md"), exists],
+      ["projectRulesDir", path.join(projectDir, ".claude", "rules"), isDirectory],
+      ["projectSkillsDir", path.join(projectDir, ".claude", "skills"), isDirectory],
+      ["projectCommandsDir", path.join(projectDir, ".claude", "commands"), isDirectory],
+      ["projectAgentsDir", path.join(projectDir, ".claude", "agents"), isDirectory],
+    ] as const) {
+      if (await probe(candidate)) {
+        source[key] = candidate;
+      }
+    }
     for (const file of PROJECT_ARCHIVE_FILES) {
       await addArchivePath(
         archivePaths,

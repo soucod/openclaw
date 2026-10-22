@@ -1,30 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
-import {
-  inspectFaceTimeDriver,
-  installFaceTimeDriver,
-  uninstallFaceTimeDriver,
-} from "../src/driver-setup.js";
+import { installFaceTimeDriver, uninstallFaceTimeDriver } from "../src/driver-setup.js";
 
 describe("FaceTime driver setup", () => {
-  it("reads the idempotent installer status", async () => {
-    const runCommandWithTimeout = vi.fn().mockResolvedValue({
-      code: 0,
-      stdout: "current\n",
-      stderr: "",
-    });
-
-    await expect(
-      inspectFaceTimeDriver({
-        pluginRoot: "/tmp/facetime",
-        runCommandWithTimeout: runCommandWithTimeout as never,
-      }),
-    ).resolves.toBe("current");
-    expect(runCommandWithTimeout).toHaveBeenCalledWith(
-      ["/bin/sh", "/tmp/facetime/scripts/install-driver.sh", "--status"],
-      { timeoutMs: 10_000 },
-    );
-  });
-
   it("does not prompt or restart CoreAudio when the driver is current", async () => {
     const runCommandWithTimeout = vi.fn().mockResolvedValue({
       code: 0,
@@ -36,23 +13,12 @@ describe("FaceTime driver setup", () => {
       installFaceTimeDriver({
         pluginRoot: "/tmp/facetime",
         runCommandWithTimeout: runCommandWithTimeout as never,
-        callActive: false,
       }),
     ).resolves.toEqual({ changed: false, status: "current" });
-    expect(runCommandWithTimeout).toHaveBeenCalledTimes(1);
-  });
-
-  it("rejects installation while a call is active", async () => {
-    const runCommandWithTimeout = vi.fn();
-
-    await expect(
-      installFaceTimeDriver({
-        pluginRoot: "/tmp/facetime",
-        runCommandWithTimeout: runCommandWithTimeout as never,
-        callActive: true,
-      }),
-    ).rejects.toThrow("during an active or pending call");
-    expect(runCommandWithTimeout).not.toHaveBeenCalled();
+    expect(runCommandWithTimeout).toHaveBeenCalledExactlyOnceWith(
+      ["/bin/sh", "/tmp/facetime/scripts/install-driver.sh", "--status"],
+      { timeoutMs: 10_000 },
+    );
   });
 
   it("installs and verifies a missing driver", async () => {
@@ -60,17 +26,16 @@ describe("FaceTime driver setup", () => {
     const runCommandWithTimeout = vi
       .fn()
       .mockResolvedValueOnce({ code: 0, stdout: "missing\n", stderr: "" })
-      .mockResolvedValueOnce({ code: 0, stdout: "Installed\n", stderr: "" })
-      .mockResolvedValueOnce({ code: 0, stdout: "current\n", stderr: "" });
+      .mockResolvedValueOnce({ code: 0, stdout: "Installed\n", stderr: "" });
 
     await expect(
       installFaceTimeDriver({
         pluginRoot: "/tmp/facetime",
         runCommandWithTimeout: runCommandWithTimeout as never,
-        callActive: false,
         signal: abortController.signal,
       }),
     ).resolves.toEqual({ changed: true, status: "current" });
+    expect(runCommandWithTimeout).toHaveBeenCalledTimes(2);
     expect(runCommandWithTimeout).toHaveBeenNthCalledWith(
       2,
       ["/bin/sh", "/tmp/facetime/scripts/install-driver.sh", "--ensure"],
