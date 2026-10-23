@@ -1,4 +1,4 @@
-import { createEffect, createSignal, onCleanup, onSettled } from "solid-js";
+import { createEffect, createSignal, onSettled } from "solid-js";
 import type { PluginsUninstallResult } from "../../../../packages/gateway-protocol/src/schema/plugins.js";
 import {
   pathForRoute,
@@ -21,7 +21,7 @@ import {
 } from "../../lib/plugins/index.ts";
 import { t } from "../../lib/reactive/i18n.ts";
 import { listen } from "../../lib/reactive/listener.ts";
-import type { PluginCredentialEditorProps } from "./credential-editor.tsx";
+import { createCredentialPresentation } from "./credential-presentation.ts";
 import { installedPluginDetailTabFromHash } from "./detail-tabs.ts";
 import { createPluginDiscovery } from "./plugin-discovery.ts";
 import { createPluginHelp } from "./plugin-help.ts";
@@ -30,7 +30,7 @@ import { createPluginPageTargets } from "./plugin-removal-focus.ts";
 import { pluginRowKey, type PluginRowMessage } from "./plugin-row-message.tsx";
 import { pluginMutationWarnings, createPluginsConsent } from "./plugins-consent.ts";
 import { createPluginDetailReads } from "./plugins-detail-reads.ts";
-import type { PluginsHubTab } from "./plugins-hub.ts";
+import { createPluginsMutationPresentation } from "./plugins-mutation-presentation.ts";
 import { createPluginsPageIcons } from "./plugins-page-icons.ts";
 import {
   createPluginsPageState,
@@ -40,7 +40,7 @@ import {
   type PluginMutationAction,
 } from "./plugins-page-model.ts";
 import type { PluginsRouteData } from "./route-data.ts";
-import type { PluginSettingsField } from "./settings-editor.tsx";
+import type { PluginSettingsEditorProps } from "./settings-editor.tsx";
 import type { PluginSettingsTab } from "./settings-view.tsx";
 import { createPluginPreview } from "./skill-preview.tsx";
 
@@ -60,6 +60,7 @@ export function createPluginsPage(options: {
   const [settingsTab, setSettingsTab] = createSignal<PluginSettingsTab>("installed");
 
   const state = createPluginsPageState();
+  const credentialPresentation = createCredentialPresentation(context.router);
   const details = createPluginDetailReads({
     state,
     setState,
@@ -158,9 +159,7 @@ export function createPluginsPage(options: {
     return true;
   };
 
-  const resolveCredential = (
-    field: PluginSettingsField,
-  ): PluginCredentialEditorProps | undefined => {
+  const resolveCredential: PluginSettingsEditorProps["resolveCredential"] = (field) => {
     const detail = state.detail;
     const descriptor = detail?.inspection?.credentials?.find(
       (entry) =>
@@ -178,6 +177,7 @@ export function createPluginsPage(options: {
         baseHash: runtime.state.configSnapshot?.hash ?? null,
         gateway,
         canInspect: hasOperatorAdminAccess(context.gateway.snapshot.hello?.auth ?? null),
+        getPresentationLifetime: () => credentialPresentation.lifetime,
         // Awaited writes and discards can settle before the presentation catches up.
         get saveError() {
           return runtime.state.lastError;
@@ -194,6 +194,17 @@ export function createPluginsPage(options: {
     };
   };
 
+  const canMutate = () => state.result?.mutationAllowed === true && accessBlockedReason() === null;
+
+  const mutationPresentation = createPluginsMutationPresentation({
+    gateway,
+    read,
+    isActive: () => active,
+    lifetime: () => credentialPresentation.lifetime,
+    catalog,
+    setMessage,
+  });
+
   const consent = createPluginsConsent({
     gateway,
     getContext: () => context,
@@ -207,6 +218,7 @@ export function createPluginsPage(options: {
     closeDetails: skillPreview.close,
     applyMutationResult,
     refreshCatalogAfterMutation: refreshCatalog,
+    presentMutation: mutationPresentation.present,
     onChange: publish,
   });
   const catalogTask = createPageRequest(publish, {
@@ -220,12 +232,6 @@ export function createPluginsPage(options: {
     },
     onError: (error) => setState({ error: formatUiError(error) }),
   });
-  onCleanup(() => {
-    catalogTask.cancel();
-    details.inspection.release();
-    details.catalog.release();
-  });
-
   onSettled(() => {
     let configAutoSaveStatus = runtime.state.configAutoSaveStatus;
     // Preserve saving-to-saved receipts so plugin edits refresh the catalog even within one render turn.
@@ -250,6 +256,7 @@ export function createPluginsPage(options: {
       surface = nextSurface;
       gateway.refresh();
       if (previous !== routeData) {
+        credentialPresentation.retire();
         skillPreview.close();
         if (previous?.location.pathname !== routeData?.location.pathname) {
           installRequestGeneration += 1;
@@ -280,6 +287,9 @@ export function createPluginsPage(options: {
     return () => {
       stopKeydown();
       active = false;
+      catalogTask.cancel();
+      details.inspection.release();
+      details.catalog.release();
       icons.reset();
       gateway.dispose();
     };
@@ -440,6 +450,7 @@ export function createPluginsPage(options: {
   }
 
   function invalidateRequests(invalidateCatalog: boolean, retirePresentation = true) {
+    credentialPresentation.retire();
     details.inspection.reset();
     details.catalog.reset();
     mcpLogin.reset();
@@ -487,9 +498,7 @@ export function createPluginsPage(options: {
     }
   }
 
-  function loading(): boolean {
-    return gateway.connected && (!routeDataConsumed || catalogTask.pending);
-  }
+  const loading = () => gateway.connected && (!routeDataConsumed || catalogTask.pending);
 
   function activeRoutePluginId(): string | null {
     const pathname = routeData?.location.pathname ?? "";
@@ -553,12 +562,6 @@ export function createPluginsPage(options: {
     return catalogId ? showCatalogDetail(catalogId) : discovery.refresh();
   }
 
-  function selectHubTab(tab: PluginsHubTab) {
-    if (tab !== "plugins" || surface !== "discovery") {
-      context.navigate(tab);
-    }
-  }
-
   function accessBlockedReason(
     mutationAllowed?: boolean,
     connected = gateway.connected,
@@ -568,10 +571,6 @@ export function createPluginsPage(options: {
       hasAdminAccess: hasOperatorAdminAccess(context.gateway.snapshot.hello?.auth ?? null),
       mutationAllowed,
     });
-  }
-
-  function canMutate(): boolean {
-    return state.result?.mutationAllowed === true && accessBlockedReason() === null;
   }
 
   function canEditConfig(): boolean {
@@ -706,6 +705,8 @@ export function createPluginsPage(options: {
   }
   return {
     read,
+    presentedEnabled: mutationPresentation.enabled,
+    mutationSaving: mutationPresentation.saving,
     get state() {
       return read();
     },
@@ -739,7 +740,6 @@ export function createPluginsPage(options: {
     detailRead: details.catalog,
     setState,
     refreshCatalog,
-    selectHubTab,
     accessBlockedReason,
     canMutate,
     canEditConfig,

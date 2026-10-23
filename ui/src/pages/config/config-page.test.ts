@@ -2,11 +2,13 @@
 
 import { createRouter, definePage } from "@openclaw/uirouter";
 import { createComponent } from "solid-js";
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, onTestFinished, vi } from "vitest";
 import { createDeferred as deferred } from "../../../../test/helpers/promise.js";
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
 import type { SolidRouteProps } from "../../app-route-types.tsx";
+import { createApplicationTheme } from "../../app/bootstrap-theme.ts";
 import type { ApplicationContext } from "../../app/context.ts";
+import { createNativeDeviceSettingsCapability } from "../../app/native-device-settings.ts";
 import { mountRouterOutlet } from "../../app/router-outlet.test-support.tsx";
 import { changedServerUiPrefs } from "../../app/server-prefs-intent.ts";
 import { canSyncAppearancePreference } from "../../app/server-prefs-profile-runtime.ts";
@@ -28,6 +30,7 @@ import {
   waitForRenderedModalDialog,
 } from "../../test-helpers/modal-dialog.ts";
 import { cleanupSolid } from "../../test-helpers/mount-solid.ts";
+import { createNativeDeviceSettingsSnapshot } from "../../test-helpers/native-device-settings.ts";
 import { createSolidApplicationContextProvider } from "../../test-helpers/solid-application-context.tsx";
 import { flush, waitForSolid } from "../../test-helpers/solid-settle.ts";
 import { createStorageMock } from "../../test-helpers/storage.ts";
@@ -51,6 +54,17 @@ function configContext(overrides: object = {}) {
     gateway: { snapshot: { phase: "disconnected" } },
     ...overrides,
   } as unknown as ApplicationContext;
+}
+
+function stubCameraDevices() {
+  vi.stubGlobal("navigator", {
+    mediaDevices: Object.assign(new EventTarget(), {
+      enumerateDevices: vi
+        .fn()
+        .mockResolvedValue([{ kind: "videoinput", deviceId: "camera-1", label: "Desk Camera" }]),
+      getUserMedia: vi.fn(),
+    }),
+  });
 }
 
 const auth = (scopes = ["operator.admin"]) => ({ role: "operator", scopes });
@@ -90,6 +104,10 @@ async function loadProfile(configObject: object, entries: Record<string, string>
   const client = {
     request: vi.fn(async () => ({ status: "ok", entries })),
   } as unknown as GatewayBrowserClient;
+  const context = completeConfigContext(profileContext(scope, profileId, configObject));
+  const theme = createApplicationTheme(loadSettings(scope), context.gateway);
+  Object.assign(context, { theme });
+  onTestFinished(() => theme.dispose());
   await refreshProfileAppearancePrefs({
     configObject,
     scope,
@@ -97,7 +115,6 @@ async function loadProfile(configObject: object, entries: Record<string, string>
     onApplied: vi.fn(),
     client,
   });
-  const context = profileContext(scope, profileId, configObject);
   const previous = loadSettings();
   const props = mountConfigPageState(context).state.configProps;
   return { context, previous, props };
@@ -236,10 +253,11 @@ it.each([
 
 it("restores the gateway appearance default while queuing deletion of the profile override", async () => {
   const configObject = { ui: { prefs: { theme: "dash" } } };
-  const { props, previous } = await loadProfile(configObject, { "ui.theme": "knot" });
+  const { context, props, previous } = await loadProfile(configObject, { "ui.theme": "knot" });
   props().setTheme("dash");
 
   expect(loadSettings().theme).toBe("dash");
+  expect(context.theme.settings.theme).toBe("dash");
   expect(changedServerUiPrefs(previous, loadSettings())).toEqual({
     theme: null,
     accent: "theme",
@@ -313,8 +331,8 @@ it("resets the fontUi profile override when its picker sentinel is selected", as
   const { context, props, previous } = await loadProfile({}, { "ui.fontUi": "lora" });
   props().setFontUi(undefined);
   expect(loadSettings().fontUi).toBeUndefined();
+  expect(context.theme.settings.fontUi).toBeUndefined();
   expect(changedServerUiPrefs(previous, loadSettings())).toEqual({ fontUi: null });
-  expect(context.theme.refresh).toHaveBeenCalledOnce();
 });
 
 it("uses the committed snapshot for both display and reset while the form draft differs", async () => {
@@ -499,7 +517,13 @@ it("persists only confirmed camera selections and ignores superseded failures", 
     .mockResolvedValueOnce(undefined)
     .mockRejectedValueOnce(new Error("Another camera error"))
     .mockResolvedValueOnce(undefined);
-  const context = configContext({ theme: { refresh: vi.fn() } });
+  const context = completeConfigContext(configContext());
+  const theme = createApplicationTheme(
+    loadSettings(context.gateway.connection.gatewayUrl),
+    context.gateway,
+  );
+  Object.assign(context, { theme });
+  onTestFinished(() => theme.dispose());
   const { state } = mountConfigPageState(context);
   const props = state.configProps;
 
@@ -507,7 +531,7 @@ it("persists only confirmed camera selections and ignores superseded failures", 
     "The selected camera is unavailable",
   );
   expect(loadSettings().realtimeTalkVideoDeviceId).toBeUndefined();
-  expect(context.theme.refresh).not.toHaveBeenCalled();
+  expect(theme.settings.realtimeTalkVideoDeviceId).toBeUndefined();
 
   const superseded = props().onCameraSelect?.("slow-camera");
   await props().onCameraSelect?.("back-camera");
@@ -515,13 +539,13 @@ it("persists only confirmed camera selections and ignores superseded failures", 
   flush();
   expect(props().camera?.selectedDeviceId).toBe("back-camera");
   expect(loadSettings().realtimeTalkVideoDeviceId).toBe("back-camera");
-  expect(context.theme.refresh).toHaveBeenCalledOnce();
+  expect(theme.settings.realtimeTalkVideoDeviceId).toBe("back-camera");
   first.reject(new Error("The selected camera is unavailable"));
   await first.promise.catch(() => undefined);
   flush();
   await expect(props().camera?.selection).resolves.toBeUndefined();
   expect(loadSettings().realtimeTalkVideoDeviceId).toBe("back-camera");
-  expect(context.theme.refresh).toHaveBeenCalledOnce();
+  expect(theme.settings.realtimeTalkVideoDeviceId).toBe("back-camera");
 
   await expect(props().onCameraSelect?.("another-missing-camera")).rejects.toThrow(
     "Another camera error",
@@ -530,6 +554,7 @@ it("persists only confirmed camera selections and ignores superseded failures", 
   flush();
   expect(props().camera?.selectedDeviceId).toBe("");
   expect(loadSettings().realtimeTalkVideoDeviceId).toBeUndefined();
+  expect(theme.settings.realtimeTalkVideoDeviceId).toBeUndefined();
 });
 
 it("keeps the camera select mounted through pending, rejected, and retried selections", async () => {
@@ -540,17 +565,8 @@ it("keeps the camera select mounted through pending, rejected, and retried selec
     .mockReturnValueOnce(pending.promise)
     .mockReturnValueOnce(retry.promise)
     .mockReturnValueOnce(recovery.promise);
-  vi.stubGlobal("navigator", {
-    mediaDevices: Object.assign(new EventTarget(), {
-      enumerateDevices: vi
-        .fn()
-        .mockResolvedValue([{ kind: "videoinput", deviceId: "camera-1", label: "Desk Camera" }]),
-      getUserMedia: vi.fn(),
-    }),
-  });
-  const { container } = mountConfigPage(configContext({ theme: { refresh: vi.fn() } }), {
-    pageId: "appearance",
-  });
+  stubCameraDevices();
+  const { container } = mountConfigPage(configContext(), { pageId: "appearance" });
   const select = container.querySelector<HTMLSelectElement>("[data-settings-camera]")!;
   await waitForSolid(() => expect(select.options).toHaveLength(2));
   select.focus();
@@ -586,17 +602,8 @@ it("keeps the camera select mounted through pending, rejected, and retried selec
 it("leaves Appearance while a camera selection is unresolved", async () => {
   const pending = deferred();
   switchActiveRealtimeTalkCameras.mockReturnValueOnce(pending.promise);
-  vi.stubGlobal("navigator", {
-    mediaDevices: Object.assign(new EventTarget(), {
-      enumerateDevices: vi
-        .fn()
-        .mockResolvedValue([{ kind: "videoinput", deviceId: "camera-1", label: "Desk Camera" }]),
-      getUserMedia: vi.fn(),
-    }),
-  });
-  const view = mountConfigPage(configContext({ theme: { refresh: vi.fn() } }), {
-    pageId: "appearance",
-  });
+  stubCameraDevices();
+  const view = mountConfigPage(configContext(), { pageId: "appearance" });
   const select = view.container.querySelector<HTMLSelectElement>("[data-settings-camera]")!;
   await waitForSolid(() => expect(select.options).toHaveLength(2));
   select.value = "camera-1";
@@ -618,17 +625,44 @@ it("leaves Appearance while a camera selection is unresolved", async () => {
   expect(view.container.querySelector("[data-settings-camera]")).toBeNull();
 });
 
+it("leaves Talk while a native voice edit is unresolved and still accepts its outcome", async () => {
+  const snapshot = createNativeDeviceSettingsSnapshot();
+  const pending = Promise.withResolvers<unknown>();
+  const post = vi
+    .fn<(message: { type: string }) => Promise<unknown>>()
+    .mockResolvedValue(undefined);
+  vi.stubGlobal("webkit", { messageHandlers: { openclawDeviceSettings: { postMessage: post } } });
+  vi.stubGlobal("__OPENCLAW_NATIVE_DEVICE_SETTINGS__", snapshot);
+  const capability = createNativeDeviceSettingsCapability()!;
+  const view = mountConfigPage(configContext({ nativeDeviceSettings: capability }), {
+    pageId: "talk",
+  });
+  try {
+    const wake = view.container.querySelector<HTMLInputElement>('input[type="checkbox"]')!;
+    post.mockReturnValueOnce(pending.promise);
+    wake.click();
+    await waitForSolid(() => expect(view.container.textContent).toContain("Saving"));
+    expect(capability.snapshot?.voice.wakeEnabled).toBe(false);
+
+    view.update({ pageId: "notifications" });
+    await waitForSolid(() => {
+      expect(view.container.querySelector("h1")?.textContent).toBe("Notifications");
+      expect(view.container.querySelector("openclaw-talk-settings")).toBeNull();
+    });
+    const accepted = structuredClone(snapshot);
+    accepted.voice.wakeEnabled = true;
+    pending.resolve(accepted);
+    await waitForSolid(() => expect(capability.snapshot?.voice.wakeEnabled).toBe(true));
+    expect(view.container.querySelector("h1")?.textContent).toBe("Notifications");
+  } finally {
+    capability.dispose();
+  }
+});
+
 it("leaves the settings route before a camera switch settles and still records its outcome", async () => {
   const pending = deferred();
   switchActiveRealtimeTalkCameras.mockReturnValueOnce(pending.promise);
-  vi.stubGlobal("navigator", {
-    mediaDevices: Object.assign(new EventTarget(), {
-      enumerateDevices: vi
-        .fn()
-        .mockResolvedValue([{ kind: "videoinput", deviceId: "camera-1", label: "Desk Camera" }]),
-      getUserMedia: vi.fn(),
-    }),
-  });
+  stubCameraDevices();
   const appearance = pages.find((page) => page.id === "appearance");
   if (!appearance || appearance.id !== "appearance") {
     throw new Error("Missing Appearance route");
