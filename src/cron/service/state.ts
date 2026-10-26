@@ -361,18 +361,18 @@ export type CronJobPolicyContext = {
 export type CronServiceState = {
   deps: CronServiceDepsInternal;
   store: CronStoreFile | null;
-  /** Read facts share one generation across committed and scheduler-local mutations. */
+  /** Worker publications replace the source rows or advance the store revision. */
   readSnapshot?: {
     storeRevision: number;
     source: CronJob[] | undefined;
     status: CronStatusSummary;
-    list?: {
+    lists: {
       filteredJobs: CronJob[];
       sortBy: CronJobsSortBy;
       sortDir: CronSortDir;
       jobs: CronJob[];
       snapshotRevision: string;
-    };
+    }[];
     /** Requested rows are detached and frozen once for this list generation. */
     readJobs: WeakMap<CronJob, CronJob>;
   };
@@ -538,6 +538,7 @@ export type CronAddOptions = {
   /** Captured source digest of the admitting plugin instance; enables restart continuity. */
   pluginCommandSourceDigest?: string;
   operatorSource?: NonNullable<CronStoredJob["operatorSource"]>["source"];
+  operatorSourceExecutionRevision?: string;
   inferenceBinding?: CronStoredJob["inferenceBinding"];
   sourceConversation?: CronStoredJob["sourceConversation"];
   /** Logical sandbox target captured from the admitted creator, never public input. */
@@ -570,6 +571,8 @@ export type CronUpdateInput = CronJobPatch;
 /** Authenticated caller provenance used only when a tool policy is explicitly adopted. */
 export type CronUpdateOptions = Pick<
   CronAddOptions,
+  | "operatorSource"
+  | "operatorSourceExecutionRevision"
   | "toolsAllowProvenance"
   | "toolsAllowExecTarget"
   | "commitGuard"
@@ -580,6 +583,8 @@ export type CronUpdateOptions = Pick<
   | "streamSandbox"
   | "sessionEntryCurrent"
 > & {
+  /** Parent incarnation recorded by `automations bind`; only fills an absent link. */
+  bindSourceConversation?: NonNullable<CronStoredJob["sourceConversation"]>;
   /** Null forbids policy adoption; undefined retains in-process operator defaults. */
   scheduledToolPolicy?: CronScheduledToolPolicy | null;
 };
