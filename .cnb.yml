@@ -53,13 +53,13 @@ avwq_dev:
           image: cnbcool/knowledge-base
           settings:
             include: '**/*.md,**/*.mdx,**/*.pdf,**/*.docx,**/*.txt'
-  "crontab: 25 0 * * *":
+  "crontab: 25 2 * * 0":
     - docker:
         image: node:22
       services:
         - docker
       stages:
-        - name: daily docker build & push
+        - name: weekly docker build & push
           env:
             IMAGE: ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}
           script: |
