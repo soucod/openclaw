@@ -197,6 +197,7 @@ const repositoryScriptEntries = [
   "scripts/perf/subagent-maintenance-capture-measure.ts!",
   "scripts/perf/subagent-sweep-measure.ts!",
   "scripts/perf/tool-schema-preparation-measure.ts!",
+  "scripts/perf/terminal-assistant-snapshot-measure.ts!",
   // Retained source commands and selectable preloads execute directly by exact path.
   "scripts/perf/after-turn-context-measure.ts!",
   "scripts/perf/agent-runtime-dispatch-measure.ts!",
@@ -223,6 +224,7 @@ const repositoryScriptEntries = [
   "scripts/perf/session-catalog-pairing-measure.ts!",
   "scripts/perf/session-involvement-measure.ts!",
   "scripts/perf/sqlite-native-lease-measure.mjs!",
+  "scripts/perf/agent-db-close-receipt-measure.mjs!",
   "scripts/perf/sqlite-owner-dispatch-measure.mjs!",
   "scripts/perf/sqlite-wal-scan-measure.mjs!",
   "scripts/perf/state-engine-schema-bench.ts!",
@@ -254,6 +256,8 @@ const repositoryScriptEntries = [
   "scripts/perf/provider-request-prepare-measure.ts!",
   // Invoked directly with Node as documented in its header.
   "scripts/perf/attempt-stream-options-measure.ts!",
+  "scripts/perf/attempt-prompt-context-measure.ts!",
+  "scripts/perf/current-prompt-history-measure.ts!",
   "scripts/perf/session-profile-reference-measure.ts!",
   "scripts/perf/worker-task-metrics-measure.ts!",
   // scripts/perf/README.md invokes this worker protocol benchmark by path.
@@ -488,6 +492,7 @@ const repositoryScriptEntries = [
   "scripts/perf/quadratic-report-measure.ts!",
   "scripts/perf/reef-device-sign-measure.ts!",
   "scripts/perf/session-actor-admission-measure.ts!",
+  "scripts/perf/session-input-custody-measure.ts!",
   "scripts/perf/session-pin-policy-measure.ts!",
   "scripts/perf/session-prompt-begin-measure.ts!",
   "scripts/perf/session-store-target-inventory-measure.ts!",
@@ -696,6 +701,7 @@ const repositoryScriptEntries = [
   "scripts/perf/operator-model-policy-measure.ts!",
   "scripts/perf/provider-rate-limit-retention.ts!",
   "scripts/perf/provider-rate-limit-stream-measure.ts!",
+  "scripts/perf/provider-error-projection-measure.mjs!",
   "scripts/perf/session-cost-refresh-measure.ts!",
   "scripts/perf/sqlite-operation-receive-measure.ts!",
   "scripts/perf/tool-search-lexical-measure.ts!",
@@ -712,6 +718,7 @@ const repositoryScriptEntries = [
   "scripts/perf/session-transcript-code-measure.mjs!",
   "scripts/perf/stall-recorder-cost-preload.mjs!",
   "scripts/perf/trajectory-preparation-retention.ts!",
+  "scripts/perf/usage-cache-write-measure.ts!",
   "scripts/perf/transcript-session-list-measure.ts!",
   "scripts/perf/transport-pull-allocation-measure.mjs!",
   // Source headers and maintained benchmark contributions invoke these workloads by exact path.
