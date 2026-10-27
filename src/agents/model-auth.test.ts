@@ -39,12 +39,9 @@ vi.mock("../plugins/setup-registry.js", () => ({
 }));
 
 // mock-isolation: Synthetic auth and SecretRef fixtures supply provider hooks; external discovery would alter credential precedence.
-vi.mock("../plugins/provider-external-auth-core.js", () => ({
-  createProviderExternalAuthResolver: () => ({
-    resolveExternalAuthProfilesWithPlugins: () => [],
-    withPreparedExternalAuthProfiles: async <T>(_params: unknown, run: () => Promise<T>) => run(),
-  }),
-}));
+vi.mock("../plugins/provider-external-auth-core.js", async () =>
+  (await import("../plugins/provider-external-auth.test-support.js")).createExternalAuthMock(),
+);
 
 vi.mock("../plugins/provider-runtime.js", () => {
   const providerRuntime = {
@@ -313,7 +310,7 @@ describe("resolveModelAuthMode", () => {
   });
 
   it("returns oauth for codex when Codex CLI auth is available", () => {
-    const readCodexCliCredentialsCached = vi
+    using readCodexCliCredentialsCached = vi
       .spyOn(cliCredentials, "readCodexCliCredentialsCached")
       .mockReturnValue({
         type: "oauth",
@@ -323,15 +320,11 @@ describe("resolveModelAuthMode", () => {
         expires: Date.now() + 60_000,
       });
 
-    try {
-      expect(resolveModelAuthMode("codex", undefined, authStore({}))).toBe("oauth");
-      expect(readCodexCliCredentialsCached).toHaveBeenCalledWith({
-        ttlMs: 5_000,
-        allowKeychainPrompt: false,
-      });
-    } finally {
-      readCodexCliCredentialsCached.mockRestore();
-    }
+    expect(resolveModelAuthMode("codex", undefined, authStore({}))).toBe("oauth");
+    expect(readCodexCliCredentialsCached).toHaveBeenCalledWith({
+      ttlMs: 5_000,
+      allowKeychainPrompt: false,
+    });
   });
 });
 
