@@ -23,6 +23,7 @@
         OPENCLAW_VERSION=$(npm view openclaw version --registry "https://npm.cnb.cool/soucod-github/npm-soucod-github-public/-/packages/")
         echo "openclaw version: $OPENCLAW_VERSION"
         docker buildx build \
+          --build-arg OPENCLAW_DOCKER_BUILD_TSDOWN_MAX_OLD_SPACE_MB=6192 \
           -t "${IMAGE}:${OPENCLAW_VERSION}" \
           -t "${IMAGE}:latest" \
           --push .
@@ -66,6 +67,7 @@ avwq_dev:
             echo "openclaw version: $OPENCLAW_VERSION"
             if ! docker pull "${IMAGE}:${OPENCLAW_VERSION}"; then
               docker buildx build \
+                --build-arg OPENCLAW_DOCKER_BUILD_TSDOWN_MAX_OLD_SPACE_MB=6192 \
                 -t "${IMAGE}:${OPENCLAW_VERSION}" \
                 -t "${IMAGE}:latest" \
                 --push .
