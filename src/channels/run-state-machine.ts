@@ -1,7 +1,8 @@
-export type RunStateStatusPatch = {
+type RunStateStatusPatch = {
   busy?: boolean;
   activeRuns?: number;
   lastRunActivityAt?: number | null;
+  activeRunStartedAt?: number | null;
 };
 
 export type RunStateStatusSink = (patch: RunStateStatusPatch) => void;
@@ -34,10 +35,7 @@ export function createRunStateMachine(params: RunStateMachineParams) {
   };
 
   const clearHeartbeat = () => {
-    if (!runActivityHeartbeat) {
-      return;
-    }
-    clearInterval(runActivityHeartbeat);
+    clearInterval(runActivityHeartbeat ?? undefined);
     runActivityHeartbeat = null;
   };
 
@@ -45,29 +43,19 @@ export function createRunStateMachine(params: RunStateMachineParams) {
     if (runActivityHeartbeat || activeRuns <= 0 || !lifecycleActive) {
       return;
     }
-    runActivityHeartbeat = setInterval(() => {
-      if (!lifecycleActive || activeRuns <= 0) {
-        clearHeartbeat();
-        return;
-      }
-      publish();
-    }, heartbeatMs);
-    runActivityHeartbeat.unref?.();
+    runActivityHeartbeat = setInterval(publish, heartbeatMs).unref();
   };
 
   const deactivate = () => {
     lifecycleActive = false;
     clearHeartbeat();
-  };
-
-  const onAbort = () => {
-    deactivate();
+    params.abortSignal?.removeEventListener("abort", deactivate);
   };
 
   if (params.abortSignal?.aborted) {
-    onAbort();
+    deactivate();
   } else {
-    params.abortSignal?.addEventListener("abort", onAbort, { once: true });
+    params.abortSignal?.addEventListener("abort", deactivate, { once: true });
   }
 
   if (lifecycleActive) {

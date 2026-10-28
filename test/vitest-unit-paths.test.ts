@@ -1,21 +1,61 @@
+// Vitest unit path tests validate unit test include and exclude paths.
+import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { isUnitConfigTestFile } from "../vitest.unit-paths.mjs";
+import {
+  filterUnitConfigTestFiles,
+  isUnitConfigTestFile,
+  unitTestAdditionalExcludePatterns,
+  unitTestIncludePatterns,
+} from "./vitest/vitest.unit-paths.mjs";
 
 describe("isUnitConfigTestFile", () => {
-  it("accepts unit-config src, test, and whitelisted ui tests", () => {
-    expect(isUnitConfigTestFile("src/infra/git-commit.test.ts")).toBe(true);
-    expect(isUnitConfigTestFile("test/format-error.test.ts")).toBe(true);
-    expect(isUnitConfigTestFile("ui/src/ui/views/chat.test.ts")).toBe(true);
+  it("retains the runtime's hidden-file ownership in bulk and singleton discovery", () => {
+    const file = "src/.hidden-fixture.test.ts";
+    const included = path.matchesGlob(file, "src/**/*.test.ts");
+    expect(filterUnitConfigTestFiles([file])).toEqual(included ? [file] : []);
+    expect(isUnitConfigTestFile(file)).toBe(included);
   });
 
-  it("rejects files excluded from the unit config", () => {
+  it("keeps bulk unit discovery ordered with shared exclusions", () => {
+    const packageFile = "packages/plugin-package-contract/src/index.test.ts";
+    const sourceFile = "src/unowned-fixture.test.ts";
     expect(
-      isUnitConfigTestFile("extensions/imessage/src/monitor.shutdown.unhandled-rejection.test.ts"),
-    ).toBe(false);
-    expect(isUnitConfigTestFile("src/agents/pi-embedded-runner.test.ts")).toBe(false);
-    expect(isUnitConfigTestFile("src/commands/onboard.test.ts")).toBe(false);
-    expect(isUnitConfigTestFile("ui/src/ui/views/other.test.ts")).toBe(false);
-    expect(isUnitConfigTestFile("src/infra/git-commit.live.test.ts")).toBe(false);
-    expect(isUnitConfigTestFile("src/infra/git-commit.e2e.test.ts")).toBe(false);
+      filterUnitConfigTestFiles([
+        packageFile,
+        "src/state/openclaw-database-verify.process.test.ts",
+        sourceFile,
+        "src/unowned-fixture.live.test.ts",
+        "src/unowned-fixture.e2e.test.ts",
+        "src/vendor/unowned-fixture.test.ts",
+        packageFile,
+      ]),
+    ).toEqual([packageFile, sourceFile, packageFile]);
+  });
+
+  it("preserves native exclusions for noncanonical paths in bulk and singleton discovery", () => {
+    const included = "src/unowned-fixture.test.ts";
+    const excluded = "src/state/openclaw-database-verify.process.test.ts";
+    const files = [
+      included,
+      excluded,
+      `./${excluded}`,
+      excluded.replace("/state/", "//state/"),
+      excluded.replace("/state/", "/state/./"),
+      excluded.replace("/state/", "/state/../state/"),
+      excluded.replaceAll("/", "\\"),
+      excluded.toUpperCase(),
+      included,
+    ];
+    const expected = files.filter((file) => {
+      const normalized = file.split(path.sep).join("/");
+      return (
+        unitTestIncludePatterns.some((pattern) => path.matchesGlob(normalized, pattern)) &&
+        !unitTestAdditionalExcludePatterns.some((pattern) => path.matchesGlob(normalized, pattern))
+      );
+    });
+    expect(filterUnitConfigTestFiles(files)).toEqual(expected);
+    for (const file of files) {
+      expect(isUnitConfigTestFile(file)).toBe(expected.includes(file));
+    }
   });
 });

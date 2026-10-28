@@ -1,138 +1,83 @@
+// Plugin install plan tests cover install planning for local, registry, and bundled plugins.
+import { installedPluginRoot } from "openclaw/plugin-sdk/test-fixtures";
 import { describe, expect, it, vi } from "vitest";
-import { PLUGIN_INSTALL_ERROR_CODE } from "../plugins/install.js";
 import {
   resolveBundledInstallPlanForCatalogEntry,
-  resolveBundledInstallPlanBeforeNpm,
-  resolveBundledInstallPlanForNpmFailure,
-} from "./plugin-install-plan.js";
+  resolvePluginInstallSourcePlan,
+} from "../plugins/install-source-plan.js";
+import { resolveCatalogOfficialExternalNpmPackageTrust } from "../plugins/official-external-install-trust.js";
 
 describe("plugin install plan helpers", () => {
-  it("prefers bundled plugin for bare plugin-id specs", () => {
-    const findBundledSource = vi.fn().mockReturnValue({
-      pluginId: "voice-call",
-      localPath: "/tmp/extensions/voice-call",
-      npmSpec: "@openclaw/voice-call",
-    });
-
-    const result = resolveBundledInstallPlanBeforeNpm({
-      rawSpec: "voice-call",
-      findBundledSource,
-    });
-
-    expect(findBundledSource).toHaveBeenCalledWith({ kind: "pluginId", value: "voice-call" });
-    expect(result?.bundledSource.pluginId).toBe("voice-call");
-    expect(result?.warning).toContain('bare install spec "voice-call"');
-  });
-
-  it("skips bundled pre-plan for scoped npm specs", () => {
-    const findBundledSource = vi.fn();
-    const result = resolveBundledInstallPlanBeforeNpm({
-      rawSpec: "@openclaw/voice-call",
-      findBundledSource,
-    });
-
-    expect(findBundledSource).not.toHaveBeenCalled();
-    expect(result).toBeNull();
-  });
-
-  it("prefers bundled catalog plugin by id before npm spec", () => {
-    const findBundledSource = vi
-      .fn()
-      .mockImplementation(({ kind, value }: { kind: "pluginId" | "npmSpec"; value: string }) => {
-        if (kind === "pluginId" && value === "voice-call") {
-          return {
-            pluginId: "voice-call",
-            localPath: "/tmp/extensions/voice-call",
-            npmSpec: "@openclaw/voice-call",
-          };
-        }
-        return undefined;
+  it.each([" ClAwHuB:demo@ "])(
+    "rejects the malformed explicit ClawHub selector %s before npm fallback",
+    (raw) => {
+      expect(resolvePluginInstallSourcePlan({ raw, mode: "install" })).toEqual({
+        ok: false,
+        error: `Unsupported ClawHub plugin spec: ${raw}`,
       });
+    },
+  );
 
-    const result = resolveBundledInstallPlanForCatalogEntry({
-      pluginId: "voice-call",
-      npmSpec: "@openclaw/voice-call",
-      findBundledSource,
-    });
-
-    expect(findBundledSource).toHaveBeenCalledWith({ kind: "pluginId", value: "voice-call" });
-    expect(result?.bundledSource.localPath).toBe("/tmp/extensions/voice-call");
+  it("keeps explicit npm specs with local-looking suffixes on the registry path", () => {
+    expect(resolvePluginInstallSourcePlan({ raw: "npm:plugin.js", mode: "install" })).toMatchObject(
+      {
+        ok: true,
+        request: { source: "npm", spec: "plugin.js" },
+      },
+    );
   });
 
-  it("rejects npm-spec matches that resolve to a different plugin id", () => {
-    const findBundledSource = vi
-      .fn()
-      .mockImplementation(({ kind }: { kind: "pluginId" | "npmSpec"; value: string }) => {
-        if (kind === "npmSpec") {
-          return {
-            pluginId: "not-voice-call",
-            localPath: "/tmp/extensions/not-voice-call",
-            npmSpec: "@openclaw/voice-call",
-          };
-        }
-        return undefined;
-      });
+  it("trusts exact official external npm packages without remapping the spec", () => {
+    const result = resolveCatalogOfficialExternalNpmPackageTrust(
+      "@wecom/wecom-openclaw-plugin@2026.7.2",
+    );
 
-    const result = resolveBundledInstallPlanForCatalogEntry({
-      pluginId: "voice-call",
-      npmSpec: "@openclaw/voice-call",
-      findBundledSource,
+    expect(result).toEqual({
+      pluginId: "wecom-openclaw-plugin",
+      expectedIntegrity:
+        "sha512-7kqdBIOF3SgDDoBoFtO6jxnxofbYSgbKdxZDNabD0y0jg2xKcVqlXZOOJ9+XQho/QOtIFrnRH2IRnPukFEYwJg==",
+      trustedSourceLinkedOfficialInstall: true,
     });
+  });
+
+  it("does not trust npm package names outside the official external catalog", () => {
+    const result = resolveCatalogOfficialExternalNpmPackageTrust("@acme/outside@1.0.0");
 
     expect(result).toBeNull();
   });
 
-  it("rejects plugin-id bundled matches when the catalog npm spec was overridden", () => {
+  it.each([
+    [
+      "rejects npm-spec matches that resolve to a different plugin id",
+      "npmSpec",
+      { pluginId: "voice-call", npmSpec: "@openclaw/voice-call" },
+      { pluginId: "not-voice-call", npmSpec: "@openclaw/voice-call" },
+    ],
+    [
+      "rejects plugin-id bundled matches when the catalog npm spec was overridden",
+      "pluginId",
+      { pluginId: "whatsapp", npmSpec: "@vendor/whatsapp-fork" },
+      { pluginId: "whatsapp", npmSpec: "@openclaw/whatsapp" },
+    ],
+  ] as const)("%s", (_name, matchKind, catalog, bundled) => {
     const findBundledSource = vi
       .fn()
       .mockImplementation(({ kind }: { kind: "pluginId" | "npmSpec"; value: string }) => {
-        if (kind === "pluginId") {
+        if (kind === matchKind) {
           return {
-            pluginId: "whatsapp",
-            localPath: "/tmp/extensions/whatsapp",
-            npmSpec: "@openclaw/whatsapp",
+            pluginId: bundled.pluginId,
+            localPath: installedPluginRoot("/tmp", bundled.pluginId),
+            npmSpec: bundled.npmSpec,
           };
         }
         return undefined;
       });
 
     const result = resolveBundledInstallPlanForCatalogEntry({
-      pluginId: "whatsapp",
-      npmSpec: "@vendor/whatsapp-fork",
+      ...catalog,
       findBundledSource,
     });
 
-    expect(result).toBeNull();
-  });
-
-  it("uses npm-spec bundled fallback only for package-not-found", () => {
-    const findBundledSource = vi.fn().mockReturnValue({
-      pluginId: "voice-call",
-      localPath: "/tmp/extensions/voice-call",
-      npmSpec: "@openclaw/voice-call",
-    });
-    const result = resolveBundledInstallPlanForNpmFailure({
-      rawSpec: "@openclaw/voice-call",
-      code: PLUGIN_INSTALL_ERROR_CODE.NPM_PACKAGE_NOT_FOUND,
-      findBundledSource,
-    });
-
-    expect(findBundledSource).toHaveBeenCalledWith({
-      kind: "npmSpec",
-      value: "@openclaw/voice-call",
-    });
-    expect(result?.warning).toContain("npm package unavailable");
-  });
-
-  it("skips fallback for non-not-found npm failures", () => {
-    const findBundledSource = vi.fn();
-    const result = resolveBundledInstallPlanForNpmFailure({
-      rawSpec: "@openclaw/voice-call",
-      code: "INSTALL_FAILED",
-      findBundledSource,
-    });
-
-    expect(findBundledSource).not.toHaveBeenCalled();
     expect(result).toBeNull();
   });
 });

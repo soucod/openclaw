@@ -1,104 +1,197 @@
-import { resolveCommandAuthorizedFromAuthorizers } from "openclaw/plugin-sdk/command-auth";
-import {
-  readStoreAllowFromForDmPolicy,
-  resolveDmGroupAccessWithLists,
-  type DmGroupAccessDecision,
-} from "openclaw/plugin-sdk/security-runtime";
-import { normalizeDiscordAllowList, resolveDiscordAllowListMatch } from "./allow-list.js";
+import type {
+  AccessGroupMembershipFact,
+  ChannelIngressEventInput,
+  ChannelIngressContextBinding,
+  IdentifierAuthentication,
+  ChannelIngressIdentitySubjectInput,
+  ResolveChannelMessageIngressParams,
+} from "openclaw/plugin-sdk/channel-ingress-runtime";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import type { RequestClient } from "../internal/discord.js";
+import { getDiscordRuntime } from "../runtime.js";
+import { canViewDiscordGuildChannel } from "../send.permissions.js";
+import { discordIngressIdentity } from "./ingress-identity.js";
 
-const DISCORD_ALLOW_LIST_PREFIXES = ["discord:", "user:", "pk:"];
+const DISCORD_CHANNEL_ID = "discord";
 
 export type DiscordDmPolicy = "open" | "pairing" | "allowlist" | "disabled";
 
-export type DiscordDmCommandAccess = {
-  decision: DmGroupAccessDecision;
-  reason: string;
-  commandAuthorized: boolean;
-  allowMatch: ReturnType<typeof resolveDiscordAllowListMatch> | { allowed: false };
+type DiscordIngressSender = {
+  id: string;
+  name?: string;
+  tag?: string;
+  isPluralKit?: boolean;
+  authorKind?: "user" | "bot";
 };
 
-function resolveSenderAllowMatch(params: {
-  allowEntries: string[];
-  sender: { id: string; name?: string; tag?: string };
-  allowNameMatching: boolean;
-}) {
-  const allowList = normalizeDiscordAllowList(params.allowEntries, DISCORD_ALLOW_LIST_PREFIXES);
-  return allowList
-    ? resolveDiscordAllowListMatch({
-        allowList,
-        candidate: params.sender,
-        allowNameMatching: params.allowNameMatching,
-      })
-    : ({ allowed: false } as const);
-}
-
-function resolveDmPolicyCommandAuthorization(params: {
-  dmPolicy: DiscordDmPolicy;
-  decision: DmGroupAccessDecision;
-  commandAuthorized: boolean;
-}) {
-  if (params.dmPolicy === "open" && params.decision === "allow") {
-    return true;
-  }
-  return params.commandAuthorized;
-}
-
-export async function resolveDiscordDmCommandAccess(params: {
+type DiscordCommandAccessParams = {
   accountId: string;
-  dmPolicy: DiscordDmPolicy;
-  configuredAllowFrom: string[];
-  sender: { id: string; name?: string; tag?: string };
+  sender: DiscordIngressSender;
   allowNameMatching: boolean;
-  useAccessGroups: boolean;
-  readStoreAllowFrom?: () => Promise<string[]>;
-}): Promise<DiscordDmCommandAccess> {
-  const storeAllowFrom = params.readStoreAllowFrom
-    ? await params.readStoreAllowFrom().catch(() => [])
-    : await readStoreAllowFromForDmPolicy({
-        provider: "discord",
-        accountId: params.accountId,
-        dmPolicy: params.dmPolicy,
-      });
+  cfg?: OpenClawConfig;
+  token?: string;
+  rest?: RequestClient;
+  conversationId?: string;
+  conversationParentId?: string;
+  conversationThreadId?: string;
+  contextBinding?: ChannelIngressContextBinding;
+  minIdentifierAuthentication?: IdentifierAuthentication;
+};
 
-  const access = resolveDmGroupAccessWithLists({
-    isGroup: false,
-    dmPolicy: params.dmPolicy,
-    allowFrom: params.configuredAllowFrom,
-    groupAllowFrom: [],
-    storeAllowFrom,
-    isSenderAllowed: (allowEntries) =>
-      resolveSenderAllowMatch({
-        allowEntries,
-        sender: params.sender,
-        allowNameMatching: params.allowNameMatching,
-      }).allowed,
-  });
-
-  const allowMatch = resolveSenderAllowMatch({
-    allowEntries: access.effectiveAllowFrom,
-    sender: params.sender,
-    allowNameMatching: params.allowNameMatching,
-  });
-
-  const commandAuthorized = resolveCommandAuthorizedFromAuthorizers({
-    useAccessGroups: params.useAccessGroups,
-    authorizers: [
-      {
-        configured: access.effectiveAllowFrom.length > 0,
-        allowed: allowMatch.allowed,
-      },
-    ],
-    modeWhenAccessGroupsOff: "configured",
-  });
-
+function createDiscordDmIngressSubject(
+  sender: DiscordIngressSender,
+): ChannelIngressIdentitySubjectInput {
   return {
-    decision: access.decision,
-    reason: access.reason,
-    commandAuthorized: resolveDmPolicyCommandAuthorization({
-      dmPolicy: params.dmPolicy,
-      decision: access.decision,
-      commandAuthorized,
-    }),
-    allowMatch,
+    stableId: sender.id,
+    aliases: {
+      discordUserName: sender.name,
+      discordUserTag: sender.tag,
+      participantKind: sender.isPluralKit ? "pluralkit-member" : sender.authorKind,
+    },
+    // PluralKit replaces Discord's Gateway author id with a member id returned by
+    // its API. The lookup is trusted input, but Discord did not bind that exact id.
+    ...(sender.isPluralKit ? { authentication: { discordUserId: "asserted" as const } } : {}),
   };
+}
+
+function createDiscordDynamicAccessGroupResolver(params: {
+  cfg?: OpenClawConfig;
+  token?: string;
+  rest?: RequestClient;
+}): ResolveChannelMessageIngressParams["resolveAccessGroupMembership"] {
+  if (!params.cfg) {
+    return undefined;
+  }
+  const cfg = params.cfg;
+  return async ({ group, accountId, subject }) => {
+    if (group.type !== "discord.channelAudience") {
+      return false;
+    }
+    const senderId = String(subject.stableId ?? "").trim();
+    if (!senderId) {
+      return false;
+    }
+    const membership = group.membership ?? "canViewChannel";
+    if (membership !== "canViewChannel") {
+      return false;
+    }
+    return await canViewDiscordGuildChannel(group.guildId, group.channelId, senderId, {
+      cfg,
+      accountId,
+      token: params.token,
+      rest: params.rest,
+    });
+  };
+}
+
+function createDiscordIngressResolver(params: {
+  accountId: string;
+  cfg?: OpenClawConfig;
+  token?: string;
+  rest?: RequestClient;
+  readStoreAllowFrom?: ResolveChannelMessageIngressParams["readStoreAllowFrom"];
+  useDefaultPairingStore?: boolean;
+}) {
+  return getDiscordRuntime().channel.inbound.ingress.createResolver({
+    channelId: DISCORD_CHANNEL_ID,
+    accountId: params.accountId,
+    identity: discordIngressIdentity,
+    cfg: params.cfg,
+    resolveAccessGroupMembership: createDiscordDynamicAccessGroupResolver(params),
+    ...(params.readStoreAllowFrom ? { readStoreAllowFrom: params.readStoreAllowFrom } : {}),
+    ...(params.useDefaultPairingStore !== undefined
+      ? { useDefaultPairingStore: params.useDefaultPairingStore }
+      : {}),
+  });
+}
+
+function createDiscordCommandContext(
+  params: DiscordCommandAccessParams,
+  kind: "direct" | "channel",
+  defaultId: string,
+) {
+  return {
+    subject: createDiscordDmIngressSubject(params.sender),
+    conversation: {
+      kind,
+      id: params.conversationId ?? defaultId,
+      parentId: params.conversationParentId,
+      threadId: params.conversationThreadId,
+    },
+    ...(params.contextBinding ? { contextBinding: params.contextBinding } : {}),
+    policy: {
+      mutableIdentifierMatching: params.allowNameMatching
+        ? ("enabled" as const)
+        : ("disabled" as const),
+      ...(params.minIdentifierAuthentication
+        ? { minIdentifierAuthentication: params.minIdentifierAuthentication }
+        : {}),
+    },
+  };
+}
+
+export async function resolveDiscordDmCommandAccess(
+  params: DiscordCommandAccessParams & {
+    dmPolicy: DiscordDmPolicy;
+    configuredAllowFrom: string[];
+    readStoreAllowFrom?: ResolveChannelMessageIngressParams["readStoreAllowFrom"];
+    eventKind?: ChannelIngressEventInput["kind"];
+  },
+) {
+  return await createDiscordIngressResolver({
+    ...params,
+    useDefaultPairingStore: params.readStoreAllowFrom == null,
+  }).message({
+    ...createDiscordCommandContext(params, "direct", params.sender.id),
+    event: {
+      kind: params.eventKind ?? "native-command",
+      authMode: "inbound",
+      mayPair: true,
+    },
+    dmPolicy: params.dmPolicy,
+    groupPolicy: "disabled",
+    allowFrom: params.configuredAllowFrom,
+    command: {
+      hasControlCommand: false,
+      modeWhenAccessGroupsOff: "configured",
+    },
+  });
+}
+
+export async function resolveDiscordTextCommandAccess(
+  params: DiscordCommandAccessParams & {
+    ownerAllowFrom?: string[];
+    memberAccessConfigured: boolean;
+    memberAllowed: boolean;
+    allowTextCommands: boolean;
+    hasControlCommand: boolean;
+  },
+) {
+  const ownerAllowFrom = (params.ownerAllowFrom ?? []).filter((entry) => entry.trim() !== "*");
+  const memberAccessGroup = "discord-member-access";
+  const commandGroup = params.memberAccessConfigured ? [`accessGroup:${memberAccessGroup}`] : [];
+  const accessGroupMembership: AccessGroupMembershipFact[] = params.memberAccessConfigured
+    ? [
+        {
+          groupName: memberAccessGroup,
+          source: "dynamic",
+          ...(params.memberAllowed
+            ? ({ kind: "matched", matchedEntryIds: [memberAccessGroup] } as const)
+            : ({ kind: "not-matched" } as const)),
+        },
+      ]
+    : [];
+  return await createDiscordIngressResolver(params).command({
+    ...createDiscordCommandContext(params, "channel", "discord-command"),
+    accessGroupMembership,
+    dmPolicy: "allowlist",
+    groupPolicy: "allowlist",
+    allowFrom: ownerAllowFrom,
+    groupAllowFrom: commandGroup,
+    command: {
+      allowTextCommands: params.allowTextCommands,
+      hasControlCommand: params.hasControlCommand,
+      modeWhenAccessGroupsOff: "configured",
+    },
+  });
 }

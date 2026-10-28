@@ -1,14 +1,17 @@
-export type OutboundMirror = {
+import type { SessionTranscriptDeliveryMirror } from "../../config/sessions/transcript-mirror.js";
+
+/**
+ * @deprecated Confirmed sends record destination history automatically; removed in the next
+ * Plugin SDK major. Accepted for source compatibility and otherwise ignored.
+ */
+export type DeliveryMirror = {
   sessionKey: string;
   agentId?: string;
   text?: string;
   mediaUrls?: string[];
   idempotencyKey?: string;
-};
-
-export type DeliveryMirror = OutboundMirror & {
-  /** Whether this message is being sent in a group/channel context */
+  expectedSessionId?: string;
+  deliveryMirror?: SessionTranscriptDeliveryMirror;
   isGroup?: boolean;
-  /** Group or channel identifier for correlation with received events */
   groupId?: string;
 };

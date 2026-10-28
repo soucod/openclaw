@@ -1,146 +1,91 @@
-import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import {
-  buildOfficialChannelCatalog,
-  OFFICIAL_CHANNEL_CATALOG_RELATIVE_PATH,
-  writeOfficialChannelCatalog,
-} from "../scripts/write-official-channel-catalog.mjs";
+import { afterEach, assert, beforeEach, describe, expect, it } from "vitest";
+import { buildOfficialChannelCatalog } from "../scripts/write-official-channel-catalog.mts";
+import { normalizeClawHubSha256Integrity } from "../src/infra/clawhub-integrity.js";
+import { describePluginInstallSource } from "../src/plugins/install-source-info.js";
+import { cleanupTempDirs, makeTempDir as makeTempRepoRoot } from "./helpers/temp-dir.js";
+import { writeJsonFile } from "./helpers/temp-repo.js";
 
 const tempDirs: string[] = [];
-
-function makeRepoRoot(prefix: string): string {
-  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-  tempDirs.push(repoRoot);
-  return repoRoot;
-}
-
-function writeJson(filePath: string, value: unknown): void {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-}
-
-afterEach(() => {
-  for (const dir of tempDirs.splice(0, tempDirs.length)) {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
+let repoRoot: string;
+beforeEach(() => {
+  repoRoot = makeTempRepoRoot(tempDirs, "openclaw-channel-catalog-");
 });
 
+type OfficialChannelCatalogEntry = ReturnType<
+  typeof buildOfficialChannelCatalog
+>["entries"][number];
+type OfficialChannelInstall = OfficialChannelCatalogEntry["openclaw"]["install"];
+
+function writeChannelPackage(directory: string, install: OfficialChannelInstall) {
+  writeJsonFile(path.join(repoRoot, "extensions", directory, "package.json"), {
+    name: `@openclaw/${directory}`,
+    openclaw: {
+      channel: { id: directory },
+      install,
+      release: { publishToNpm: true },
+    },
+  });
+  const entry = buildOfficialChannelCatalog({ repoRoot }).entries.find(
+    (candidate) => candidate.openclaw.channel.id === directory,
+  );
+  assert(entry, "expected official channel catalog entry");
+  return entry;
+}
+
+afterEach(() => cleanupTempDirs(tempDirs));
+
 describe("buildOfficialChannelCatalog", () => {
-  it("includes publishable official channel plugins and skips non-publishable entries", () => {
-    const repoRoot = makeRepoRoot("openclaw-official-channel-catalog-");
-    writeJson(path.join(repoRoot, "extensions", "whatsapp", "package.json"), {
-      name: "@openclaw/whatsapp",
-      version: "2026.3.23",
-      description: "OpenClaw WhatsApp channel plugin",
-      openclaw: {
-        channel: {
-          id: "whatsapp",
-          label: "WhatsApp",
-          selectionLabel: "WhatsApp (QR link)",
-          detailLabel: "WhatsApp Web",
-          docsPath: "/channels/whatsapp",
-          blurb: "works with your own number; recommend a separate phone + eSIM.",
-        },
-        install: {
-          npmSpec: "@openclaw/whatsapp",
-          localPath: "extensions/whatsapp",
-          defaultChoice: "npm",
-        },
-        release: {
-          publishToNpm: true,
-        },
-      },
-    });
-    writeJson(path.join(repoRoot, "extensions", "local-only", "package.json"), {
-      name: "@openclaw/local-only",
-      openclaw: {
-        channel: {
-          id: "local-only",
-          label: "Local Only",
-          selectionLabel: "Local Only",
-          docsPath: "/channels/local-only",
-          blurb: "dev only",
-        },
-        install: {
-          localPath: "extensions/local-only",
-        },
-        release: {
-          publishToNpm: false,
-        },
-      },
+  it("keeps third-party official external catalog install sources pinned", () => {
+    const entries = buildOfficialChannelCatalog({ repoRoot }).entries.filter(
+      (entry) => entry.source === "external" && !entry.name?.startsWith("@openclaw/"),
+    );
+
+    expect(entries.length).toBeGreaterThan(0);
+    for (const entry of entries) {
+      const install = entry.openclaw.install;
+      const installSource = describePluginInstallSource(install);
+      expect(installSource.warnings).toStrictEqual([]);
+      if (install.npmSpec) {
+        expect(installSource.npm?.pinState).toBe("exact-with-integrity");
+      } else {
+        expect(installSource.npm).toBeUndefined();
+        expect(installSource.clawhub?.exactVersion).toBe(true);
+        expect(normalizeClawHubSha256Integrity(install.expectedIntegrity ?? "")).not.toBeNull();
+      }
+    }
+  });
+
+  it("allows official OpenClaw channel npm specs without integrity during launch", () => {
+    const twitch = writeChannelPackage("twitch", {
+      npmSpec: "@openclaw/twitch",
+      defaultChoice: "npm",
+      minHostVersion: ">=2026.4.10",
     });
 
-    expect(buildOfficialChannelCatalog({ repoRoot })).toEqual({
-      entries: [
-        {
-          name: "@openclaw/whatsapp",
-          version: "2026.3.23",
-          description: "OpenClaw WhatsApp channel plugin",
-          openclaw: {
-            channel: {
-              id: "whatsapp",
-              label: "WhatsApp",
-              selectionLabel: "WhatsApp (QR link)",
-              detailLabel: "WhatsApp Web",
-              docsPath: "/channels/whatsapp",
-              blurb: "works with your own number; recommend a separate phone + eSIM.",
-            },
-            install: {
-              npmSpec: "@openclaw/whatsapp",
-              localPath: "extensions/whatsapp",
-              defaultChoice: "npm",
-            },
-          },
-        },
-      ],
+    expect(twitch?.name).toBe("@openclaw/twitch");
+    expect(twitch?.openclaw.install).toEqual({
+      npmSpec: "@openclaw/twitch",
+      defaultChoice: "npm",
+      minHostVersion: ">=2026.4.10",
+    });
+    expect(describePluginInstallSource(twitch.openclaw.install)).toMatchObject({
+      npm: { pinState: "floating-without-integrity" },
+      warnings: ["npm-spec-floating", "npm-spec-missing-integrity"],
     });
   });
 
-  it("writes the official catalog under dist", () => {
-    const repoRoot = makeRepoRoot("openclaw-official-channel-catalog-write-");
-    writeJson(path.join(repoRoot, "extensions", "whatsapp", "package.json"), {
-      name: "@openclaw/whatsapp",
-      openclaw: {
-        channel: {
-          id: "whatsapp",
-          label: "WhatsApp",
-          selectionLabel: "WhatsApp",
-          docsPath: "/channels/whatsapp",
-          blurb: "wa",
-        },
-        install: {
-          npmSpec: "@openclaw/whatsapp",
-        },
-        release: {
-          publishToNpm: true,
-        },
-      },
+  it("preserves ClawHub specs when generating publishable channel catalog entries", () => {
+    const entry = writeChannelPackage("storepack-chat", {
+      clawhubSpec: "clawhub:@openclaw/storepack-chat",
+      npmSpec: "@openclaw/storepack-chat",
+      defaultChoice: "clawhub",
     });
 
-    writeOfficialChannelCatalog({ repoRoot });
-
-    const outputPath = path.join(repoRoot, OFFICIAL_CHANNEL_CATALOG_RELATIVE_PATH);
-    expect(fs.existsSync(outputPath)).toBe(true);
-    expect(JSON.parse(fs.readFileSync(outputPath, "utf8"))).toEqual({
-      entries: [
-        {
-          name: "@openclaw/whatsapp",
-          openclaw: {
-            channel: {
-              id: "whatsapp",
-              label: "WhatsApp",
-              selectionLabel: "WhatsApp",
-              docsPath: "/channels/whatsapp",
-              blurb: "wa",
-            },
-            install: {
-              npmSpec: "@openclaw/whatsapp",
-            },
-          },
-        },
-      ],
+    expect(entry.openclaw.install).toEqual({
+      clawhubSpec: "clawhub:@openclaw/storepack-chat",
+      npmSpec: "@openclaw/storepack-chat",
+      defaultChoice: "clawhub",
     });
   });
 });

@@ -1,4 +1,4 @@
-// Private runtime barrel for the bundled Mattermost extension.
-// Keep this barrel thin and aligned with the local extension surface.
-
-export * from "openclaw/plugin-sdk/mattermost";
+export type { ChannelGroupContext, OpenClawConfig, PluginRuntime } from "openclaw/plugin-sdk/core";
+export type { RuntimeEnv } from "openclaw/plugin-sdk/runtime";
+export type { ReplyPayload } from "openclaw/plugin-sdk/reply-runtime";
+export { setMattermostRuntime } from "./src/runtime.js";

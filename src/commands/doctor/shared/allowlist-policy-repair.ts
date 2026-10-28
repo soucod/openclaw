@@ -1,10 +1,16 @@
-import { normalizeChatChannelId } from "../../../channels/registry.js";
-import type { OpenClawConfig } from "../../../config/config.js";
+import { asOptionalObjectRecord } from "@openclaw/normalization-core/record-coerce";
+import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
+import { normalizeUniqueStringEntries } from "@openclaw/normalization-core/string-normalization";
+import { normalizeChatChannelId } from "../../../channels/ids.js";
+import {
+  resolveChannelDmAccess,
+  setCanonicalDmAllowFrom,
+} from "../../../channels/plugins/dm-access.js";
+import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 import { readChannelAllowFromStore } from "../../../pairing/pairing-store.js";
-import { DEFAULT_ACCOUNT_ID, normalizeAccountId } from "../../../routing/session-key.js";
-import { resolveAllowFromMode, type AllowFromMode } from "./allow-from-mode.js";
-import { hasAllowFromEntries } from "./allowlist.js";
-import { asObjectRecord } from "./object.js";
+import { normalizeAccountId } from "../../../routing/session-key.js";
+import { getDoctorChannelCapabilities } from "../channel-capabilities.js";
+import { hasAllowFromEntries, iterateDoctorChannelAccounts } from "./allowlist.js";
 
 export async function maybeRepairAllowlistPolicyAllowFrom(cfg: OpenClawConfig): Promise<{
   config: OpenClawConfig;
@@ -18,131 +24,63 @@ export async function maybeRepairAllowlistPolicyAllowFrom(cfg: OpenClawConfig): 
   const next = structuredClone(cfg);
   const changes: string[] = [];
 
-  const applyRecoveredAllowFrom = (params: {
-    account: Record<string, unknown>;
-    allowFrom: string[];
-    mode: AllowFromMode;
-    prefix: string;
-  }) => {
-    const count = params.allowFrom.length;
-    const noun = count === 1 ? "entry" : "entries";
-
-    if (params.mode === "nestedOnly") {
-      const dmEntry = params.account.dm;
-      const dm =
-        dmEntry && typeof dmEntry === "object" && !Array.isArray(dmEntry)
-          ? (dmEntry as Record<string, unknown>)
-          : {};
-      dm.allowFrom = params.allowFrom;
-      params.account.dm = dm;
-      changes.push(
-        `- ${params.prefix}.dm.allowFrom: restored ${count} sender ${noun} from pairing store (dmPolicy="allowlist").`,
-      );
-      return;
+  for (const [channelName, value] of Object.entries(next.channels ?? {})) {
+    const channelConfig = asOptionalObjectRecord(value);
+    if (!channelConfig || channelConfig.enabled === false) {
+      continue;
     }
-
-    if (params.mode === "topOrNested") {
-      const dmEntry = params.account.dm;
-      const dm =
-        dmEntry && typeof dmEntry === "object" && !Array.isArray(dmEntry)
-          ? (dmEntry as Record<string, unknown>)
-          : undefined;
-      const nestedAllowFrom = dm?.allowFrom as Array<string | number> | undefined;
-      if (dm && !Array.isArray(params.account.allowFrom) && Array.isArray(nestedAllowFrom)) {
-        dm.allowFrom = params.allowFrom;
-        changes.push(
-          `- ${params.prefix}.dm.allowFrom: restored ${count} sender ${noun} from pairing store (dmPolicy="allowlist").`,
-        );
+    const mode = getDoctorChannelCapabilities(channelName).dmAllowFromMode;
+    const recoverAllowFromForAccount = async (params: {
+      account: Record<string, unknown>;
+      parent?: Record<string, unknown>;
+      accountId?: string;
+      prefix: string;
+    }) => {
+      const { dmPolicy, allowFrom } = resolveChannelDmAccess({
+        account: params.account,
+        parent: params.parent,
+        mode,
+      });
+      if (dmPolicy !== "allowlist" || hasAllowFromEntries(allowFrom)) {
         return;
       }
-    }
 
-    params.account.allowFrom = params.allowFrom;
-    changes.push(
-      `- ${params.prefix}.allowFrom: restored ${count} sender ${noun} from pairing store (dmPolicy="allowlist").`,
-    );
-  };
-
-  const recoverAllowFromForAccount = async (params: {
-    channelName: string;
-    account: Record<string, unknown>;
-    accountId?: string;
-    prefix: string;
-  }) => {
-    const dmEntry = params.account.dm;
-    const dm =
-      dmEntry && typeof dmEntry === "object" && !Array.isArray(dmEntry)
-        ? (dmEntry as Record<string, unknown>)
-        : undefined;
-    const dmPolicy =
-      (params.account.dmPolicy as string | undefined) ?? (dm?.policy as string | undefined);
-    if (dmPolicy !== "allowlist") {
-      return;
-    }
-
-    const topAllowFrom = params.account.allowFrom as Array<string | number> | undefined;
-    const nestedAllowFrom = dm?.allowFrom as Array<string | number> | undefined;
-    if (hasAllowFromEntries(topAllowFrom) || hasAllowFromEntries(nestedAllowFrom)) {
-      return;
-    }
-
-    const normalizedChannelId = (normalizeChatChannelId(params.channelName) ?? params.channelName)
-      .trim()
-      .toLowerCase();
-    if (!normalizedChannelId) {
-      return;
-    }
-    const normalizedAccountId = normalizeAccountId(params.accountId) || DEFAULT_ACCOUNT_ID;
-    const fromStore = await readChannelAllowFromStore(
-      normalizedChannelId,
-      process.env,
-      normalizedAccountId,
-    ).catch(() => []);
-    const recovered = Array.from(new Set(fromStore.map((entry) => String(entry).trim()))).filter(
-      Boolean,
-    );
-    if (recovered.length === 0) {
-      return;
-    }
-
-    applyRecoveredAllowFrom({
-      account: params.account,
-      allowFrom: recovered,
-      mode: resolveAllowFromMode(params.channelName),
-      prefix: params.prefix,
-    });
-  };
-
-  const nextChannels = next.channels as Record<string, Record<string, unknown>>;
-  for (const [channelName, channelConfig] of Object.entries(nextChannels)) {
-    if (!channelConfig || typeof channelConfig !== "object") {
-      continue;
-    }
-    await recoverAllowFromForAccount({
-      channelName,
-      account: channelConfig,
-      prefix: `channels.${channelName}`,
-    });
-
-    const accounts = asObjectRecord(channelConfig.accounts);
-    if (!accounts) {
-      continue;
-    }
-    for (const [accountId, accountConfig] of Object.entries(accounts)) {
-      if (!accountConfig || typeof accountConfig !== "object") {
-        continue;
+      const normalizedChannelId = normalizeOptionalLowercaseString(
+        normalizeChatChannelId(channelName) ?? channelName,
+      );
+      if (!normalizedChannelId) {
+        return;
       }
-      await recoverAllowFromForAccount({
-        channelName,
-        account: accountConfig as Record<string, unknown>,
-        accountId,
-        prefix: `channels.${channelName}.accounts.${accountId}`,
+      const normalizedAccountId = normalizeAccountId(params.accountId);
+      const fromStore = await readChannelAllowFromStore(
+        normalizedChannelId,
+        process.env,
+        normalizedAccountId,
+      ).catch(() => []);
+      const recovered = normalizeUniqueStringEntries(fromStore);
+      if (recovered.length === 0) {
+        return;
+      }
+
+      const count = recovered.length;
+      const noun = count === 1 ? "entry" : "entries";
+      setCanonicalDmAllowFrom({
+        entry: params.account,
+        allowFrom: recovered,
+        mode,
+        pathPrefix: params.prefix,
+        changes,
+        reason: `restored ${count} sender ${noun} from pairing store (dmPolicy="allowlist").`,
       });
+    };
+    for (const account of iterateDoctorChannelAccounts(
+      channelConfig,
+      `channels.${channelName}`,
+      true,
+    )) {
+      await recoverAllowFromForAccount(account);
     }
   }
 
-  if (changes.length === 0) {
-    return { config: cfg, changes: [] };
-  }
-  return { config: next, changes };
+  return { config: changes.length > 0 ? next : cfg, changes };
 }

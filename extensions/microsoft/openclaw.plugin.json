@@ -1,5 +1,14 @@
 {
   "id": "microsoft",
+  "categories": ["voice"],
+  "capabilityCatalogEntry": "./capability-catalog.ts",
+  "activation": {
+    "onStartup": false
+  },
+  "enabledByDefault": true,
+  "contracts": {
+    "speechProviders": ["microsoft", "edge"]
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

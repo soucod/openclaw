@@ -1,45 +1,77 @@
-import { describe, expect, it } from "vitest";
-import {
-  collectConfigDocBaselineEntries,
-  dedupeConfigDocBaselineEntries,
-  normalizeConfigDocBaselineHelpPath,
-} from "./doc-baseline.js";
+import { expect, it, vi } from "vitest";
+import { renderConfigDocBaselineArtifacts } from "./doc-baseline.js";
 
-describe("config doc baseline", () => {
-  it("normalizes array and record paths to wildcard form", async () => {
-    expect(normalizeConfigDocBaselineHelpPath("agents.list[].skills")).toBe("agents.list.*.skills");
-    expect(normalizeConfigDocBaselineHelpPath("session.sendPolicy.rules[0].match.keyPrefix")).toBe(
-      "session.sendPolicy.rules.*.match.keyPrefix",
-    );
-    expect(normalizeConfigDocBaselineHelpPath(".env.*.")).toBe("env.*");
-  });
-
-  it("merges tuple item metadata instead of dropping earlier entries", () => {
-    const entries = dedupeConfigDocBaselineEntries(
-      collectConfigDocBaselineEntries(
-        {
-          type: "array",
-          items: [
-            {
-              type: "string",
-              enum: ["alpha"],
-            },
-            {
-              type: "number",
-              enum: [42],
-            },
-          ],
+vi.mock("./doc-baseline.runtime.js", async () => {
+  const { collectBundledChannelConfigsCore } =
+    await import("../plugins/bundled-channel-config-metadata.js");
+  return {
+    collectBundledChannelConfigs: collectBundledChannelConfigsCore,
+    loadPluginManifestRegistry: () => ({ plugins: [] }),
+    collectChannelSchemaMetadata: () => [],
+    collectPluginSchemaMetadata: () => [],
+    buildConfigSchema: () => ({
+      schema: {
+        type: "object",
+        required: ["mapValues", "mixedValues", "singleValues"],
+        additionalProperties: { type: "string" },
+        properties: {
+          mapValues: {
+            type: "object",
+            additionalProperties: { type: "boolean" },
+          },
+          mixedValues: {
+            type: "array",
+            additionalProperties: { type: "string", enum: ["extra"] },
+            items: [null, true, [], { type: "number", enum: [42] }],
+          },
+          singleValues: {
+            type: "array",
+            items: { type: "string" },
+          },
+          tupleValues: {
+            type: "array",
+            items: [
+              { type: "string", enum: ["alpha"] },
+              { type: "number", enum: [42] },
+            ],
+          },
         },
-        {},
-        "tupleValues",
-      ),
-    );
-    const tupleEntry = new Map(entries.map((entry) => [entry.path, entry])).get("tupleValues.*");
+      },
+      uiHints: {},
+      version: "test",
+      generatedAt: "test",
+    }),
+  };
+});
 
-    expect(tupleEntry).toMatchObject({
-      type: ["number", "string"],
-    });
-    expect(tupleEntry?.enumValues).toEqual(expect.arrayContaining([42, "alpha"]));
-    expect(tupleEntry?.enumValues).toHaveLength(2);
+it("renders optional wildcards and merges tuple metadata through the public renderer", async () => {
+  const { baseline } = await renderConfigDocBaselineArtifacts();
+
+  const entry = (path: string, type: string | string[], required = false, hasChildren = false) => ({
+    path,
+    type,
+    required,
+    hasChildren,
+    kind: "core",
+    deprecated: false,
+    sensitive: false,
+    tags: [],
   });
+  expect(baseline.coreEntries).toEqual([
+    entry("*", "string"),
+    entry("mapValues", "object", true, true),
+    entry("mapValues.*", "boolean"),
+    entry("mixedValues", "array", true, true),
+    {
+      ...entry("mixedValues.*", ["number", "string"]),
+      enumValues: ["extra", 42],
+    },
+    entry("singleValues", "array", true, true),
+    entry("singleValues.*", "string"),
+    entry("tupleValues", "array", false, true),
+    {
+      ...entry("tupleValues.*", ["number", "string"]),
+      enumValues: ["alpha", 42],
+    },
+  ]);
 });

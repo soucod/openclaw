@@ -1,190 +1,141 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { describe, expect, it } from "vitest";
-import {
-  ACPX_BUNDLED_BIN,
-  ACPX_PINNED_VERSION,
-  createAcpxPluginConfigSchema,
-  resolveAcpxPluginRoot,
-  resolveAcpxPluginConfig,
-} from "./config.js";
+import { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
+import { afterEach, expect, it, vi } from "vitest";
+import { resolveAcpxPluginConfig, resolveAcpxPluginRoot } from "./config.js";
 
-describe("acpx plugin config parsing", () => {
-  it("resolves source-layout plugin root from a file under src", () => {
-    const pluginRoot = fs.mkdtempSync(path.join(os.tmpdir(), "acpx-root-source-"));
-    try {
-      fs.mkdirSync(path.join(pluginRoot, "src"), { recursive: true });
-      fs.writeFileSync(path.join(pluginRoot, "package.json"), "{}\n", "utf8");
-      fs.writeFileSync(path.join(pluginRoot, "openclaw.plugin.json"), "{}\n", "utf8");
+const TSX_IMPORT = import.meta.resolve("tsx");
+const runtimeArgs = process.versions.bun ? ["--no-install"] : [];
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+const workspaceDir = path.resolve("/tmp/openclaw-acpx");
+const resolve = (
+  rawConfig?: unknown,
+  options: Omit<Parameters<typeof resolveAcpxPluginConfig>[0], "rawConfig"> = {},
+) => resolveAcpxPluginConfig({ workspaceDir, rawConfig, ...options });
 
-      const moduleUrl = pathToFileURL(path.join(pluginRoot, "src", "config.ts")).href;
-      expect(resolveAcpxPluginRoot(moduleUrl)).toBe(pluginRoot);
-    } finally {
-      fs.rmSync(pluginRoot, { recursive: true, force: true });
-    }
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllEnvs();
+});
+
+it("resolves state independently of the session working directory", () => {
+  const stateDir = path.resolve("/tmp/openclaw-state");
+  vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
+  const resolved = resolve();
+  expect(resolved).toMatchObject({
+    cwd: workspaceDir,
+    stateDir: path.join(stateDir, "acpx"),
+    permissionMode: "approve-reads",
+    nonInteractivePermissions: "fail",
+    timeoutSeconds: 120,
+    probeAgent: undefined,
   });
+  expect(resolved.agents).toStrictEqual({});
+  expect(resolve({ stateDir: workspaceDir }, { stateDir }).stateDir).toBe(workspaceDir);
+  expect(resolve({}, { stateDir: workspaceDir }).stateDir).toBe(path.join(workspaceDir, "acpx"));
+});
 
-  it("resolves bundled-layout plugin root from the dist entry file", () => {
-    const pluginRoot = fs.mkdtempSync(path.join(os.tmpdir(), "acpx-root-dist-"));
-    try {
-      fs.writeFileSync(path.join(pluginRoot, "package.json"), "{}\n", "utf8");
-      fs.writeFileSync(path.join(pluginRoot, "openclaw.plugin.json"), "{}\n", "utf8");
+it.each([
+  ["win32", String.raw`node "say \"hello\""`, ["node", 'say "hello"']],
+  ["linux", String.raw`node ./some\ file.js ""`, ["node", "./some file.js", ""]],
+] as const)("preserves %s command syntax: %s", (platform, command, expected) => {
+  vi.spyOn(process, "platform", "get").mockReturnValue(platform);
+  const config = resolve({ agents: { fixture: { command, args: ["suffix"] } } });
+  expect(config.agents.fixture).toEqual([...expected, "suffix"]);
+});
 
-      const moduleUrl = pathToFileURL(path.join(pluginRoot, "index.js")).href;
-      expect(resolveAcpxPluginRoot(moduleUrl)).toBe(pluginRoot);
-    } finally {
-      fs.rmSync(pluginRoot, { recursive: true, force: true });
-    }
+it.each([
+  [{ agents: { custom: { command: "node 'unfinished argument" } } }, "unterminated quote"],
+  [{ probeAgent: "" }, /probeAgent must be a non-empty string/],
+] as const)("rejects invalid config %j", (config, error) => {
+  expect(() => resolve(config)).toThrow(error);
+});
+
+it("passes agent process env lists through and leaves them unset by default", () => {
+  const resolved = resolve();
+  expect(resolved.agentProcessEnvAllow).toBeUndefined();
+  expect(resolved.agentProcessEnvBlock).toBeUndefined();
+  expect(
+    resolve({ agentProcessEnvAllow: [], agentProcessEnvBlock: ["OPENCLAW_GATEWAY_TOKEN"] }),
+  ).toMatchObject({
+    agentProcessEnvAllow: [],
+    agentProcessEnvBlock: ["OPENCLAW_GATEWAY_TOKEN"],
   });
+});
 
-  it("prefers the workspace plugin root for dist/extensions/acpx bundles", () => {
-    const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "acpx-root-workspace-"));
-    const workspacePluginRoot = path.join(repoRoot, "extensions", "acpx");
-    const bundledPluginRoot = path.join(repoRoot, "dist", "extensions", "acpx");
-    try {
-      fs.mkdirSync(workspacePluginRoot, { recursive: true });
-      fs.mkdirSync(bundledPluginRoot, { recursive: true });
-      fs.writeFileSync(path.join(workspacePluginRoot, "package.json"), "{}\n", "utf8");
-      fs.writeFileSync(path.join(workspacePluginRoot, "openclaw.plugin.json"), "{}\n", "utf8");
-      fs.writeFileSync(path.join(bundledPluginRoot, "package.json"), "{}\n", "utf8");
-      fs.writeFileSync(path.join(bundledPluginRoot, "openclaw.plugin.json"), "{}\n", "utf8");
+it.each([
+  ["agentProcessEnvBlock", "OPENCLAW_GATEWAY_TOKEN"],
+  ["agentProcessEnvBlock", [""]],
+  ["agentProcessEnvBlock", ["NAME=value"]],
+  ["agentProcessEnvAllow", [" PATH"]],
+  ["agentProcessEnvAllow", ["NUL\u0000NAME"]],
+  ["agentProcessEnvAllow", [42]],
+] as const)("rejects invalid %s %j", (key, value) => {
+  expect(() => resolve({ [key]: value })).toThrow(
+    `${key} must be an array of environment variable names`,
+  );
+});
 
-      const moduleUrl = pathToFileURL(path.join(bundledPluginRoot, "index.js")).href;
-      expect(resolveAcpxPluginRoot(moduleUrl)).toBe(workspacePluginRoot);
-    } finally {
-      fs.rmSync(repoRoot, { recursive: true, force: true });
-    }
+it("injects the built-in plugin-tools MCP server only when explicitly enabled", () => {
+  const distEntry = path.resolve("dist/mcp/plugin-tools-serve.js");
+  expect(resolve({ pluginToolsMcpBridge: true }).mcpServers["openclaw-plugin-tools"]).toEqual({
+    command: process.execPath,
+    args: fs.existsSync(distEntry)
+      ? [...runtimeArgs, distEntry]
+      : [
+          ...runtimeArgs,
+          ...(process.versions.bun ? [] : ["--import", TSX_IMPORT]),
+          path.resolve("src/mcp/plugin-tools-serve.ts"),
+        ],
   });
+});
 
-  it("resolves bundled acpx with pinned version by default", () => {
-    const resolved = resolveAcpxPluginConfig({
-      rawConfig: {
-        cwd: "/tmp/workspace",
+it("launches managed bridges from the host package when acpx is an external package", () => {
+  const tmp = fs.realpathSync(tempDirs.make("openclaw-acpx-external-"));
+  const hostRoot = path.join(tmp, "lib", "node_modules", "openclaw");
+  fs.mkdirSync(path.join(hostRoot, "dist", "mcp"), { recursive: true });
+  fs.writeFileSync(path.join(hostRoot, "package.json"), JSON.stringify({ name: "openclaw" }));
+  fs.writeFileSync(path.join(hostRoot, "openclaw.mjs"), "");
+  fs.writeFileSync(path.join(hostRoot, "dist", "mcp", "plugin-tools-serve.js"), "");
+  fs.writeFileSync(path.join(hostRoot, "dist", "mcp", "openclaw-tools-serve.js"), "");
+  fs.mkdirSync(path.join(tmp, "bin"));
+  fs.symlinkSync(path.join(hostRoot, "openclaw.mjs"), path.join(tmp, "bin", "openclaw"));
+  const pluginRoot = path.join(tmp, "captures", "package-0", "node_modules", "@openclaw", "acpx");
+  fs.mkdirSync(path.join(pluginRoot, "dist"), { recursive: true });
+  fs.writeFileSync(
+    path.join(pluginRoot, "package.json"),
+    JSON.stringify({ name: "@openclaw/acpx" }),
+  );
+  fs.writeFileSync(path.join(pluginRoot, "openclaw.plugin.json"), "{}");
+  const originalArgv = process.argv;
+  process.argv = [process.execPath, path.join(tmp, "bin", "openclaw"), "gateway"];
+  try {
+    const resolved = resolve(
+      { pluginToolsMcpBridge: true, openClawToolsMcpBridge: true },
+      {
+        moduleUrl: pathToFileURL(path.join(pluginRoot, "dist", "config.js")).href,
       },
-      workspaceDir: "/tmp/workspace",
-    });
+    );
 
-    expect(resolved.command).toBe(ACPX_BUNDLED_BIN);
-    expect(resolved.expectedVersion).toBe(ACPX_PINNED_VERSION);
-    expect(resolved.allowPluginLocalInstall).toBe(true);
-    expect(resolved.stripProviderAuthEnvVars).toBe(true);
-    expect(resolved.cwd).toBe(path.resolve("/tmp/workspace"));
-    expect(resolved.strictWindowsCmdWrapper).toBe(true);
-  });
-
-  it("accepts command override and disables plugin-local auto-install", () => {
-    const command = "/home/user/repos/acpx/dist/cli.js";
-    const resolved = resolveAcpxPluginConfig({
-      rawConfig: {
-        command,
+    expect(resolved.mcpServers).toEqual({
+      "openclaw-plugin-tools": {
+        command: process.execPath,
+        args: [...runtimeArgs, path.join(hostRoot, "dist", "mcp", "plugin-tools-serve.js")],
       },
-      workspaceDir: "/tmp/workspace",
-    });
-
-    expect(resolved.command).toBe(path.resolve(command));
-    expect(resolved.expectedVersion).toBeUndefined();
-    expect(resolved.allowPluginLocalInstall).toBe(false);
-    expect(resolved.stripProviderAuthEnvVars).toBe(false);
-  });
-
-  it("resolves relative command paths against workspace directory", () => {
-    const resolved = resolveAcpxPluginConfig({
-      rawConfig: {
-        command: "../acpx/dist/cli.js",
+      "openclaw-tools": {
+        command: process.execPath,
+        args: [...runtimeArgs, path.join(hostRoot, "dist", "mcp", "openclaw-tools-serve.js")],
       },
-      workspaceDir: "/home/user/repos/openclaw",
     });
+  } finally {
+    process.argv = originalArgv;
+  }
+});
 
-    expect(resolved.command).toBe(path.resolve("/home/user/repos/openclaw", "../acpx/dist/cli.js"));
-    expect(resolved.expectedVersion).toBeUndefined();
-    expect(resolved.allowPluginLocalInstall).toBe(false);
-    expect(resolved.stripProviderAuthEnvVars).toBe(false);
-  });
+it("resolves the plugin root from shared dist chunk paths", () => {
+  const moduleUrl = new URL("../../../dist/extensions/acpx/service-shared.js", import.meta.url)
+    .href;
 
-  it("keeps bare command names as-is", () => {
-    const resolved = resolveAcpxPluginConfig({
-      rawConfig: {
-        command: "acpx",
-      },
-      workspaceDir: "/tmp/workspace",
-    });
-
-    expect(resolved.command).toBe("acpx");
-    expect(resolved.expectedVersion).toBeUndefined();
-    expect(resolved.allowPluginLocalInstall).toBe(false);
-    expect(resolved.stripProviderAuthEnvVars).toBe(false);
-  });
-
-  it("accepts exact expectedVersion override", () => {
-    const command = "/home/user/repos/acpx/dist/cli.js";
-    const resolved = resolveAcpxPluginConfig({
-      rawConfig: {
-        command,
-        expectedVersion: "0.1.99",
-      },
-      workspaceDir: "/tmp/workspace",
-    });
-
-    expect(resolved.command).toBe(path.resolve(command));
-    expect(resolved.expectedVersion).toBe("0.1.99");
-    expect(resolved.allowPluginLocalInstall).toBe(false);
-    expect(resolved.stripProviderAuthEnvVars).toBe(false);
-  });
-
-  it("treats expectedVersion=any as no version constraint", () => {
-    const resolved = resolveAcpxPluginConfig({
-      rawConfig: {
-        command: "/home/user/repos/acpx/dist/cli.js",
-        expectedVersion: "any",
-      },
-      workspaceDir: "/tmp/workspace",
-    });
-
-    expect(resolved.expectedVersion).toBeUndefined();
-  });
-
-  it("rejects commandArgs overrides", () => {
-    expect(() =>
-      resolveAcpxPluginConfig({
-        rawConfig: {
-          commandArgs: ["--foo"],
-        },
-        workspaceDir: "/tmp/workspace",
-      }),
-    ).toThrow("unknown config key: commandArgs");
-  });
-
-  it("schema rejects empty cwd", () => {
-    const schema = createAcpxPluginConfigSchema();
-    if (!schema.safeParse) {
-      throw new Error("acpx config schema missing safeParse");
-    }
-    const parsed = schema.safeParse({ cwd: "   " });
-
-    expect(parsed.success).toBe(false);
-  });
-
-  it("accepts strictWindowsCmdWrapper override", () => {
-    const resolved = resolveAcpxPluginConfig({
-      rawConfig: {
-        strictWindowsCmdWrapper: true,
-      },
-      workspaceDir: "/tmp/workspace",
-    });
-
-    expect(resolved.strictWindowsCmdWrapper).toBe(true);
-  });
-
-  it("rejects non-boolean strictWindowsCmdWrapper", () => {
-    expect(() =>
-      resolveAcpxPluginConfig({
-        rawConfig: {
-          strictWindowsCmdWrapper: "yes",
-        },
-        workspaceDir: "/tmp/workspace",
-      }),
-    ).toThrow("strictWindowsCmdWrapper must be a boolean");
-  });
+  expect(resolveAcpxPluginRoot(moduleUrl)).toBe(path.resolve("extensions/acpx"));
 });

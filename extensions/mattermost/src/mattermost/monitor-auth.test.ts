@@ -1,64 +1,72 @@
-import { describe, expect, it, vi } from "vitest";
+import { createPluginRuntimeMock } from "openclaw/plugin-sdk/channel-test-helpers";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { setMattermostRuntime } from "../runtime.js";
 
-const evaluateSenderGroupAccessForPolicy = vi.hoisted(() => vi.fn());
 const isDangerousNameMatchingEnabled = vi.hoisted(() => vi.fn());
 const resolveAllowlistMatchSimple = vi.hoisted(() => vi.fn());
-const resolveControlCommandGate = vi.hoisted(() => vi.fn());
-const resolveEffectiveAllowFromLists = vi.hoisted(() => vi.fn());
 
-vi.mock("../runtime-api.js", () => ({
-  evaluateSenderGroupAccessForPolicy,
+vi.mock("./runtime-api.js", () => ({
   isDangerousNameMatchingEnabled,
   resolveAllowlistMatchSimple,
-  resolveControlCommandGate,
-  resolveEffectiveAllowFromLists,
 }));
 
 describe("mattermost monitor auth", () => {
-  it("normalizes allowlist entries and resolves effective lists", async () => {
-    resolveEffectiveAllowFromLists.mockReturnValue({
-      effectiveAllowFrom: ["alice"],
-      effectiveGroupAllowFrom: ["team"],
+  let auth: typeof import("./monitor-auth.js");
+  let normalizeMattermostAllowEntry: typeof import("./ingress-identity.js").normalizeMattermostAllowEntry;
+
+  beforeAll(async () => {
+    auth = await import("./monitor-auth.js");
+    ({ normalizeMattermostAllowEntry } = await import("./ingress-identity.js"));
+  });
+
+  beforeEach(() => {
+    setMattermostRuntime(createPluginRuntimeMock());
+    isDangerousNameMatchingEnabled.mockReset();
+    resolveAllowlistMatchSimple.mockReset();
+  });
+
+  const direct = {
+    channelInfo: { type: "D", name: "alice", display_name: "Alice" },
+    kind: "direct",
+    chatType: "direct",
+    channelName: "alice",
+    channelDisplay: "Alice",
+    roomLabel: "#alice",
+  };
+  const denied = { ok: false, commandAuthorized: false };
+  function authorize(
+    config: Parameters<typeof auth.authorizeMattermostCommandInvocation>[0]["account"]["config"],
+    allowTextCommands: boolean,
+    hasControlCommand: boolean,
+    channelInfo = direct.channelInfo,
+  ) {
+    return auth.authorizeMattermostCommandInvocation({
+      account: { config } as never,
+      cfg: {},
+      senderId: "alice",
+      senderName: "Alice",
+      channelId: channelInfo.type === "D" ? "dm-1" : "chan-1",
+      channelInfo: channelInfo as never,
+      allowTextCommands,
+      hasControlCommand,
     });
+  }
 
-    const {
-      normalizeMattermostAllowEntry,
-      normalizeMattermostAllowList,
-      resolveMattermostEffectiveAllowFromLists,
-    } = await import("./monitor-auth.js");
-
+  it("normalizes allowlist entries", () => {
     expect(normalizeMattermostAllowEntry(" @Alice ")).toBe("alice");
     expect(normalizeMattermostAllowEntry("mattermost:Bob")).toBe("bob");
+    expect(normalizeMattermostAllowEntry("accessGroup:Ops")).toBe("accessGroup:Ops");
     expect(normalizeMattermostAllowEntry("*")).toBe("*");
-    expect(normalizeMattermostAllowList([" Alice ", "user:alice", "ALICE", "*"])).toEqual([
+    expect(auth.normalizeMattermostAllowList([" Alice ", "user:alice", "ALICE", "*"])).toEqual([
       "alice",
       "*",
     ]);
-    expect(
-      resolveMattermostEffectiveAllowFromLists({
-        allowFrom: [" Alice "],
-        groupAllowFrom: [" Team "],
-        storeAllowFrom: ["Store"],
-        dmPolicy: "pairing",
-      }),
-    ).toEqual({
-      effectiveAllowFrom: ["alice"],
-      effectiveGroupAllowFrom: ["team"],
-    });
-    expect(resolveEffectiveAllowFromLists).toHaveBeenCalledWith({
-      allowFrom: ["alice"],
-      groupAllowFrom: ["team"],
-      storeAllowFrom: ["store"],
-      dmPolicy: "pairing",
-    });
   });
 
-  it("checks sender allowlists against normalized ids and names", async () => {
+  it("checks sender allowlists against normalized ids and names", () => {
     resolveAllowlistMatchSimple.mockReturnValue({ allowed: true });
-
-    const { isMattermostSenderAllowed } = await import("./monitor-auth.js");
     expect(
-      isMattermostSenderAllowed({
+      auth.isMattermostSenderAllowed({
         senderId: "@Alice",
         senderName: "Alice",
         allowFrom: [" mattermost:alice "],
@@ -73,79 +81,57 @@ describe("mattermost monitor auth", () => {
     });
   });
 
-  it("authorizes direct messages in open mode and blocks disabled/group-restricted channels", async () => {
+  it("formats direct-message drops with the ingress reason and open-policy hint", () => {
+    expect(
+      auth.formatMattermostDirectMessageDropLog({
+        senderId: "alice-id",
+        dmPolicy: "open",
+        reasonCode: "dm_policy_not_allowlisted",
+      }),
+    ).toBe(
+      "mattermost: drop dm sender=alice-id (dmPolicy=open reason=dm_policy_not_allowlisted hint=add-allowFrom-wildcard)",
+    );
+  });
+
+  it("resolves direct command authorization from shared ingress", async () => {
     isDangerousNameMatchingEnabled.mockReturnValue(false);
-    resolveEffectiveAllowFromLists.mockReturnValue({
-      effectiveAllowFrom: [],
-      effectiveGroupAllowFrom: [],
-    });
-    resolveControlCommandGate.mockReturnValue({
-      commandAuthorized: false,
-      shouldBlock: false,
-    });
-    evaluateSenderGroupAccessForPolicy.mockReturnValue({
-      allowed: false,
-      reason: "empty_allowlist",
-    });
     resolveAllowlistMatchSimple.mockReturnValue({ allowed: false });
 
-    const { authorizeMattermostCommandInvocation } = await import("./monitor-auth.js");
-
-    expect(
-      authorizeMattermostCommandInvocation({
-        account: {
-          config: { dmPolicy: "open" },
-        } as never,
-        cfg: {} as never,
-        senderId: "alice",
-        senderName: "Alice",
-        channelId: "dm-1",
-        channelInfo: { type: "D", name: "alice", display_name: "Alice" } as never,
-        allowTextCommands: false,
-        hasControlCommand: false,
-      }),
-    ).toMatchObject({
-      ok: true,
-      commandAuthorized: true,
-      kind: "direct",
-      roomLabel: "#alice",
+    await expect(authorize({ dmPolicy: "open" }, true, true)).resolves.toEqual({
+      ...direct,
+      ...denied,
+      denyReason: "unauthorized",
     });
 
-    expect(
-      authorizeMattermostCommandInvocation({
-        account: {
-          config: { dmPolicy: "disabled" },
-        } as never,
-        cfg: {} as never,
-        senderId: "alice",
-        senderName: "Alice",
-        channelId: "dm-1",
-        channelInfo: { type: "D", name: "alice", display_name: "Alice" } as never,
-        allowTextCommands: false,
-        hasControlCommand: false,
-      }),
-    ).toMatchObject({
-      ok: false,
+    resolveAllowlistMatchSimple.mockReturnValue({ allowed: true });
+
+    await expect(authorize({ dmPolicy: "open", allowFrom: ["*"] }, false, false)).resolves.toEqual({
+      ...direct,
+      ok: true,
+      commandAuthorized: true,
+    });
+
+    await expect(authorize({ dmPolicy: "disabled" }, false, false)).resolves.toEqual({
+      ...direct,
+      ...denied,
       denyReason: "dm-disabled",
     });
 
-    expect(
-      authorizeMattermostCommandInvocation({
-        account: {
-          config: { groupPolicy: "allowlist" },
-        } as never,
-        cfg: {} as never,
-        senderId: "alice",
-        senderName: "Alice",
-        channelId: "chan-1",
-        channelInfo: { type: "O", name: "town-square", display_name: "Town Square" } as never,
-        allowTextCommands: true,
-        hasControlCommand: false,
+    await expect(
+      authorize({ groupPolicy: "allowlist" }, true, false, {
+        type: "O",
+        name: "town-square",
+        display_name: "Town Square",
       }),
-    ).toMatchObject({
-      ok: false,
+    ).resolves.toEqual({
+      ...denied,
       denyReason: "channel-no-allowlist",
+      channelInfo: { type: "O", name: "town-square", display_name: "Town Square" },
       kind: "channel",
+      chatType: "channel",
+      channelName: "town-square",
+      channelDisplay: "Town Square",
+      roomLabel: "#town-square",
     });
   });
 });

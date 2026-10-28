@@ -1,22 +1,36 @@
 import { describeAccountSnapshot } from "openclaw/plugin-sdk/account-helpers";
+import { DEFAULT_ACCOUNT_ID } from "openclaw/plugin-sdk/account-id";
 import { formatNormalizedAllowFromEntries } from "openclaw/plugin-sdk/allow-from";
 import {
   adaptScopedAccountAccessor,
   createScopedChannelConfigAdapter,
   createScopedDmSecurityResolver,
 } from "openclaw/plugin-sdk/channel-config-helpers";
+import type { ChannelOutboundAdapter } from "openclaw/plugin-sdk/channel-contract";
+import { createChatChannelPlugin, type ChannelPlugin } from "openclaw/plugin-sdk/channel-core";
+import { identityEntryAuthenticationClassifier } from "openclaw/plugin-sdk/channel-ingress-runtime";
 import {
-  composeAccountWarningCollectors,
-  composeWarningCollectors,
+  createAccountStatusSink,
+  createReplyToFanout,
+  defineChannelMessageAdapter,
+  runPassiveAccountLifecycle,
+  type ChannelMessageSendTextContext,
+} from "openclaw/plugin-sdk/channel-outbound";
+import {
+  buildMutableAllowEntryDetector,
+  collectStandardAllowlistLists,
   createAllowlistProviderOpenWarningCollector,
+  createConditionalWarningCollector,
+  createDangerousNameMatchingMutableAllowlistWarningCollector,
 } from "openclaw/plugin-sdk/channel-policy";
-import { createChatChannelPlugin } from "openclaw/plugin-sdk/core";
+import { attachChannelToResult } from "openclaw/plugin-sdk/channel-send-result";
+import { PAIRING_APPROVED_MESSAGE } from "openclaw/plugin-sdk/channel-status";
 import {
   createChannelDirectoryAdapter,
-  listResolvedDirectoryEntriesFromSources,
+  createResolvedDirectoryEntriesLister,
 } from "openclaw/plugin-sdk/directory-runtime";
-import { runStoppablePassiveMonitor } from "openclaw/plugin-sdk/extension-shared";
 import {
+  buildProbeChannelStatusSummary,
   createComputedAccountStatusAdapter,
   createDefaultChannelRuntimeState,
 } from "openclaw/plugin-sdk/status-helpers";
@@ -26,32 +40,132 @@ import {
   resolveIrcAccount,
   type ResolvedIrcAccount,
 } from "./accounts.js";
-import { IrcConfigSchema } from "./config-schema.js";
-import { monitorIrcProvider } from "./monitor.js";
+import { IrcChannelConfigSchema } from "./config-schema.js";
+import { ircIngressIdentity } from "./ingress-identity.js";
 import {
-  normalizeIrcMessagingTarget,
-  looksLikeIrcTargetId,
   isChannelTarget,
+  looksLikeIrcTargetId,
   normalizeIrcAllowEntry,
+  normalizeIrcMessagingTarget,
+  resolveIrcOutboundSessionRoute,
 } from "./normalize.js";
-import { resolveIrcGroupMatch, resolveIrcRequireMention } from "./policy.js";
+import { ircOutboundBaseAdapter } from "./outbound-base.js";
+import { resolveIrcGroupRequireMention, resolveIrcGroupToolPolicy } from "./policy.js";
 import { probeIrc } from "./probe.js";
+import { collectRuntimeConfigAssignments, secretTargetRegistryEntries } from "./secret-contract.js";
 import {
-  buildBaseChannelStatusSummary,
-  buildChannelConfigSchema,
-  createAccountStatusSink,
-  DEFAULT_ACCOUNT_ID,
-  getChatChannelMeta,
-  PAIRING_APPROVED_MESSAGE,
-  type ChannelPlugin,
-} from "./runtime-api.js";
-import { getIrcRuntime } from "./runtime.js";
-import { sendMessageIrc } from "./send.js";
-import { ircSetupAdapter } from "./setup-core.js";
+  sendIrcMessages,
+  sendMessageIrc as sendIrcMessageText,
+  type SendIrcResult,
+} from "./send.js";
+import { ircSetupContract } from "./setup-core.js";
 import { ircSetupWizard } from "./setup-surface.js";
 import type { CoreConfig, IrcProbe } from "./types.js";
 
-const meta = getChatChannelMeta("irc");
+function ircAccountDetails(account: ResolvedIrcAccount) {
+  return {
+    host: account.host,
+    port: account.port,
+    tls: account.tls,
+    nick: account.nick,
+    passwordSource: account.passwordSource,
+    tokenStatus: account.tokenStatus,
+  };
+}
+
+function toIrcMessageResult({ target, ...result }: SendIrcResult) {
+  return {
+    ...result,
+    target: { kind: "conversation" as const, id: target },
+  };
+}
+
+async function sendIrcMessage(ctx: ChannelMessageSendTextContext, text = ctx.text) {
+  return toIrcMessageResult(
+    await sendIrcMessageText(ctx.to, text, {
+      cfg: ctx.cfg,
+      accountId: ctx.accountId ?? undefined,
+      replyTo: ctx.replyToId ?? undefined,
+      abortSignal: ctx.signal,
+      onPlatformSendDispatch: ctx.onPlatformSendDispatch,
+    }),
+  );
+}
+
+const sendFormattedIrcText: NonNullable<ChannelOutboundAdapter["sendFormattedText"]> = async (
+  ctx,
+) => {
+  const { chunkTextWithMode, resolveChunkMode, resolveTextChunkLimit } =
+    await import("openclaw/plugin-sdk/reply-chunking");
+  const accountId = ctx.accountId ?? undefined;
+  const textLimit =
+    ctx.formatting?.textLimit ??
+    resolveTextChunkLimit(ctx.cfg, "irc", accountId, {
+      fallbackLimit: ircOutboundBaseAdapter.textChunkLimit,
+    });
+  const chunkMode = ctx.formatting?.chunkMode ?? resolveChunkMode(ctx.cfg, "irc", accountId);
+  const nextReplyToId = createReplyToFanout(ctx);
+  const results = await sendIrcMessages(
+    ctx.to,
+    ctx.text,
+    {
+      cfg: ctx.cfg,
+      accountId,
+      abortSignal: ctx.abortSignal,
+      onPlatformSendDispatch: ctx.onPlatformSendDispatch,
+    },
+    (preparedText) =>
+      chunkTextWithMode(preparedText, textLimit, chunkMode).map((text) => ({
+        text,
+        replyTo: nextReplyToId(),
+      })),
+    async (result) => {
+      await ctx.onDeliveryResult?.(attachChannelToResult("irc", toIrcMessageResult(result)));
+    },
+  );
+  return results.map((result) => attachChannelToResult("irc", toIrcMessageResult(result)));
+};
+
+const ircMessageAdapter = defineChannelMessageAdapter({
+  id: "irc",
+  durableFinal: {
+    capabilities: {
+      text: true,
+      media: true,
+      replyTo: true,
+    },
+  },
+  send: {
+    text: sendIrcMessage,
+    media: (ctx) =>
+      sendIrcMessage(ctx, ctx.mediaUrl ? `${ctx.text}\n\nAttachment: ${ctx.mediaUrl}` : ctx.text),
+  },
+});
+
+const isIrcMutableAllowEntry = buildMutableAllowEntryDetector({
+  stableIdPattern: /^(?:(?:irc|user):)*[^@]*@/i,
+});
+
+const collectIrcMutableAllowlistWarnings =
+  createDangerousNameMatchingMutableAllowlistWarningCollector({
+    channel: "irc",
+    detector: isIrcMutableAllowEntry,
+    collectLists: (scope) =>
+      collectStandardAllowlistLists(scope, { includeGroups: true, groupField: "allowFrom" }),
+  });
+
+const meta = {
+  id: "irc",
+  label: "IRC",
+  selectionLabel: "IRC (Server + Nick)",
+  docsPath: "/channels/irc",
+  docsLabel: "irc",
+  blurb: "classic IRC networks; host, nick, channels.",
+  order: 80,
+  detailLabel: "IRC",
+  systemImage: "number",
+  markdownCapable: true,
+};
 
 function normalizePairingTarget(raw: string): string {
   const normalized = normalizeIrcAllowEntry(raw);
@@ -61,11 +175,31 @@ function normalizePairingTarget(raw: string): string {
   return normalized.split(/[!@]/, 1)[0]?.trim() ?? "";
 }
 
-const ircConfigAdapter = createScopedChannelConfigAdapter<
-  ResolvedIrcAccount,
-  ResolvedIrcAccount,
-  CoreConfig
->({
+const listIrcDirectoryPeersFromConfig = createResolvedDirectoryEntriesLister<ResolvedIrcAccount>({
+  kind: "user",
+  resolveAccount: adaptScopedAccountAccessor(resolveIrcAccount),
+  resolveSources: (account) => [
+    account.config.allowFrom ?? [],
+    account.config.groupAllowFrom ?? [],
+    ...Object.values(account.config.groups ?? {}).map((group) => group.allowFrom ?? []),
+  ],
+  normalizeId: (entry) => normalizePairingTarget(entry) || null,
+});
+
+const listIrcDirectoryGroupsFromConfig = createResolvedDirectoryEntriesLister<ResolvedIrcAccount>({
+  kind: "group",
+  resolveAccount: adaptScopedAccountAccessor(resolveIrcAccount),
+  resolveSources: (account) => [
+    account.config.channels ?? [],
+    Object.keys(account.config.groups ?? {}),
+  ],
+  normalizeId: (entry) => {
+    const normalized = normalizeIrcMessagingTarget(entry);
+    return normalized && isChannelTarget(normalized) ? normalized : null;
+  },
+});
+
+const ircConfigAdapter = createScopedChannelConfigAdapter<ResolvedIrcAccount, ResolvedIrcAccount>({
   sectionKey: "irc",
   listAccountIds: listIrcAccountIds,
   resolveAccount: adaptScopedAccountAccessor(resolveIrcAccount),
@@ -96,6 +230,7 @@ const resolveIrcDmPolicy = createScopedDmSecurityResolver<ResolvedIrcAccount>({
   resolvePolicy: (account) => account.config.dmPolicy,
   resolveAllowFrom: (account) => account.config.allowFrom,
   policyPathSuffix: "dmPolicy",
+  classifyEntryAuthentication: identityEntryAuthenticationClassifier(ircIngressIdentity),
   normalizeEntry: (raw) => normalizeIrcAllowEntry(raw),
 });
 
@@ -109,26 +244,29 @@ const collectIrcGroupPolicyWarnings =
       remediation: 'Prefer channels.irc.groupPolicy="allowlist" with channels.irc.groups',
     },
   });
+const collectIrcOpenGroupFindings = createConditionalWarningCollector.findings({
+  collectWarnings: collectIrcGroupPolicyWarnings,
+  checkId: "channels.irc.groups.open",
+  severity: "warn",
+  title: "IRC security warning",
+});
 
-const collectIrcSecurityWarnings = composeAccountWarningCollectors<
-  ResolvedIrcAccount,
-  {
-    account: ResolvedIrcAccount;
-    cfg: CoreConfig;
-  }
->(
-  collectIrcGroupPolicyWarnings,
-  (account) =>
-    !account.config.tls &&
-    "- IRC TLS is disabled (channels.irc.tls=false); traffic and credentials are plaintext.",
-  (account) =>
-    account.config.nickserv?.register &&
-    '- IRC NickServ registration is enabled (channels.irc.nickserv.register=true); this sends "REGISTER" on every connect. Disable after first successful registration.',
-  (account) =>
-    account.config.nickserv?.register &&
-    !account.config.nickserv.password?.trim() &&
-    "- IRC NickServ registration is enabled but no NickServ password is resolved; set channels.irc.nickserv.password, channels.irc.nickserv.passwordFile, or IRC_NICKSERV_PASSWORD.",
-);
+const collectIrcSecurityWarnings = (params: { account: ResolvedIrcAccount; cfg: CoreConfig }) => [
+  ...collectIrcOpenGroupFindings(params),
+  ...(!params.account.config.tls
+    ? ["- IRC TLS is disabled (channels.irc.tls=false); traffic and credentials are plaintext."]
+    : []),
+  ...(params.account.config.nickserv?.register
+    ? [
+        '- IRC NickServ registration is enabled (channels.irc.nickserv.register=true); this sends "REGISTER" on every connect. Disable after first successful registration.',
+      ]
+    : []),
+  ...(params.account.config.nickserv?.register && !params.account.config.nickserv.password?.trim()
+    ? [
+        "- IRC NickServ registration is enabled but no NickServ password is resolved; set channels.irc.nickserv.password, channels.irc.nickserv.passwordFile, or IRC_NICKSERV_PASSWORD.",
+      ]
+    : []),
+];
 
 export const ircPlugin: ChannelPlugin<ResolvedIrcAccount, IrcProbe> = createChatChannelPlugin({
   base: {
@@ -137,30 +275,37 @@ export const ircPlugin: ChannelPlugin<ResolvedIrcAccount, IrcProbe> = createChat
       ...meta,
       quickstartAllowFrom: true,
     },
-    setup: ircSetupAdapter,
+    setupContract: ircSetupContract,
     setupWizard: ircSetupWizard,
     capabilities: {
       chatTypes: ["direct", "group"],
       media: true,
       blockStreaming: true,
     },
-    reload: { configPrefixes: ["channels.irc"] },
-    configSchema: buildChannelConfigSchema(IrcConfigSchema),
+    reload: { configPrefixes: ["channels.irc"], accountScopedRestart: true },
+    configSchema: IrcChannelConfigSchema,
     config: {
       ...ircConfigAdapter,
+      hasConfiguredState: ({ env }) =>
+        typeof env?.IRC_HOST === "string" &&
+        env.IRC_HOST.trim().length > 0 &&
+        typeof env?.IRC_NICK === "string" &&
+        env.IRC_NICK.trim().length > 0,
       isConfigured: (account) => account.configured,
       describeAccount: (account) =>
         describeAccountSnapshot({
           account,
           configured: account.configured,
-          extra: {
-            host: account.host,
-            port: account.port,
-            tls: account.tls,
-            nick: account.nick,
-            passwordSource: account.passwordSource,
-          },
+          extra: ircAccountDetails(account),
         }),
+    },
+    secrets: {
+      secretTargetRegistryEntries,
+      collectRuntimeConfigAssignments,
+    },
+    doctor: {
+      groupAllowFromFallbackToAllowFrom: false,
+      collectMutableAllowlistWarnings: collectIrcMutableAllowlistWarnings,
     },
     groups: {
       resolveRequireMention: ({ cfg, accountId, groupId }) => {
@@ -168,28 +313,30 @@ export const ircPlugin: ChannelPlugin<ResolvedIrcAccount, IrcProbe> = createChat
         if (!groupId) {
           return true;
         }
-        const match = resolveIrcGroupMatch({ groups: account.config.groups, target: groupId });
-        return resolveIrcRequireMention({
-          groupConfig: match.groupConfig,
-          wildcardConfig: match.wildcardConfig,
-        });
+        return resolveIrcGroupRequireMention({ groups: account.config.groups, target: groupId });
       },
       resolveToolPolicy: ({ cfg, accountId, groupId }) => {
         const account = resolveIrcAccount({ cfg: cfg as CoreConfig, accountId });
         if (!groupId) {
           return undefined;
         }
-        const match = resolveIrcGroupMatch({ groups: account.config.groups, target: groupId });
-        return match.groupConfig?.tools ?? match.wildcardConfig?.tools;
+        return resolveIrcGroupToolPolicy({ groups: account.config.groups, target: groupId });
       },
     },
     messaging: {
+      targetPrefixes: ["irc"],
       normalizeTarget: normalizeIrcMessagingTarget,
+      inferTargetChatType: ({ to }) => {
+        const target = normalizeIrcMessagingTarget(to);
+        return target ? (isChannelTarget(target) ? "group" : "direct") : undefined;
+      },
+      resolveOutboundSessionRoute: resolveIrcOutboundSessionRoute,
       targetResolver: {
         looksLikeId: looksLikeIrcTargetId,
         hint: "<#channel|nick>",
       },
     },
+    message: ircMessageAdapter,
     resolver: {
       resolveTargets: async ({ inputs, kind }) => {
         return inputs.map((input) => {
@@ -227,45 +374,20 @@ export const ircPlugin: ChannelPlugin<ResolvedIrcAccount, IrcProbe> = createChat
       },
     },
     directory: createChannelDirectoryAdapter({
-      listPeers: async (params) =>
-        listResolvedDirectoryEntriesFromSources<ResolvedIrcAccount>({
-          ...params,
-          kind: "user",
-          resolveAccount: adaptScopedAccountAccessor(resolveIrcAccount),
-          resolveSources: (account) => [
-            account.config.allowFrom ?? [],
-            account.config.groupAllowFrom ?? [],
-            ...Object.values(account.config.groups ?? {}).map((group) => group.allowFrom ?? []),
-          ],
-          normalizeId: (entry) => normalizePairingTarget(entry) || null,
-        }),
+      listPeers: async (params) => listIrcDirectoryPeersFromConfig(params),
       listGroups: async (params) => {
-        const entries = listResolvedDirectoryEntriesFromSources<ResolvedIrcAccount>({
-          ...params,
-          kind: "group",
-          resolveAccount: adaptScopedAccountAccessor(resolveIrcAccount),
-          resolveSources: (account) => [
-            account.config.channels ?? [],
-            Object.keys(account.config.groups ?? {}),
-          ],
-          normalizeId: (entry) => {
-            const normalized = normalizeIrcMessagingTarget(entry);
-            return normalized && isChannelTarget(normalized) ? normalized : null;
-          },
-        });
-        return entries.map((entry) => ({ ...entry, name: entry.id }));
+        const entries = await listIrcDirectoryGroupsFromConfig(params);
+        return entries.map((entry) => Object.assign({}, entry, { name: entry.id }));
       },
     }),
     status: createComputedAccountStatusAdapter<ResolvedIrcAccount, IrcProbe>({
       defaultRuntime: createDefaultChannelRuntimeState(DEFAULT_ACCOUNT_ID),
       buildChannelSummary: ({ account, snapshot }) => ({
-        ...buildBaseChannelStatusSummary(snapshot),
+        ...buildProbeChannelStatusSummary(snapshot),
         host: account.host,
         port: snapshot.port,
         tls: account.tls,
         nick: account.nick,
-        probe: snapshot.probe,
-        lastProbeAt: snapshot.lastProbeAt ?? null,
       }),
       probeAccount: async ({ cfg, account, timeoutMs }) =>
         probeIrc(cfg as CoreConfig, { accountId: account.accountId, timeoutMs }),
@@ -274,40 +396,35 @@ export const ircPlugin: ChannelPlugin<ResolvedIrcAccount, IrcProbe> = createChat
         name: account.name,
         enabled: account.enabled,
         configured: account.configured,
-        extra: {
-          host: account.host,
-          port: account.port,
-          tls: account.tls,
-          nick: account.nick,
-          passwordSource: account.passwordSource,
-        },
+        extra: ircAccountDetails(account),
       }),
     }),
     gateway: {
       startAccount: async (ctx) => {
         const account = ctx.account;
-        const statusSink = createAccountStatusSink({
-          accountId: ctx.accountId,
-          setStatus: ctx.setStatus,
-        });
+        const statusSink = createAccountStatusSink(ctx);
         if (!account.configured) {
           throw new Error(
             `IRC is not configured for account "${account.accountId}" (need host and nick in channels.irc).`,
           );
         }
-        ctx.log?.info(
+        ctx.log?.info?.(
           `[${account.accountId}] starting IRC provider (${account.host}:${account.port}${account.tls ? " tls" : ""})`,
         );
-        await runStoppablePassiveMonitor({
+        const { monitorIrcProvider } = await import("./channel-runtime.js");
+        await runPassiveAccountLifecycle({
           abortSignal: ctx.abortSignal,
           start: async () =>
             await monitorIrcProvider({
               accountId: account.accountId,
-              config: ctx.cfg as CoreConfig,
+              config: ctx.cfg,
               runtime: ctx.runtime,
               abortSignal: ctx.abortSignal,
               statusSink,
             }),
+          stop: async (monitor) => {
+            await monitor.stop();
+          },
         });
       },
     },
@@ -317,12 +434,16 @@ export const ircPlugin: ChannelPlugin<ResolvedIrcAccount, IrcProbe> = createChat
       idLabel: "ircUser",
       message: PAIRING_APPROVED_MESSAGE,
       normalizeAllowEntry: (entry) => normalizeIrcAllowEntry(entry),
-      notify: async ({ id, message }) => {
+      notify: async ({ cfg, id, message, accountId }) => {
         const target = normalizePairingTarget(id);
         if (!target) {
           throw new Error(`invalid IRC pairing id: ${id}`);
         }
-        await sendMessageIrc(target, message);
+        const { sendMessageIrc } = await import("./channel-runtime.js");
+        await sendMessageIrc(target, message, {
+          cfg: cfg as CoreConfig,
+          accountId,
+        });
       },
     },
   },
@@ -332,25 +453,15 @@ export const ircPlugin: ChannelPlugin<ResolvedIrcAccount, IrcProbe> = createChat
   },
   outbound: {
     base: {
-      deliveryMode: "direct",
-      chunker: (text, limit) => getIrcRuntime().channel.text.chunkMarkdownText(text, limit),
-      chunkerMode: "markdown",
-      textChunkLimit: 350,
+      ...ircOutboundBaseAdapter,
+      sendFormattedText: sendFormattedIrcText,
     },
     attachedResults: {
       channel: "irc",
-      sendText: async ({ cfg, to, text, accountId, replyToId }) =>
-        await sendMessageIrc(to, text, {
-          cfg: cfg as CoreConfig,
-          accountId: accountId ?? undefined,
-          replyTo: replyToId ?? undefined,
-        }),
-      sendMedia: async ({ cfg, to, text, mediaUrl, accountId, replyToId }) =>
-        await sendMessageIrc(to, mediaUrl ? `${text}\n\nAttachment: ${mediaUrl}` : text, {
-          cfg: cfg as CoreConfig,
-          accountId: accountId ?? undefined,
-          replyTo: replyToId ?? undefined,
-        }),
+      sendText: ({ onDeliveryResult: _onDeliveryResult, ...ctx }) =>
+        ircMessageAdapter.send.text(ctx),
+      sendMedia: ({ onDeliveryResult: _onDeliveryResult, mediaUrl, ...ctx }) =>
+        ircMessageAdapter.send.media({ ...ctx, mediaUrl: mediaUrl ?? "" }),
     },
   },
 });

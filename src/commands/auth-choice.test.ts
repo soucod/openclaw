@@ -1,1530 +1,399 @@
-import fs from "node:fs/promises";
-import type { OAuthCredentials } from "@mariozechner/pi-ai";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import anthropicPlugin from "../../extensions/anthropic/index.js";
-import chutesPlugin from "../../extensions/chutes/index.js";
-import cloudflareAiGatewayPlugin from "../../extensions/cloudflare-ai-gateway/index.js";
-import googlePlugin from "../../extensions/google/index.js";
-import huggingfacePlugin from "../../extensions/huggingface/index.js";
-import kimiCodingPlugin from "../../extensions/kimi-coding/index.js";
-import minimaxPlugin from "../../extensions/minimax/index.js";
-import mistralPlugin from "../../extensions/mistral/index.js";
-import moonshotPlugin from "../../extensions/moonshot/index.js";
-import ollamaPlugin from "../../extensions/ollama/index.js";
-import openAIPlugin from "../../extensions/openai/index.js";
-import opencodeGoPlugin from "../../extensions/opencode-go/index.js";
-import opencodePlugin from "../../extensions/opencode/index.js";
-import openrouterPlugin from "../../extensions/openrouter/index.js";
-import qianfanPlugin from "../../extensions/qianfan/index.js";
-import qwenPortalAuthPlugin from "../../extensions/qwen-portal-auth/index.js";
-import syntheticPlugin from "../../extensions/synthetic/index.js";
-import togetherPlugin from "../../extensions/together/index.js";
-import venicePlugin from "../../extensions/venice/index.js";
-import vercelAiGatewayPlugin from "../../extensions/vercel-ai-gateway/index.js";
-import xaiPlugin from "../../extensions/xai/index.js";
-import xiaomiPlugin from "../../extensions/xiaomi/index.js";
-import { setDetectZaiEndpointForTesting } from "../../extensions/zai/detect.js";
-import zaiPlugin from "../../extensions/zai/index.js";
-import { resolveAgentDir } from "../agents/agent-scope.js";
-import { resolveAgentModelPrimaryValue } from "../config/model-input.js";
+// Auth choice tests cover auth choice application, provider config, and credential prompts.
+import path from "node:path";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  MINIMAX_CN_API_BASE_URL,
-  ZAI_CODING_CN_BASE_URL,
-  ZAI_CODING_GLOBAL_BASE_URL,
-} from "../plugins/provider-model-definitions.js";
-import type { ProviderPlugin } from "../plugins/types.js";
-import { registerProviderPlugins } from "../test-utils/plugin-registration.js";
-import type { WizardPrompter } from "../wizard/prompts.js";
-import { applyAuthChoice, resolvePreferredProviderForAuthChoice } from "./auth-choice.js";
-import { GOOGLE_GEMINI_DEFAULT_MODEL } from "./google-gemini-model-default.js";
-import type { AuthChoice } from "./onboard-types.js";
-import {
-  authProfilePathForAgent,
   createAuthTestLifecycle,
   createExitThrowingRuntime,
-  createWizardPrompter,
-  readAuthProfilesForAgent,
-  requireOpenClawAgentDir,
+  createWizardPrompter as createPrompter,
   setupAuthTestEnv,
-} from "./test-wizard-helpers.js";
+} from "../../test/helpers/auth-wizard.js";
+import { resolveAgentDir } from "../agents/agent-scope.js";
+import type { OpenClawConfig } from "../config/config.js";
+import { resolveAgentModelPrimaryValue } from "../config/model-input.js";
+import * as providerAuthChoices from "../plugins/provider-auth-choices.js";
+import type { ProviderAuthMethod, ProviderAuthResult, ProviderPlugin } from "../plugins/types.js";
+import { applyAuthChoice } from "./auth-choice.apply.js";
 
-type DetectZaiEndpoint = typeof import("./zai-endpoint-detect.js").detectZaiEndpoint;
-
-vi.mock("../../extensions/github-copilot/login.js", () => ({
-  githubCopilotLoginCommand: vi.fn(async () => {}),
-}));
-
-const loginOpenAICodexOAuth = vi.hoisted(() =>
-  vi.fn<() => Promise<OAuthCredentials | null>>(async () => null),
-);
-vi.mock("./openai-codex-oauth.js", () => ({
-  loginOpenAICodexOAuth,
-}));
+type ResolveDeprecatedProviderInstallCatalogEntry =
+  typeof import("../plugins/provider-install-catalog.js").resolveDeprecatedProviderInstallCatalogEntry;
 
 const resolvePluginProviders = vi.hoisted(() => vi.fn<() => ProviderPlugin[]>(() => []));
-vi.mock("../plugins/provider-auth-choice.runtime.js", async (importOriginal) => {
-  const actual =
-    await importOriginal<typeof import("../plugins/provider-auth-choice.runtime.js")>();
-  return {
-    ...actual,
-    resolvePluginProviders,
-  };
-});
+const runProviderModelSelectedHook = vi.hoisted(() => vi.fn(async () => {}));
+const resolveDeprecatedProviderInstallCatalogEntry = vi.hoisted(() =>
+  vi.fn<ResolveDeprecatedProviderInstallCatalogEntry>(() => undefined),
+);
 
-const detectZaiEndpoint = vi.hoisted(() => vi.fn<DetectZaiEndpoint>(async () => null));
-vi.mock("./zai-endpoint-detect.js", () => ({
-  detectZaiEndpoint,
+vi.mock("../plugins/provider-install-catalog.js", () => ({
+  resolveDeprecatedProviderInstallCatalogEntry,
+  resolveProviderInstallCatalogEntry: vi.fn(() => undefined),
+}));
+
+vi.mock("../plugins/provider-auth-choice.runtime.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../plugins/provider-auth-choice.runtime.js")>()),
+  resolvePluginProviders,
+  resolvePluginSetupProvider: () => undefined,
+  runProviderModelSelectedHook,
+}));
+
+vi.mock("../agents/agent-scope.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../agents/agent-scope.js")>()),
+  resolveDefaultAgentId: () => "main",
+  resolveAgentDir: (configForTest: unknown, agentId: string) =>
+    `${process.env.OPENCLAW_STATE_DIR ?? "/tmp/openclaw-state"}/agents/${agentId}/agent`,
+  resolveAgentWorkspaceDir: (configForTest: unknown, agentId: string) =>
+    `/tmp/openclaw-workspaces/${agentId}`,
+  // Required by src/agents/model-runtime-policy.ts, which is transitively
+  // imported through provider-auth-choice -> runtime-plugin-install.
+  resolveSessionAgentIds: () => ({ defaultAgentId: "main", sessionAgentId: "main" }),
+  listAgentEntries: () => [],
+}));
+
+vi.mock("../agents/workspace.js", () => ({
+  resolveDefaultAgentWorkspaceDir: () => "/tmp/openclaw-workspace",
+}));
+
+vi.mock("../infra/browser-open.js", () => ({
+  openUrl: vi.fn(async () => {}),
+}));
+
+vi.mock("../infra/remote-env.js", () => ({
+  isRemoteEnvironment: () => false,
+}));
+
+vi.mock("../plugins/provider-oauth-flow.js", () => ({
+  createVpsAwareOAuthHandlers: vi.fn(),
 }));
 
 type StoredAuthProfile = {
   key?: string;
+  token?: string;
   keyRef?: { source: string; provider: string; id: string };
   access?: string;
   refresh?: string;
+  expires?: number;
   provider?: string;
   type?: string;
   email?: string;
   metadata?: Record<string, string>;
 };
 
-function createDefaultProviderPlugins() {
-  return registerProviderPlugins(
-    anthropicPlugin,
-    chutesPlugin,
-    cloudflareAiGatewayPlugin,
-    googlePlugin,
-    huggingfacePlugin,
-    kimiCodingPlugin,
-    minimaxPlugin,
-    mistralPlugin,
-    moonshotPlugin,
-    ollamaPlugin,
-    openAIPlugin,
-    opencodeGoPlugin,
-    opencodePlugin,
-    openrouterPlugin,
-    qianfanPlugin,
-    qwenPortalAuthPlugin,
-    syntheticPlugin,
-    togetherPlugin,
-    venicePlugin,
-    vercelAiGatewayPlugin,
-    xaiPlugin,
-    xiaomiPlugin,
-    zaiPlugin,
-  );
+const testAuthProfileStores = vi.hoisted(
+  () => new Map<string, { profiles: Record<string, StoredAuthProfile> }>(),
+);
+
+// These tests verify profile payloads, not file locking; keep auth stores in memory.
+function resolveTestAuthStoreKey(agentDir?: string): string {
+  return agentDir?.trim() || process.env.OPENCLAW_AGENT_DIR || "__main__";
+}
+
+function readTestAuthProfileStore(agentDir?: string): {
+  profiles: Record<string, StoredAuthProfile>;
+} {
+  return testAuthProfileStores.get(resolveTestAuthStoreKey(agentDir)) ?? { profiles: {} };
+}
+
+function seedTestAuthProfile(params: {
+  profileId: string;
+  credential: StoredAuthProfile;
+  agentDir?: string;
+}): void {
+  const key = resolveTestAuthStoreKey(params.agentDir);
+  const store = testAuthProfileStores.get(key) ?? { profiles: {} };
+  store.profiles[params.profileId] = params.credential;
+  testAuthProfileStores.set(key, store);
+}
+
+// mock-isolation: Capture profile payloads without writing the credential store.
+vi.mock("../agents/auth-profiles.js", () => ({
+  persistAuthProfileBatch: async (params: {
+    profiles: readonly {
+      profileId: string;
+      credential: StoredAuthProfile;
+      replaceExisting?: boolean;
+    }[];
+    agentDir?: string;
+  }) => {
+    for (const profile of params.profiles) {
+      const existing = readTestAuthProfileStore(params.agentDir).profiles[profile.profileId];
+      if (profile.replaceExisting === false && existing) {
+        continue;
+      }
+      seedTestAuthProfile({ ...profile, agentDir: params.agentDir });
+    }
+    return { rollback() {} };
+  },
+}));
+
+function createOpenAiProvider(): ProviderPlugin {
+  return {
+    id: "openai",
+    pluginId: "openai",
+    label: "OpenAI API key",
+    auth: [
+      {
+        id: "api-key",
+        label: "OpenAI API key",
+        kind: "api_key",
+        wizard: { choiceId: "openai-api-key" },
+        run: async (ctx) => {
+          const env = ctx.env ?? process.env;
+          const envKey = env.OPENAI_API_KEY?.trim();
+          const useEnv =
+            envKey &&
+            (await ctx.prompter.confirm({
+              message: "Use OPENAI_API_KEY from environment?",
+            }));
+          const key = useEnv
+            ? envKey
+            : await ctx.prompter.text({ message: "Enter OpenAI API key" });
+          return {
+            profiles: [
+              {
+                profileId: "openai:api-key",
+                credential: { type: "api_key", provider: "openai", key },
+              },
+            ],
+            defaultModel: "openai/gpt-5.5",
+          };
+        },
+      },
+    ],
+  };
+}
+
+function createFixedChoiceProvider(params: {
+  providerId: string;
+  label: string;
+  choiceId: string;
+  method: ProviderAuthMethod;
+}): ProviderPlugin {
+  return {
+    id: params.providerId,
+    pluginId: params.providerId,
+    label: params.label,
+    auth: [
+      {
+        ...params.method,
+        wizard: {
+          choiceId: params.choiceId,
+          choiceLabel: params.label,
+          groupId: params.providerId,
+          groupLabel: params.label,
+        },
+      },
+    ],
+  };
 }
 
 describe("applyAuthChoice", () => {
   const lifecycle = createAuthTestLifecycle([
     "OPENCLAW_STATE_DIR",
     "OPENCLAW_AGENT_DIR",
-    "PI_CODING_AGENT_DIR",
     "ANTHROPIC_API_KEY",
     "OPENROUTER_API_KEY",
     "HF_TOKEN",
     "HUGGINGFACE_HUB_TOKEN",
-    "LITELLM_API_KEY",
-    "AI_GATEWAY_API_KEY",
-    "CLOUDFLARE_AI_GATEWAY_API_KEY",
-    "MOONSHOT_API_KEY",
-    "MISTRAL_API_KEY",
-    "KIMI_API_KEY",
     "GEMINI_API_KEY",
-    "XIAOMI_API_KEY",
-    "VENICE_API_KEY",
     "OPENCODE_API_KEY",
-    "TOGETHER_API_KEY",
-    "QIANFAN_API_KEY",
     "SYNTHETIC_API_KEY",
-    "SSH_TTY",
-    "CHUTES_CLIENT_ID",
   ]);
-  let activeStateDir: string | null = null;
+  let authTestRoot: string | null = null;
+  let authTestCleanup: (() => Promise<void>) | null = null;
+  let authStateCounter = 0;
   async function setupTempState() {
-    if (activeStateDir) {
-      await fs.rm(activeStateDir, { recursive: true, force: true });
+    if (!authTestRoot) {
+      throw new Error("auth test root not initialized");
     }
-    const env = await setupAuthTestEnv("openclaw-auth-");
-    activeStateDir = env.stateDir;
-    lifecycle.setStateDir(env.stateDir);
-  }
-  function createPrompter(overrides: Partial<WizardPrompter>): WizardPrompter {
-    return createWizardPrompter(overrides, { defaultSelect: "" });
-  }
-  function createSelectFirstOption(): WizardPrompter["select"] {
-    return vi.fn(async (params) => params.options[0]?.value as never);
-  }
-  function createNoopMultiselect(): WizardPrompter["multiselect"] {
-    return vi.fn(async () => []);
-  }
-  function createApiKeyPromptHarness(
-    overrides: Partial<Pick<WizardPrompter, "select" | "multiselect" | "text" | "confirm">> = {},
-  ): {
-    select: WizardPrompter["select"];
-    multiselect: WizardPrompter["multiselect"];
-    prompter: WizardPrompter;
-    runtime: ReturnType<typeof createExitThrowingRuntime>;
-  } {
-    const select = overrides.select ?? createSelectFirstOption();
-    const multiselect = overrides.multiselect ?? createNoopMultiselect();
-    return {
-      select,
-      multiselect,
-      prompter: createPrompter({ ...overrides, select, multiselect }),
-      runtime: createExitThrowingRuntime(),
-    };
+    testAuthProfileStores.clear();
+    const stateDir = path.join(authTestRoot, `state-${++authStateCounter}`);
+    const agentDir = path.join(stateDir, "agent");
+    process.env.OPENCLAW_STATE_DIR = stateDir;
+    process.env.OPENCLAW_AGENT_DIR = agentDir;
   }
   async function readAuthProfiles() {
-    return await readAuthProfilesForAgent<{
-      profiles?: Record<string, StoredAuthProfile>;
-    }>(requireOpenClawAgentDir());
+    return readTestAuthProfileStore(resolveAgentDir({} as OpenClawConfig, "main"));
   }
   async function readAuthProfile(profileId: string) {
     return (await readAuthProfiles()).profiles?.[profileId];
   }
+  function expectAuthProfileConfig(
+    result: { config: OpenClawConfig },
+    profileId: string,
+    expected: { provider: string; mode: string },
+  ) {
+    const profile = result.config.auth?.profiles?.[profileId];
+    expect(profile?.provider).toBe(expected.provider);
+    expect(profile?.mode).toBe(expected.mode);
+  }
+  function promptMessages(mock: { mock: { calls: unknown[][] } }): string[] {
+    return mock.mock.calls.map((call) => {
+      const message = (call[0] as { message?: unknown }).message;
+      return typeof message === "string" ? message : "";
+    });
+  }
+  function expectPromptMessageContaining(mock: { mock: { calls: unknown[][] } }, expected: string) {
+    expect(promptMessages(mock).join("\n")).toContain(expected);
+  }
+  function firstCallArg(mock: { mock: { calls: unknown[][] } }): unknown {
+    const call = mock.mock.calls[0];
+    if (!call) {
+      throw new Error("Expected first mock call");
+    }
+    return call[0];
+  }
+
+  let defaultProviderPlugins: ProviderPlugin[] = [];
+
+  beforeAll(async () => {
+    const authTestEnv = await setupAuthTestEnv("openclaw-auth-");
+    authTestRoot = authTestEnv.stateDir;
+    authTestCleanup = authTestEnv.cleanup;
+    defaultProviderPlugins = [createOpenAiProvider()];
+    resolvePluginProviders.mockReturnValue(defaultProviderPlugins);
+  });
+
+  afterAll(async () => {
+    await authTestCleanup?.();
+  });
 
   afterEach(async () => {
     vi.unstubAllGlobals();
     resolvePluginProviders.mockReset();
-    resolvePluginProviders.mockReturnValue(createDefaultProviderPlugins());
-    detectZaiEndpoint.mockReset();
-    detectZaiEndpoint.mockResolvedValue(null);
-    setDetectZaiEndpointForTesting(detectZaiEndpoint);
-    loginOpenAICodexOAuth.mockReset();
-    loginOpenAICodexOAuth.mockResolvedValue(null);
+    resolvePluginProviders.mockReturnValue(defaultProviderPlugins);
+    runProviderModelSelectedHook.mockClear();
+    resolveDeprecatedProviderInstallCatalogEntry.mockReset();
+    resolveDeprecatedProviderInstallCatalogEntry.mockReturnValue(undefined);
+    testAuthProfileStores.clear();
     await lifecycle.cleanup();
-    activeStateDir = null;
   });
 
-  setDetectZaiEndpointForTesting(detectZaiEndpoint);
-  resolvePluginProviders.mockReturnValue(createDefaultProviderPlugins());
-
-  it("does not throw when openai-codex oauth fails", async () => {
+  it("applies Anthropic setup-token auth when the provider exposes the setup flow", async () => {
     await setupTempState();
 
-    loginOpenAICodexOAuth.mockRejectedValueOnce(new Error("oauth failed"));
     resolvePluginProviders.mockReturnValue([
-      {
-        id: "openai-codex",
-        label: "OpenAI Codex",
-        auth: [
-          {
-            id: "oauth",
-            label: "ChatGPT OAuth",
-            kind: "oauth",
-            run: vi.fn(async () => {
-              try {
-                await loginOpenAICodexOAuth();
-              } catch {
-                return { profiles: [] };
-              }
-              return { profiles: [] };
-            }),
-          },
-        ],
-      },
-    ] as never);
-
-    const prompter = createPrompter({});
-    const runtime = createExitThrowingRuntime();
-
-    await expect(
-      applyAuthChoice({
-        authChoice: "openai-codex",
-        config: {},
-        prompter,
-        runtime,
-        setDefaultModel: false,
+      createFixedChoiceProvider({
+        providerId: "anthropic",
+        label: "Anthropic",
+        choiceId: "setup-token",
+        method: {
+          id: "setup-token",
+          label: "Anthropic setup-token",
+          kind: "token",
+          run: vi.fn(async (): Promise<ProviderAuthResult> => ({
+            profiles: [
+              {
+                profileId: "anthropic:default",
+                credential: {
+                  type: "token",
+                  provider: "anthropic",
+                  token: `sk-ant-oat01-${"a".repeat(80)}`,
+                },
+              },
+            ],
+            defaultModel: "anthropic/claude-sonnet-4-6",
+          })),
+        },
       }),
-    ).resolves.toEqual({ config: {} });
-  });
-
-  it("stores openai-codex OAuth with email profile id", async () => {
-    await setupTempState();
-
-    loginOpenAICodexOAuth.mockResolvedValueOnce({
-      email: "user@example.com",
-      refresh: "refresh-token",
-      access: "access-token",
-      expires: Date.now() + 60_000,
-    });
-    resolvePluginProviders.mockReturnValue([
-      {
-        id: "openai-codex",
-        label: "OpenAI Codex",
-        auth: [
-          {
-            id: "oauth",
-            label: "ChatGPT OAuth",
-            kind: "oauth",
-            run: vi.fn(async () => {
-              const creds = await loginOpenAICodexOAuth();
-              if (!creds) {
-                return { profiles: [] };
-              }
-              return {
-                profiles: [
-                  {
-                    profileId: "openai-codex:user@example.com",
-                    credential: {
-                      type: "oauth",
-                      provider: "openai-codex",
-                      refresh: "refresh-token",
-                      access: "access-token",
-                      expires: creds.expires,
-                      email: "user@example.com",
-                    },
-                  },
-                ],
-                defaultModel: "openai-codex/gpt-5.4",
-              };
-            }),
-          },
-        ],
-      },
-    ] as never);
-
-    const prompter = createPrompter({});
-    const runtime = createExitThrowingRuntime();
+    ]);
 
     const result = await applyAuthChoice({
-      authChoice: "openai-codex",
-      config: {},
-      prompter,
-      runtime,
-      setDefaultModel: false,
-    });
-
-    expect(result.config.auth?.profiles?.["openai-codex:user@example.com"]).toMatchObject({
-      provider: "openai-codex",
-      mode: "oauth",
-    });
-    expect(result.config.auth?.profiles?.["openai-codex:default"]).toBeUndefined();
-    expect(await readAuthProfile("openai-codex:user@example.com")).toMatchObject({
-      type: "oauth",
-      provider: "openai-codex",
-      refresh: "refresh-token",
-      access: "access-token",
-      email: "user@example.com",
-    });
-  });
-
-  it("prompts and writes provider API key for common providers", async () => {
-    const scenarios: Array<{
-      authChoice:
-        | "minimax-global-api"
-        | "minimax-cn-api"
-        | "synthetic-api-key"
-        | "huggingface-api-key";
-      promptContains: string;
-      profileId: string;
-      provider: string;
-      token: string;
-      expectedBaseUrl?: string;
-      expectedModelPrefix?: string;
-    }> = [
-      {
-        authChoice: "minimax-global-api" as const,
-        promptContains: "Enter MiniMax API key",
-        profileId: "minimax:global",
-        provider: "minimax",
-        token: "sk-minimax-test",
-      },
-      {
-        authChoice: "minimax-cn-api" as const,
-        promptContains: "Enter MiniMax CN API key",
-        profileId: "minimax:cn",
-        provider: "minimax",
-        token: "sk-minimax-test",
-        expectedBaseUrl: MINIMAX_CN_API_BASE_URL,
-      },
-      {
-        authChoice: "synthetic-api-key" as const,
-        promptContains: "Enter Synthetic API key",
-        profileId: "synthetic:default",
-        provider: "synthetic",
-        token: "sk-synthetic-test",
-      },
-      {
-        authChoice: "huggingface-api-key" as const,
-        promptContains: "Hugging Face",
-        profileId: "huggingface:default",
-        provider: "huggingface",
-        token: "hf-test-token",
-        expectedModelPrefix: "huggingface/",
-      },
-    ];
-    for (const scenario of scenarios) {
-      await setupTempState();
-
-      const text = vi.fn().mockResolvedValue(scenario.token);
-      const { prompter, runtime } = createApiKeyPromptHarness({ text });
-
-      const result = await applyAuthChoice({
-        authChoice: scenario.authChoice,
-        config: {},
-        prompter,
-        runtime,
-        setDefaultModel: true,
-      });
-
-      expect(text).toHaveBeenCalledWith(
-        expect.objectContaining({ message: expect.stringContaining(scenario.promptContains) }),
-      );
-      expect(result.config.auth?.profiles?.[scenario.profileId]).toMatchObject({
-        provider: scenario.provider,
-        mode: "api_key",
-      });
-      if (scenario.expectedBaseUrl) {
-        expect(result.config.models?.providers?.[scenario.provider]?.baseUrl).toBe(
-          scenario.expectedBaseUrl,
-        );
-      }
-      if (scenario.expectedModelPrefix) {
-        expect(
-          resolveAgentModelPrimaryValue(result.config.agents?.defaults?.model)?.startsWith(
-            scenario.expectedModelPrefix,
-          ),
-        ).toBe(true);
-      }
-      expect((await readAuthProfile(scenario.profileId))?.key).toBe(scenario.token);
-    }
-  });
-
-  it("handles Z.AI endpoint selection and detection paths", async () => {
-    const scenarios: Array<{
-      authChoice: "zai-api-key" | "zai-coding-global";
-      token: string;
-      endpointSelection?: "coding-cn" | "global";
-      detectResult?: {
-        endpoint: "coding-global" | "coding-cn";
-        modelId: string;
-        baseUrl: string;
-        note: string;
-      };
-      expectedBaseUrl: string;
-      expectedModel?: string;
-      shouldPromptForEndpoint: boolean;
-      expectedDetectCall?: { apiKey: string; endpoint?: "coding-global" | "coding-cn" };
-    }> = [
-      {
-        authChoice: "zai-api-key",
-        token: "zai-test-key",
-        endpointSelection: "coding-cn",
-        expectedBaseUrl: ZAI_CODING_CN_BASE_URL,
-        expectedModel: "zai/glm-5",
-        shouldPromptForEndpoint: true,
-      },
-      {
-        authChoice: "zai-coding-global",
-        token: "zai-test-key",
-        detectResult: {
-          endpoint: "coding-global",
-          modelId: "glm-4.7",
-          baseUrl: ZAI_CODING_GLOBAL_BASE_URL,
-          note: "Detected coding-global endpoint with GLM-4.7 fallback",
-        },
-        expectedBaseUrl: ZAI_CODING_GLOBAL_BASE_URL,
-        expectedModel: "zai/glm-4.7",
-        shouldPromptForEndpoint: false,
-        expectedDetectCall: { apiKey: "zai-test-key", endpoint: "coding-global" },
-      },
-      {
-        authChoice: "zai-api-key",
-        token: "zai-detected-key",
-        detectResult: {
-          endpoint: "coding-global",
-          modelId: "glm-4.5",
-          baseUrl: ZAI_CODING_GLOBAL_BASE_URL,
-          note: "Detected coding-global endpoint",
-        },
-        expectedBaseUrl: ZAI_CODING_GLOBAL_BASE_URL,
-        expectedModel: "zai/glm-4.5",
-        shouldPromptForEndpoint: false,
-        expectedDetectCall: { apiKey: "zai-detected-key" },
-      },
-    ];
-    for (const scenario of scenarios) {
-      await setupTempState();
-      detectZaiEndpoint.mockReset();
-      detectZaiEndpoint.mockResolvedValue(null);
-      if (scenario.detectResult) {
-        detectZaiEndpoint.mockResolvedValueOnce(scenario.detectResult);
-      }
-
-      const text = vi.fn().mockResolvedValue(scenario.token);
-      const select = vi.fn(async (params: { message: string }) => {
-        if (params.message === "Select Z.AI endpoint") {
-          return scenario.endpointSelection ?? "global";
-        }
-        return "default";
-      });
-      const { prompter, runtime } = createApiKeyPromptHarness({
-        select: select as WizardPrompter["select"],
-        text,
-      });
-
-      const result = await applyAuthChoice({
-        authChoice: scenario.authChoice,
-        config: {},
-        prompter,
-        runtime,
-        setDefaultModel: true,
-      });
-
-      if (scenario.expectedDetectCall) {
-        expect(detectZaiEndpoint).toHaveBeenCalledWith(scenario.expectedDetectCall);
-      }
-      if (scenario.shouldPromptForEndpoint) {
-        expect(select).toHaveBeenCalledWith(
-          expect.objectContaining({ message: "Select Z.AI endpoint", initialValue: "global" }),
-        );
-      } else {
-        expect(select).not.toHaveBeenCalledWith(
-          expect.objectContaining({ message: "Select Z.AI endpoint" }),
-        );
-      }
-      expect(result.config.models?.providers?.zai?.baseUrl).toBe(scenario.expectedBaseUrl);
-      if (scenario.expectedModel) {
-        expect(resolveAgentModelPrimaryValue(result.config.agents?.defaults?.model)).toBe(
-          scenario.expectedModel,
-        );
-      }
-      if (scenario.authChoice === "zai-api-key") {
-        expect((await readAuthProfile("zai:default"))?.key).toBe(scenario.token);
-      }
-    }
-  });
-
-  it("maps apiKey tokenProvider aliases to provider flow", async () => {
-    const scenarios: Array<{
-      tokenProvider: string;
-      token: string;
-      profileId: string;
-      provider: string;
-      expectedModel?: string;
-      expectedModelPrefix?: string;
-    }> = [
-      {
-        tokenProvider: "huggingface",
-        token: "hf-token-provider-test",
-        profileId: "huggingface:default",
-        provider: "huggingface",
-        expectedModelPrefix: "huggingface/",
-      },
-      {
-        tokenProvider: "  ToGeThEr  ",
-        token: "sk-together-token-provider-test",
-        profileId: "together:default",
-        provider: "together",
-        expectedModelPrefix: "together/",
-      },
-      {
-        tokenProvider: "KIMI-CODING",
-        token: "sk-kimi-token-provider-test",
-        profileId: "kimi:default",
-        provider: "kimi",
-        expectedModelPrefix: "kimi/",
-      },
-      {
-        tokenProvider: " GOOGLE  ",
-        token: "sk-gemini-token-provider-test",
-        profileId: "google:default",
-        provider: "google",
-        expectedModel: GOOGLE_GEMINI_DEFAULT_MODEL,
-      },
-      {
-        tokenProvider: " LITELLM  ",
-        token: "sk-litellm-token-provider-test",
-        profileId: "litellm:default",
-        provider: "litellm",
-        expectedModelPrefix: "litellm/",
-      },
-    ];
-    for (const scenario of scenarios) {
-      await setupTempState();
-      delete process.env.HF_TOKEN;
-      delete process.env.HUGGINGFACE_HUB_TOKEN;
-
-      const text = vi.fn().mockResolvedValue("should-not-be-used");
-      const confirm = vi.fn(async () => false);
-      const { prompter, runtime } = createApiKeyPromptHarness({ text, confirm });
-
-      const result = await applyAuthChoice({
-        authChoice: "apiKey",
-        config: {},
-        prompter,
-        runtime,
-        setDefaultModel: true,
-        opts: {
-          tokenProvider: scenario.tokenProvider,
-          token: scenario.token,
-        },
-      });
-
-      expect(result.config.auth?.profiles?.[scenario.profileId]).toMatchObject({
-        provider: scenario.provider,
-        mode: "api_key",
-      });
-      if (scenario.expectedModel) {
-        expect(resolveAgentModelPrimaryValue(result.config.agents?.defaults?.model)).toBe(
-          scenario.expectedModel,
-        );
-      }
-      if (scenario.expectedModelPrefix) {
-        expect(
-          resolveAgentModelPrimaryValue(result.config.agents?.defaults?.model)?.startsWith(
-            scenario.expectedModelPrefix,
-          ),
-        ).toBe(true);
-      }
-      expect(text).not.toHaveBeenCalled();
-      expect(confirm).not.toHaveBeenCalled();
-      expect((await readAuthProfile(scenario.profileId))?.key).toBe(scenario.token);
-    }
-  });
-
-  it.each([
-    {
-      authChoice: "moonshot-api-key",
-      tokenProvider: "moonshot",
-      profileId: "moonshot:default",
-      provider: "moonshot",
-      modelPrefix: "moonshot/",
-    },
-    {
-      authChoice: "mistral-api-key",
-      tokenProvider: "mistral",
-      profileId: "mistral:default",
-      provider: "mistral",
-      modelPrefix: "mistral/",
-    },
-    {
-      authChoice: "kimi-code-api-key",
-      tokenProvider: "kimi-code",
-      profileId: "kimi:default",
-      provider: "kimi",
-      modelPrefix: "kimi/",
-    },
-    {
-      authChoice: "xiaomi-api-key",
-      tokenProvider: "xiaomi",
-      profileId: "xiaomi:default",
-      provider: "xiaomi",
-      modelPrefix: "xiaomi/",
-    },
-    {
-      authChoice: "venice-api-key",
-      tokenProvider: "venice",
-      profileId: "venice:default",
-      provider: "venice",
-      modelPrefix: "venice/",
-    },
-    {
-      authChoice: "opencode-zen",
-      tokenProvider: "opencode",
-      profileId: "opencode:default",
-      provider: "opencode",
-      modelPrefix: "opencode/",
-      extraProfiles: ["opencode-go:default"],
-    },
-    {
-      authChoice: "opencode-go",
-      tokenProvider: "opencode-go",
-      profileId: "opencode-go:default",
-      provider: "opencode-go",
-      modelPrefix: "opencode-go/",
-      extraProfiles: ["opencode:default"],
-    },
-    {
-      authChoice: "together-api-key",
-      tokenProvider: "together",
-      profileId: "together:default",
-      provider: "together",
-      modelPrefix: "together/",
-    },
-    {
-      authChoice: "qianfan-api-key",
-      tokenProvider: "qianfan",
-      profileId: "qianfan:default",
-      provider: "qianfan",
-      modelPrefix: "qianfan/",
-    },
-    {
-      authChoice: "synthetic-api-key",
-      tokenProvider: "synthetic",
-      profileId: "synthetic:default",
-      provider: "synthetic",
-      modelPrefix: "synthetic/",
-    },
-  ] as const)(
-    "uses opts token for $authChoice without prompting",
-    async ({ authChoice, tokenProvider, profileId, provider, modelPrefix, extraProfiles }) => {
-      await setupTempState();
-
-      const text = vi.fn();
-      const confirm = vi.fn(async () => false);
-      const { prompter, runtime } = createApiKeyPromptHarness({ text, confirm });
-      const token = `sk-${tokenProvider}-test`;
-
-      const result = await applyAuthChoice({
-        authChoice,
-        config: {},
-        prompter,
-        runtime,
-        setDefaultModel: true,
-        opts: {
-          tokenProvider,
-          token,
-        },
-      });
-
-      expect(text).not.toHaveBeenCalled();
-      expect(confirm).not.toHaveBeenCalled();
-      expect(result.config.auth?.profiles?.[profileId]).toMatchObject({
-        provider,
-        mode: "api_key",
-      });
-      expect(
-        resolveAgentModelPrimaryValue(result.config.agents?.defaults?.model)?.startsWith(
-          modelPrefix,
-        ),
-      ).toBe(true);
-      expect((await readAuthProfile(profileId))?.key).toBe(token);
-      for (const extraProfile of extraProfiles ?? []) {
-        expect((await readAuthProfile(extraProfile))?.key).toBe(token);
-      }
-    },
-  );
-
-  it("uses opts token for Gemini and keeps global default model when setDefaultModel=false", async () => {
-    await setupTempState();
-
-    const text = vi.fn();
-    const confirm = vi.fn(async () => false);
-    const { prompter, runtime } = createApiKeyPromptHarness({ text, confirm });
-
-    const result = await applyAuthChoice({
-      authChoice: "gemini-api-key",
-      config: { agents: { defaults: { model: { primary: "openai/gpt-4o-mini" } } } },
-      prompter,
-      runtime,
-      setDefaultModel: false,
+      authChoice: "token",
+      config: {} as OpenClawConfig,
+      prompter: createPrompter({}),
+      runtime: createExitThrowingRuntime(),
+      setDefaultModel: true,
       opts: {
-        tokenProvider: "google",
-        token: "sk-gemini-test",
+        tokenProvider: "anthropic",
+        token: `sk-ant-oat01-${"a".repeat(80)}`,
       },
     });
 
-    expect(text).not.toHaveBeenCalled();
-    expect(confirm).not.toHaveBeenCalled();
-    expect(result.config.auth?.profiles?.["google:default"]).toMatchObject({
-      provider: "google",
-      mode: "api_key",
+    expectAuthProfileConfig(result, "anthropic:default", {
+      provider: "anthropic",
+      mode: "token",
     });
     expect(resolveAgentModelPrimaryValue(result.config.agents?.defaults?.model)).toBe(
-      "openai/gpt-4o-mini",
+      "anthropic/claude-sonnet-4-6",
     );
-    expect(result.agentModelOverride).toBe(GOOGLE_GEMINI_DEFAULT_MODEL);
-    expect((await readAuthProfile("google:default"))?.key).toBe("sk-gemini-test");
+    expect((await readAuthProfile("anthropic:default"))?.token).toBe(
+      `sk-ant-oat01-${"a".repeat(80)}`,
+    );
   });
 
-  it("prompts for Venice API key and shows the Venice note when no token is provided", async () => {
-    await setupTempState();
-    process.env.VENICE_API_KEY = "";
-
-    const note = vi.fn(async () => {});
-    const text = vi.fn(async () => "sk-venice-manual");
-    const prompter = createPrompter({ note, text });
-    const runtime = createExitThrowingRuntime();
-
-    const result = await applyAuthChoice({
-      authChoice: "venice-api-key",
-      config: {},
-      prompter,
-      runtime,
-      setDefaultModel: true,
-    });
-
-    expect(note).toHaveBeenCalledWith(
-      expect.stringContaining("privacy-focused inference"),
-      "Venice AI",
-    );
-    expect(text).toHaveBeenCalledWith(
-      expect.objectContaining({
-        message: "Enter Venice AI API key",
-      }),
-    );
-    expect(result.config.auth?.profiles?.["venice:default"]).toMatchObject({
-      provider: "venice",
-      mode: "api_key",
-    });
-    expect((await readAuthProfile("venice:default"))?.key).toBe("sk-venice-manual");
-  });
-
-  it("uses existing env API keys for selected providers", async () => {
-    const scenarios: Array<{
-      authChoice: "synthetic-api-key" | "openrouter-api-key" | "ai-gateway-api-key";
-      envKey: "SYNTHETIC_API_KEY" | "OPENROUTER_API_KEY" | "AI_GATEWAY_API_KEY";
-      envValue: string;
-      profileId: string;
-      provider: string;
-      opts?: { secretInputMode?: "ref" };
-      expectEnvPrompt: boolean;
-      expectedTextCalls: number;
-      expectedKey?: string;
-      expectedKeyRef?: { source: "env"; provider: string; id: string };
-      expectedModel?: string;
-      expectedModelPrefix?: string;
-    }> = [
-      {
-        authChoice: "synthetic-api-key",
-        envKey: "SYNTHETIC_API_KEY",
-        envValue: "sk-synthetic-env",
-        profileId: "synthetic:default",
-        provider: "synthetic",
-        expectEnvPrompt: true,
-        expectedTextCalls: 0,
-        expectedKey: "sk-synthetic-env",
-        expectedModelPrefix: "synthetic/",
-      },
-      {
-        authChoice: "openrouter-api-key",
-        envKey: "OPENROUTER_API_KEY",
-        envValue: "sk-openrouter-test",
-        profileId: "openrouter:default",
-        provider: "openrouter",
-        expectEnvPrompt: true,
-        expectedTextCalls: 0,
-        expectedKey: "sk-openrouter-test",
-        expectedModel: "openrouter/auto",
-      },
-      {
-        authChoice: "ai-gateway-api-key",
-        envKey: "AI_GATEWAY_API_KEY",
-        envValue: "gateway-test-key",
-        profileId: "vercel-ai-gateway:default",
-        provider: "vercel-ai-gateway",
-        expectEnvPrompt: true,
-        expectedTextCalls: 0,
-        expectedKey: "gateway-test-key",
-        expectedModel: "vercel-ai-gateway/anthropic/claude-opus-4.6",
-      },
-      {
-        authChoice: "ai-gateway-api-key",
-        envKey: "AI_GATEWAY_API_KEY",
-        envValue: "gateway-ref-key",
-        profileId: "vercel-ai-gateway:default",
-        provider: "vercel-ai-gateway",
-        opts: { secretInputMode: "ref" }, // pragma: allowlist secret
-        expectEnvPrompt: false,
-        expectedTextCalls: 1,
-        expectedKeyRef: { source: "env", provider: "default", id: "AI_GATEWAY_API_KEY" },
-        expectedModel: "vercel-ai-gateway/anthropic/claude-opus-4.6",
-      },
-    ];
-    for (const scenario of scenarios) {
-      await setupTempState();
-      delete process.env.SYNTHETIC_API_KEY;
-      delete process.env.OPENROUTER_API_KEY;
-      delete process.env.AI_GATEWAY_API_KEY;
-      process.env[scenario.envKey] = scenario.envValue;
-
-      const text = vi.fn();
-      const confirm = vi.fn(async () => true);
-      const { prompter, runtime } = createApiKeyPromptHarness({ text, confirm });
-
-      const result = await applyAuthChoice({
-        authChoice: scenario.authChoice,
-        config: {},
-        prompter,
-        runtime,
-        setDefaultModel: true,
-        opts: scenario.opts,
-      });
-
-      if (scenario.expectEnvPrompt) {
-        expect(confirm).toHaveBeenCalledWith(
-          expect.objectContaining({
-            message: expect.stringContaining(scenario.envKey),
-          }),
-        );
-      } else {
-        expect(confirm).not.toHaveBeenCalled();
-      }
-      expect(text).toHaveBeenCalledTimes(scenario.expectedTextCalls);
-      expect(result.config.auth?.profiles?.[scenario.profileId]).toMatchObject({
-        provider: scenario.provider,
-        mode: "api_key",
-      });
-      if (scenario.expectedModel) {
-        expect(resolveAgentModelPrimaryValue(result.config.agents?.defaults?.model)).toBe(
-          scenario.expectedModel,
-        );
-      }
-      if (scenario.expectedModelPrefix) {
-        expect(
-          resolveAgentModelPrimaryValue(result.config.agents?.defaults?.model)?.startsWith(
-            scenario.expectedModelPrefix,
-          ),
-        ).toBe(true);
-      }
-      const profile = await readAuthProfile(scenario.profileId);
-      if (scenario.expectedKeyRef) {
-        expect(profile?.keyRef).toEqual(scenario.expectedKeyRef);
-        expect(profile?.key).toBeUndefined();
-      } else {
-        expect(profile?.key).toBe(scenario.expectedKey);
-        expect(profile?.keyRef).toBeUndefined();
-      }
+  it("escapes removed provider auth choice guidance for terminal output", async () => {
+    const spy = vi
+      .spyOn(providerAuthChoices, "resolveManifestDeprecatedProviderAuthChoice")
+      .mockReturnValueOnce({
+        choiceId: "modern\nchoice",
+      } as never);
+    try {
+      await expect(
+        applyAuthChoice({
+          authChoice: "legacy\u001b[31mchoice",
+          config: {},
+          prompter: createPrompter({}),
+          runtime: createExitThrowingRuntime(),
+          setDefaultModel: true,
+        }),
+      ).rejects.toThrow(
+        'Auth choice "legacy\\u001b[31mchoice" is no longer supported. Use "modern\\nchoice" instead, or run openclaw onboard to choose interactively.',
+      );
+    } finally {
+      spy.mockRestore();
     }
   });
 
-  it("retries ref setup when provider preflight fails and can switch to env ref", async () => {
+  it("guides external provider auth-choice replacements before the plugin is installed", async () => {
+    const deprecatedChoiceSpy = vi
+      .spyOn(providerAuthChoices, "resolveManifestDeprecatedProviderAuthChoice")
+      .mockReturnValueOnce(undefined);
+    resolveDeprecatedProviderInstallCatalogEntry.mockReturnValueOnce({
+      choiceId: "qwen-api-key",
+    } as never);
+    try {
+      await expect(
+        applyAuthChoice({
+          authChoice: "modelstudio-api-key",
+          config: {},
+          prompter: createPrompter({}),
+          runtime: createExitThrowingRuntime(),
+          setDefaultModel: true,
+        }),
+      ).rejects.toThrow(
+        'Auth choice "modelstudio-api-key" is no longer supported. Use "qwen-api-key" instead, or run openclaw onboard to choose interactively.',
+      );
+    } finally {
+      deprecatedChoiceSpy.mockRestore();
+    }
+  });
+
+  it("uses explicit env for plugin auth resolution instead of host env", async () => {
     await setupTempState();
-    process.env.OPENAI_API_KEY = "sk-openai-env"; // pragma: allowlist secret
-
-    const selectValues: Array<"provider" | "env" | "filemain"> = ["provider", "filemain", "env"];
-    const select = vi.fn(async (params: Parameters<WizardPrompter["select"]>[0]) => {
-      const next = selectValues[0];
-      if (next && params.options.some((option) => option.value === next)) {
-        selectValues.shift();
-        return next as never;
-      }
-      return (params.options[0]?.value ?? "env") as never;
-    });
-    const text = vi
-      .fn<WizardPrompter["text"]>()
-      .mockResolvedValueOnce("/providers/openai/apiKey")
-      .mockResolvedValueOnce("OPENAI_API_KEY");
-    const note = vi.fn(async () => undefined);
-
-    const prompter = createPrompter({
-      select,
-      text,
-      note,
-      confirm: vi.fn(async () => true),
-    });
-    const runtime = createExitThrowingRuntime();
-
+    process.env.OPENAI_API_KEY = "sk-openai-host"; // pragma: allowlist secret
+    const env = { OPENAI_API_KEY: "sk-openai-explicit" } as NodeJS.ProcessEnv; // pragma: allowlist secret
+    const text = vi.fn().mockResolvedValue("should-not-be-used");
+    const confirm = vi.fn(async () => true);
     const result = await applyAuthChoice({
       authChoice: "openai-api-key",
-      config: {
-        secrets: {
-          providers: {
-            filemain: {
-              source: "file",
-              path: "/tmp/openclaw-missing-secrets.json",
-              mode: "json",
-            },
-          },
-        },
-      },
-      prompter,
-      runtime,
+      config: {},
+      env,
+      prompter: createPrompter({ text, confirm }),
+      runtime: createExitThrowingRuntime(),
       setDefaultModel: false,
-      opts: { secretInputMode: "ref" }, // pragma: allowlist secret
     });
 
-    expect(result.config.auth?.profiles?.["openai:default"]).toMatchObject({
+    const providerResolveInput = firstCallArg(resolvePluginProviders) as {
+      env?: NodeJS.ProcessEnv;
+      mode?: string;
+    };
+    expect(providerResolveInput.env).toBe(env);
+    expect(providerResolveInput.mode).toBe("setup");
+    expectPromptMessageContaining(confirm, "OPENAI_API_KEY");
+    expect(text).not.toHaveBeenCalled();
+    expectAuthProfileConfig(result, "openai:api-key", {
       provider: "openai",
       mode: "api_key",
     });
-    expect(note).toHaveBeenCalledWith(
-      expect.stringContaining("Could not validate provider reference"),
-      "Reference check failed",
-    );
-    expect(note).toHaveBeenCalledWith(
-      expect.stringContaining("Validated environment variable OPENAI_API_KEY."),
-      "Reference validated",
-    );
-    expect(await readAuthProfile("openai:default")).toMatchObject({
-      keyRef: { source: "env", provider: "default", id: "OPENAI_API_KEY" },
-    });
-  });
-
-  it("keeps existing default model for explicit provider keys when setDefaultModel=false", async () => {
-    const scenarios: Array<{
-      authChoice: "xai-api-key" | "opencode-zen" | "opencode-go";
-      token: string;
-      promptMessage: string;
-      existingPrimary: string;
-      expectedOverride: string;
-      profileId?: string;
-      profileProvider?: string;
-      extraProfileId?: string;
-      expectProviderConfigUndefined?: "opencode" | "opencode-go" | "opencode-zen";
-      agentId?: string;
-    }> = [
-      {
-        authChoice: "xai-api-key",
-        token: "sk-xai-test",
-        promptMessage: "Enter xAI API key",
-        existingPrimary: "openai/gpt-4o-mini",
-        expectedOverride: "xai/grok-4",
-        profileId: "xai:default",
-        profileProvider: "xai",
-        agentId: "agent-1",
-      },
-      {
-        authChoice: "opencode-zen",
-        token: "sk-opencode-zen-test",
-        promptMessage: "Enter OpenCode API key",
-        existingPrimary: "anthropic/claude-opus-4-5",
-        expectedOverride: "opencode/claude-opus-4-6",
-        profileId: "opencode:default",
-        profileProvider: "opencode",
-        extraProfileId: "opencode-go:default",
-        expectProviderConfigUndefined: "opencode",
-      },
-      {
-        authChoice: "opencode-go",
-        token: "sk-opencode-go-test",
-        promptMessage: "Enter OpenCode API key",
-        existingPrimary: "anthropic/claude-opus-4-5",
-        expectedOverride: "opencode-go/kimi-k2.5",
-        profileId: "opencode-go:default",
-        profileProvider: "opencode-go",
-        extraProfileId: "opencode:default",
-        expectProviderConfigUndefined: "opencode-go",
-      },
-    ];
-    for (const scenario of scenarios) {
-      await setupTempState();
-
-      const text = vi.fn().mockResolvedValue(scenario.token);
-      const { prompter, runtime } = createApiKeyPromptHarness({ text });
-
-      const result = await applyAuthChoice({
-        authChoice: scenario.authChoice,
-        config: { agents: { defaults: { model: { primary: scenario.existingPrimary } } } },
-        prompter,
-        runtime,
-        setDefaultModel: false,
-        agentId: scenario.agentId,
-      });
-
-      expect(text).toHaveBeenCalledWith(
-        expect.objectContaining({ message: scenario.promptMessage }),
-      );
-      expect(resolveAgentModelPrimaryValue(result.config.agents?.defaults?.model)).toBe(
-        scenario.existingPrimary,
-      );
-      expect(result.agentModelOverride).toBe(scenario.expectedOverride);
-      if (scenario.profileId && scenario.profileProvider) {
-        expect(result.config.auth?.profiles?.[scenario.profileId]).toMatchObject({
-          provider: scenario.profileProvider,
-          mode: "api_key",
-        });
-        const profileStore =
-          scenario.agentId && scenario.agentId !== "default"
-            ? await readAuthProfilesForAgent<{ profiles?: Record<string, StoredAuthProfile> }>(
-                resolveAgentDir(result.config, scenario.agentId),
-              )
-            : await readAuthProfiles();
-        expect(profileStore.profiles?.[scenario.profileId]?.key).toBe(scenario.token);
-      }
-      if (scenario.extraProfileId) {
-        const profileStore =
-          scenario.agentId && scenario.agentId !== "default"
-            ? await readAuthProfilesForAgent<{ profiles?: Record<string, StoredAuthProfile> }>(
-                resolveAgentDir(result.config, scenario.agentId),
-              )
-            : await readAuthProfiles();
-        expect(profileStore.profiles?.[scenario.extraProfileId]?.key).toBe(scenario.token);
-      }
-      if (scenario.expectProviderConfigUndefined) {
-        expect(
-          result.config.models?.providers?.[scenario.expectProviderConfigUndefined],
-        ).toBeUndefined();
-      }
-    }
-  });
-
-  it("sets default model when selecting github-copilot", async () => {
-    await setupTempState();
-
-    resolvePluginProviders.mockReturnValue([
-      {
-        id: "github-copilot",
-        label: "GitHub Copilot",
-        auth: [
-          {
-            id: "device",
-            label: "GitHub device login",
-            kind: "device_code",
-            run: vi.fn(async () => ({
-              profiles: [
-                {
-                  profileId: "github-copilot:github",
-                  credential: {
-                    type: "token",
-                    provider: "github-copilot",
-                    token: "github-device-token",
-                  },
-                },
-              ],
-              defaultModel: "github-copilot/gpt-4o",
-            })),
-          },
-        ],
-      },
-    ] as never);
-
-    const prompter = createPrompter({});
-    const runtime = createExitThrowingRuntime();
-
-    const stdin = process.stdin as NodeJS.ReadStream & { isTTY?: boolean };
-    const hadOwnIsTTY = Object.prototype.hasOwnProperty.call(stdin, "isTTY");
-    const previousIsTTYDescriptor = Object.getOwnPropertyDescriptor(stdin, "isTTY");
-    Object.defineProperty(stdin, "isTTY", {
-      configurable: true,
-      enumerable: true,
-      get: () => true,
-    });
-
-    try {
-      const result = await applyAuthChoice({
-        authChoice: "github-copilot",
-        config: {},
-        prompter,
-        runtime,
-        setDefaultModel: true,
-      });
-
-      expect(resolveAgentModelPrimaryValue(result.config.agents?.defaults?.model)).toBe(
-        "github-copilot/gpt-4o",
-      );
-    } finally {
-      if (previousIsTTYDescriptor) {
-        Object.defineProperty(stdin, "isTTY", previousIsTTYDescriptor);
-      } else if (!hadOwnIsTTY) {
-        delete (stdin as { isTTY?: boolean }).isTTY;
-      }
-    }
-  });
-
-  it("does not persist literal 'undefined' when API key prompts return undefined", async () => {
-    const scenarios = [
-      {
-        authChoice: "apiKey" as const,
-        envKey: "ANTHROPIC_API_KEY",
-        profileId: "anthropic:default",
-        provider: "anthropic",
-      },
-      {
-        authChoice: "openrouter-api-key" as const,
-        envKey: "OPENROUTER_API_KEY",
-        profileId: "openrouter:default",
-        provider: "openrouter",
-      },
-    ];
-
-    for (const scenario of scenarios) {
-      await setupTempState();
-      delete process.env[scenario.envKey];
-
-      const text = vi.fn(async () => undefined as unknown as string);
-      const prompter = createPrompter({ text });
-      const runtime = createExitThrowingRuntime();
-
-      const result = await applyAuthChoice({
-        authChoice: scenario.authChoice,
-        config: {},
-        prompter,
-        runtime,
-        setDefaultModel: false,
-      });
-
-      expect(result.config.auth?.profiles?.[scenario.profileId]).toMatchObject({
-        provider: scenario.provider,
-        mode: "api_key",
-      });
-
-      const profile = await readAuthProfile(scenario.profileId);
-      expect(profile?.key).toBe("");
-      expect(profile?.key).not.toBe("undefined");
-    }
-  });
-
-  it("ignores legacy LiteLLM oauth profiles when selecting litellm-api-key", async () => {
-    await setupTempState();
-    process.env.LITELLM_API_KEY = "sk-litellm-test"; // pragma: allowlist secret
-
-    const authProfilePath = authProfilePathForAgent(requireOpenClawAgentDir());
-    await fs.writeFile(
-      authProfilePath,
-      JSON.stringify(
-        {
-          version: 1,
-          profiles: {
-            "litellm:legacy": {
-              type: "oauth",
-              provider: "litellm",
-              access: "access-token",
-              refresh: "refresh-token",
-              expires: Date.now() + 60_000,
-            },
-          },
-        },
-        null,
-        2,
-      ),
-      "utf8",
-    );
-
-    const text = vi.fn();
-    const confirm = vi.fn(async () => true);
-    const { prompter, runtime } = createApiKeyPromptHarness({ text, confirm });
-
-    const result = await applyAuthChoice({
-      authChoice: "litellm-api-key",
-      config: {
-        auth: {
-          profiles: {
-            "litellm:legacy": { provider: "litellm", mode: "oauth" },
-          },
-          order: { litellm: ["litellm:legacy"] },
-        },
-      },
-      prompter,
-      runtime,
-      setDefaultModel: true,
-    });
-
-    expect(confirm).toHaveBeenCalledWith(
-      expect.objectContaining({
-        message: expect.stringContaining("LITELLM_API_KEY"),
-      }),
-    );
-    expect(text).not.toHaveBeenCalled();
-    expect(result.config.auth?.profiles?.["litellm:default"]).toMatchObject({
-      provider: "litellm",
-      mode: "api_key",
-    });
-
-    expect(await readAuthProfile("litellm:default")).toMatchObject({
-      type: "api_key",
-      key: "sk-litellm-test",
-    });
-  });
-
-  it("configures cloudflare ai gateway via env key and explicit opts", async () => {
-    const scenarios: Array<{
-      envGatewayKey?: string;
-      textValues: string[];
-      confirmValue: boolean;
-      opts?: {
-        secretInputMode?: "ref"; // pragma: allowlist secret
-        cloudflareAiGatewayAccountId?: string;
-        cloudflareAiGatewayGatewayId?: string;
-        cloudflareAiGatewayApiKey?: string;
-      };
-      expectEnvPrompt: boolean;
-      expectedTextCalls: number;
-      expectedKey?: string;
-      expectedKeyRef?: { source: string; provider: string; id: string };
-      expectedMetadata: { accountId: string; gatewayId: string };
-    }> = [
-      {
-        envGatewayKey: "cf-gateway-test-key",
-        textValues: ["cf-account-id", "cf-gateway-id"],
-        confirmValue: true,
-        expectEnvPrompt: true,
-        expectedTextCalls: 2,
-        expectedKey: "cf-gateway-test-key",
-        expectedMetadata: {
-          accountId: "cf-account-id",
-          gatewayId: "cf-gateway-id",
-        },
-      },
-      {
-        envGatewayKey: "cf-gateway-ref-key",
-        textValues: ["cf-account-id-ref", "cf-gateway-id-ref"],
-        confirmValue: true,
-        opts: {
-          secretInputMode: "ref", // pragma: allowlist secret
-        },
-        expectEnvPrompt: false,
-        expectedTextCalls: 3,
-        expectedKeyRef: { source: "env", provider: "default", id: "CLOUDFLARE_AI_GATEWAY_API_KEY" },
-        expectedMetadata: {
-          accountId: "cf-account-id-ref",
-          gatewayId: "cf-gateway-id-ref",
-        },
-      },
-      {
-        textValues: [],
-        confirmValue: false,
-        opts: {
-          cloudflareAiGatewayAccountId: "acc-direct",
-          cloudflareAiGatewayGatewayId: "gw-direct",
-          cloudflareAiGatewayApiKey: "cf-direct-key", // pragma: allowlist secret
-        },
-        expectEnvPrompt: false,
-        expectedTextCalls: 0,
-        expectedKey: "cf-direct-key",
-        expectedMetadata: {
-          accountId: "acc-direct",
-          gatewayId: "gw-direct",
-        },
-      },
-    ];
-    for (const scenario of scenarios) {
-      await setupTempState();
-      delete process.env.CLOUDFLARE_AI_GATEWAY_API_KEY;
-      if (scenario.envGatewayKey) {
-        process.env.CLOUDFLARE_AI_GATEWAY_API_KEY = scenario.envGatewayKey;
-      }
-
-      const text = vi.fn();
-      for (const textValue of scenario.textValues) {
-        text.mockResolvedValueOnce(textValue);
-      }
-      const confirm = vi.fn(async () => scenario.confirmValue);
-      const { prompter, runtime } = createApiKeyPromptHarness({ text, confirm });
-
-      const result = await applyAuthChoice({
-        authChoice: "cloudflare-ai-gateway-api-key",
-        config: {},
-        prompter,
-        runtime,
-        setDefaultModel: true,
-        opts: scenario.opts,
-      });
-
-      if (scenario.expectEnvPrompt) {
-        expect(confirm).toHaveBeenCalledWith(
-          expect.objectContaining({
-            message: expect.stringContaining("CLOUDFLARE_AI_GATEWAY_API_KEY"),
-          }),
-        );
-      } else {
-        expect(confirm).not.toHaveBeenCalled();
-      }
-      expect(text).toHaveBeenCalledTimes(scenario.expectedTextCalls);
-      expect(result.config.auth?.profiles?.["cloudflare-ai-gateway:default"]).toMatchObject({
-        provider: "cloudflare-ai-gateway",
-        mode: "api_key",
-      });
-      expect(resolveAgentModelPrimaryValue(result.config.agents?.defaults?.model)).toBe(
-        "cloudflare-ai-gateway/claude-sonnet-4-5",
-      );
-
-      const profile = await readAuthProfile("cloudflare-ai-gateway:default");
-      if (scenario.expectedKeyRef) {
-        expect(profile?.keyRef).toEqual(scenario.expectedKeyRef);
-      } else {
-        expect(profile?.key).toBe(scenario.expectedKey);
-      }
-      expect(profile?.metadata).toEqual(scenario.expectedMetadata);
-    }
-    delete process.env.CLOUDFLARE_AI_GATEWAY_API_KEY;
-  });
-
-  it("writes Chutes OAuth credentials when selecting chutes (remote/manual)", async () => {
-    await setupTempState();
-    process.env.SSH_TTY = "1";
-    process.env.CHUTES_CLIENT_ID = "cid_test";
-
-    const fetchSpy = vi.fn(async (input: string | URL) => {
-      const url = typeof input === "string" ? input : input.toString();
-      if (url === "https://api.chutes.ai/idp/token") {
-        return new Response(
-          JSON.stringify({
-            access_token: "at_test",
-            refresh_token: "rt_test",
-            expires_in: 3600,
-          }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        );
-      }
-      if (url === "https://api.chutes.ai/idp/userinfo") {
-        return new Response(JSON.stringify({ username: "remote-user" }), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-      return new Response("not found", { status: 404 });
-    });
-    vi.stubGlobal("fetch", fetchSpy);
-
-    const runtime = createExitThrowingRuntime();
-    const text: WizardPrompter["text"] = vi.fn(async (params) => {
-      if (params.message.startsWith("Paste the redirect URL")) {
-        const runtimeLog = runtime.log as ReturnType<typeof vi.fn>;
-        const lastLog = runtimeLog.mock.calls.at(-1)?.[0];
-        const urlLine = typeof lastLog === "string" ? lastLog : String(lastLog ?? "");
-        const urlMatch = urlLine.match(/https?:\/\/\S+/)?.[0] ?? "";
-        const state = urlMatch ? new URL(urlMatch).searchParams.get("state") : null;
-        if (!state) {
-          throw new Error("missing state in oauth URL");
-        }
-        return `?code=code_manual&state=${state}`;
-      }
-      return "code_manual";
-    });
-    const { prompter } = createApiKeyPromptHarness({ text });
-
-    const result = await applyAuthChoice({
-      authChoice: "chutes",
-      config: {},
-      prompter,
-      runtime,
-      setDefaultModel: false,
-    });
-
-    expect(text).toHaveBeenCalledWith(
-      expect.objectContaining({
-        message: expect.stringContaining("Paste the redirect URL"),
-      }),
-    );
-    expect(result.config.auth?.profiles?.["chutes:remote-user"]).toMatchObject({
-      provider: "chutes",
-      mode: "oauth",
-    });
-
-    expect(await readAuthProfile("chutes:remote-user")).toMatchObject({
-      provider: "chutes",
-      access: "at_test",
-      refresh: "rt_test",
-      email: "remote-user",
-    });
-  });
-
-  it("writes portal OAuth credentials for plugin providers", async () => {
-    const scenarios: Array<{
-      authChoice: "qwen-portal" | "minimax-global-oauth";
-      label: string;
-      authId: string;
-      authLabel: string;
-      providerId: string;
-      profileId: string;
-      baseUrl: string;
-      api: "openai-completions" | "anthropic-messages";
-      defaultModel: string;
-      apiKey: string;
-      selectValue?: string;
-    }> = [
-      {
-        authChoice: "qwen-portal",
-        label: "Qwen",
-        authId: "device",
-        authLabel: "Qwen OAuth",
-        providerId: "qwen-portal",
-        profileId: "qwen-portal:default",
-        baseUrl: "https://portal.qwen.ai/v1",
-        api: "openai-completions",
-        defaultModel: "qwen-portal/coder-model",
-        apiKey: "qwen-oauth", // pragma: allowlist secret
-      },
-      {
-        authChoice: "minimax-global-oauth",
-        label: "MiniMax",
-        authId: "oauth",
-        authLabel: "MiniMax OAuth (Global)",
-        providerId: "minimax-portal",
-        profileId: "minimax-portal:default",
-        baseUrl: "https://api.minimax.io/anthropic",
-        api: "anthropic-messages",
-        defaultModel: "minimax-portal/MiniMax-M2.7",
-        apiKey: "minimax-oauth", // pragma: allowlist secret
-      },
-    ];
-    for (const scenario of scenarios) {
-      await setupTempState();
-
-      resolvePluginProviders.mockReturnValue([
-        {
-          id: scenario.providerId,
-          label: scenario.label,
-          auth: [
-            {
-              id: scenario.authId,
-              label: scenario.authLabel,
-              kind: "device_code",
-              wizard: { choiceId: scenario.authChoice },
-              run: vi.fn(async () => ({
-                profiles: [
-                  {
-                    profileId: scenario.profileId,
-                    credential: {
-                      type: "oauth",
-                      provider: scenario.providerId,
-                      access: "access",
-                      refresh: "refresh",
-                      expires: Date.now() + 60 * 60 * 1000,
-                    },
-                  },
-                ],
-                configPatch: {
-                  models: {
-                    providers: {
-                      [scenario.providerId]: {
-                        baseUrl: scenario.baseUrl,
-                        apiKey: scenario.apiKey,
-                        api: scenario.api,
-                        models: [],
-                      },
-                    },
-                  },
-                },
-                defaultModel: scenario.defaultModel,
-              })),
-            },
-          ],
-        },
-      ] as never);
-
-      const prompter = createPrompter(
-        scenario.selectValue
-          ? { select: vi.fn(async () => scenario.selectValue as never) as WizardPrompter["select"] }
-          : {},
-      );
-      const runtime = createExitThrowingRuntime();
-
-      const result = await applyAuthChoice({
-        authChoice: scenario.authChoice,
-        config: {},
-        prompter,
-        runtime,
-        setDefaultModel: true,
-      });
-
-      expect(result.config.auth?.profiles?.[scenario.profileId]).toMatchObject({
-        provider: scenario.providerId,
-        mode: "oauth",
-      });
-      expect(resolveAgentModelPrimaryValue(result.config.agents?.defaults?.model)).toBe(
-        scenario.defaultModel,
-      );
-      expect(result.config.models?.providers?.[scenario.providerId]).toMatchObject({
-        baseUrl: scenario.baseUrl,
-        apiKey: scenario.apiKey,
-      });
-      expect(await readAuthProfile(scenario.profileId)).toMatchObject({
-        provider: scenario.providerId,
-        access: "access",
-        refresh: "refresh",
-      });
-    }
-  });
-});
-
-describe("resolvePreferredProviderForAuthChoice", () => {
-  it("maps known and unknown auth choices", async () => {
-    const scenarios = [
-      { authChoice: "github-copilot" as const, expectedProvider: "github-copilot" },
-      { authChoice: "qwen-portal" as const, expectedProvider: "qwen-portal" },
-      { authChoice: "mistral-api-key" as const, expectedProvider: "mistral" },
-      { authChoice: "ollama" as const, expectedProvider: "ollama" },
-      { authChoice: "unknown" as AuthChoice, expectedProvider: undefined },
-    ] as const;
-    for (const scenario of scenarios) {
-      await expect(
-        resolvePreferredProviderForAuthChoice({ choice: scenario.authChoice }),
-      ).resolves.toBe(scenario.expectedProvider);
-    }
+    expect((await readAuthProfile("openai:api-key"))?.key).toBe("sk-openai-explicit");
   });
 });

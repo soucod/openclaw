@@ -1,120 +1,104 @@
-import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
-import { EventEmitter } from "node:events";
-import { beforeAll, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { runCommandWithTimeout } from "../process/exec.js";
+import { createCommandResult } from "../test-utils/npm-spec-install-test-helpers.js";
+import { resolveSshClient } from "./ssh-client.js";
+import { resolveSshConfig } from "./ssh-config.js";
 
-type MockSpawnChild = EventEmitter & {
-  stdout?: EventEmitter & { setEncoding?: (enc: string) => void };
-  kill?: (signal?: string) => void;
-};
+// mock-isolation: Parse fixed SSH output without launching host processes.
+vi.mock("../process/exec.js", () => ({ runCommandWithTimeout: vi.fn() }));
+// mock-isolation: Keep the SSH binary deterministic instead of probing the host PATH.
+vi.mock("./ssh-client.js", () => ({ resolveSshClient: vi.fn(() => "/usr/bin/ssh") }));
 
-function createMockSpawnChild() {
-  const child = new EventEmitter() as MockSpawnChild;
-  const stdout = new EventEmitter() as MockSpawnChild["stdout"];
-  stdout!.setEncoding = vi.fn();
-  child.stdout = stdout;
-  child.kill = vi.fn();
-  return { child, stdout };
+const runCommandMock = vi.mocked(runCommandWithTimeout);
+const resolveSshClientMock = vi.mocked(resolveSshClient);
+const ssh = "/usr/bin/ssh";
+const host = "peters-mac-studio-1.sheep-coho.ts.net";
+const sshOutput = `user steipete\nhostname ${host}\nport 2222\nidentityfile none\nidentityfile /tmp/id_ed25519\n`;
+const target = { user: "me", host: "alias", port: 22 };
+const command = () => runCommandMock.mock.calls[0]?.[0];
+
+function commandResult(
+  overrides: Partial<Awaited<ReturnType<typeof runCommandWithTimeout>>> = {},
+): Awaited<ReturnType<typeof runCommandWithTimeout>> {
+  return createCommandResult({ stdout: sshOutput, ...overrides });
 }
 
-vi.mock("node:child_process", () => {
-  const spawn = vi.fn(() => {
-    const { child, stdout } = createMockSpawnChild();
-    process.nextTick(() => {
-      stdout?.emit(
-        "data",
-        [
-          "user steipete",
-          "hostname peters-mac-studio-1.sheep-coho.ts.net",
-          "port 2222",
-          "identityfile none",
-          "identityfile /tmp/id_ed25519",
-          "",
-        ].join("\n"),
-      );
-      child.emit("exit", 0);
-    });
-    return child;
-  });
-  return { spawn };
-});
-
-const spawnMock = vi.mocked(spawn);
-
-let parseSshConfigOutput: typeof import("./ssh-config.js").parseSshConfigOutput;
-let resolveSshConfig: typeof import("./ssh-config.js").resolveSshConfig;
-
 describe("ssh-config", () => {
-  beforeAll(async () => {
-    ({ parseSshConfigOutput, resolveSshConfig } = await import("./ssh-config.js"));
+  beforeEach(() => {
+    runCommandMock.mockReset().mockResolvedValue(commandResult());
+    resolveSshClientMock.mockReset().mockReturnValue(ssh);
   });
 
-  it("parses ssh -G output", () => {
-    const parsed = parseSshConfigOutput(
-      "user bob\nhostname example.com\nport 2222\nidentityfile none\nidentityfile /tmp/id\n",
+  it.each([
+    [
+      "alias:22",
+      "user me\nhostname resolved.example\nport 22\n",
+      ["-p", "22"],
+      { user: "me", host: "resolved.example", port: 22, identityFiles: [] },
+    ],
+    [
+      "alias",
+      sshOutput,
+      [],
+      { user: "steipete", host, port: 2222, identityFiles: ["/tmp/id_ed25519"] },
+    ],
+  ] as const)(
+    "resolves explicit or inherited port for %s",
+    async (input, stdout, portArgs, resolvedTarget) => {
+      runCommandMock.mockResolvedValueOnce(commandResult({ stdout }));
+      await expect(
+        resolveSshConfig({ host: "alias", port: 22 }, { explicitPort: input === "alias:22" }),
+      ).resolves.toEqual(resolvedTarget);
+      expect(command()).toEqual([ssh, "-G", ...portArgs, "--", "alias"]);
+    },
+  );
+
+  it("ignores invalid ports and blank lines", async () => {
+    runCommandMock.mockResolvedValueOnce(
+      commandResult({
+        stdout:
+          "user bob\nhostname example.com\nport not-a-number\nidentityfile none\nidentityfile   \n",
+      }),
     );
-    expect(parsed.user).toBe("bob");
-    expect(parsed.host).toBe("example.com");
-    expect(parsed.port).toBe(2222);
-    expect(parsed.identityFiles).toEqual(["/tmp/id"]);
-  });
-
-  it("ignores invalid ports and blank lines in ssh -G output", () => {
-    const parsed = parseSshConfigOutput(
-      "user bob\nhostname example.com\nport not-a-number\nidentityfile none\nidentityfile   \n",
-    );
-
-    expect(parsed.user).toBe("bob");
-    expect(parsed.host).toBe("example.com");
-    expect(parsed.port).toBeUndefined();
-    expect(parsed.identityFiles).toEqual([]);
-  });
-
-  it("resolves ssh config via ssh -G", async () => {
-    const config = await resolveSshConfig({ user: "me", host: "alias", port: 22 });
-    expect(config?.user).toBe("steipete");
-    expect(config?.host).toBe("peters-mac-studio-1.sheep-coho.ts.net");
-    expect(config?.port).toBe(2222);
-    expect(config?.identityFiles).toEqual(["/tmp/id_ed25519"]);
-    const args = spawnMock.mock.calls[0]?.[1] as string[] | undefined;
-    expect(args?.slice(-2)).toEqual(["--", "me@alias"]);
+    await expect(resolveSshConfig({ host: "alias", port: 22 })).resolves.toEqual({
+      user: "bob",
+      host: "example.com",
+      port: undefined,
+      identityFiles: [],
+    });
   });
 
   it("adds non-default port and trimmed identity arguments", async () => {
-    await resolveSshConfig(
-      { user: "me", host: "alias", port: 2022 },
-      { identity: "  /tmp/custom_id  " },
-    );
-
-    const args = spawnMock.mock.calls.at(-1)?.[1] as string[] | undefined;
-    expect(args).toEqual(["-G", "-p", "2022", "-i", "/tmp/custom_id", "--", "me@alias"]);
+    await expect(
+      resolveSshConfig({ ...target, port: 2022 }, { identity: "  /tmp/custom_id  " }),
+    ).resolves.toEqual({
+      user: "steipete",
+      host,
+      port: 2222,
+      identityFiles: ["/tmp/id_ed25519"],
+    });
+    expect(command()).toEqual([ssh, "-G", "-p", "2022", "-i", "/tmp/custom_id", "--", "me@alias"]);
+    expect(runCommandMock.mock.calls[0]?.[1]).toMatchObject({
+      maxOutputBytes: 64 * 1024,
+      outputCapture: "head",
+      terminateOnOutputLimit: true,
+    });
+    expect(resolveSshClientMock).toHaveBeenCalledOnce();
   });
 
-  it("returns null when ssh -G fails", async () => {
-    spawnMock.mockImplementationOnce(
-      (_command: string, _args: readonly string[], _options: SpawnOptions): ChildProcess => {
-        const { child } = createMockSpawnChild();
-        process.nextTick(() => {
-          child.emit("exit", 1);
-        });
-        return child as unknown as ChildProcess;
-      },
-    );
-
-    const config = await resolveSshConfig({ user: "me", host: "bad-host", port: 22 });
-    expect(config).toBeNull();
+  it.each(["empty output", "launch failure"])("returns null on %s", async (failure) => {
+    if (failure === "launch failure") {
+      runCommandMock.mockRejectedValueOnce(new Error("spawn boom"));
+    } else {
+      runCommandMock.mockResolvedValueOnce(commandResult({ stdout: "" }));
+    }
+    await expect(resolveSshConfig(target)).resolves.toBeNull();
   });
 
-  it("returns null when the ssh process emits an error", async () => {
-    spawnMock.mockImplementationOnce(
-      (_command: string, _args: readonly string[], _options: SpawnOptions): ChildProcess => {
-        const { child } = createMockSpawnChild();
-        process.nextTick(() => {
-          child.emit("error", new Error("spawn boom"));
-        });
-        return child as unknown as ChildProcess;
-      },
-    );
+  it("returns null without launching when no trusted SSH client is installed", async () => {
+    resolveSshClientMock.mockReturnValueOnce(null);
 
-    await expect(resolveSshConfig({ user: "me", host: "bad-host", port: 22 })).resolves.toBeNull();
+    await expect(resolveSshConfig(target)).resolves.toBeNull();
+    expect(runCommandMock).not.toHaveBeenCalled();
   });
 });

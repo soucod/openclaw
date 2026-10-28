@@ -1,106 +1,68 @@
-import { createHash } from "node:crypto";
+// Provides safe path helpers for plugin installation targets.
 import fs from "node:fs/promises";
 import path from "node:path";
-import { isPathInside } from "./path-guards.js";
 
+export {
+  assertCanonicalPathWithinBase,
+  resolveSafeInstallDir,
+  safeDirName,
+  safePathSegmentHashed,
+} from "@openclaw/fs-safe/advanced";
+
+/** Returns the package basename for scoped npm names while preserving plain ids. */
 export function unscopedPackageName(name: string): string {
   const trimmed = name.trim();
-  if (!trimmed) {
-    return trimmed;
-  }
-  return trimmed.includes("/") ? (trimmed.split("/").pop() ?? trimmed) : trimmed;
+  return trimmed.slice(trimmed.lastIndexOf("/") + 1);
 }
 
-export function safeDirName(input: string): string {
-  const trimmed = input.trim();
-  if (!trimmed) {
-    return trimmed;
+/** Matches a requested install id against either the full package name or unscoped basename. */
+export function packageNameMatchesId(packageName: string, id: string): boolean {
+  const trimmedId = id.trim();
+  if (!trimmedId) {
+    return false;
   }
-  return trimmed.replaceAll("/", "__").replaceAll("\\", "__");
+
+  const trimmedPackageName = packageName.trim();
+  if (!trimmedPackageName) {
+    return false;
+  }
+
+  return trimmedId === trimmedPackageName || trimmedId === unscopedPackageName(trimmedPackageName);
 }
 
-export function safePathSegmentHashed(input: string): string {
-  const trimmed = input.trim();
-  const base = trimmed
-    .replaceAll(/[\\/]/g, "-")
-    .replaceAll(/[^a-zA-Z0-9._-]/g, "-")
-    .replaceAll(/-+/g, "-")
-    .replaceAll(/^-+/g, "")
-    .replaceAll(/-+$/g, "");
+export const INSTALL_BASE_CHANGED_ERROR_MESSAGE = "install base directory changed during install";
 
-  const normalized = base.length > 0 ? base : "skill";
-  const safe = normalized === "." || normalized === ".." ? "skill" : normalized;
-
-  const hash = createHash("sha256").update(trimmed).digest("hex").slice(0, 10);
-
-  if (safe !== trimmed) {
-    const prefix = safe.length > 50 ? safe.slice(0, 50) : safe;
-    return `${prefix}-${hash}`;
-  }
-  if (safe.length > 60) {
-    return `${safe.slice(0, 50)}-${hash}`;
-  }
-  return safe;
-}
-
-export function resolveSafeInstallDir(params: {
-  baseDir: string;
-  id: string;
-  invalidNameMessage: string;
-  nameEncoder?: (id: string) => string;
-}): { ok: true; path: string } | { ok: false; error: string } {
-  const encodedName = (params.nameEncoder ?? safeDirName)(params.id);
-  const targetDir = path.join(params.baseDir, encodedName);
-  const resolvedBase = path.resolve(params.baseDir);
-  const resolvedTarget = path.resolve(targetDir);
-  const relative = path.relative(resolvedBase, resolvedTarget);
-  if (
-    !relative ||
-    relative === ".." ||
-    relative.startsWith(`..${path.sep}`) ||
-    path.isAbsolute(relative)
-  ) {
-    return { ok: false, error: params.invalidNameMessage };
-  }
-  return { ok: true, path: targetDir };
-}
-
-export async function assertCanonicalPathWithinBase(params: {
-  baseDir: string;
-  candidatePath: string;
-  boundaryLabel: string;
+export async function assertInstallBaseStable(params: {
+  installBaseDir: string;
+  expectedRealPath: string;
 }): Promise<void> {
-  const baseDir = path.resolve(params.baseDir);
-  const candidatePath = path.resolve(params.candidatePath);
-  if (!isPathInside(baseDir, candidatePath)) {
-    throw new Error(`Invalid path: must stay within ${params.boundaryLabel}`);
+  const baseStat = await fs.stat(params.installBaseDir);
+  if (!baseStat.isDirectory()) {
+    throw new Error(INSTALL_BASE_CHANGED_ERROR_MESSAGE);
   }
-
-  const baseLstat = await fs.lstat(baseDir);
-  if (!baseLstat.isDirectory() || baseLstat.isSymbolicLink()) {
-    throw new Error(`Invalid ${params.boundaryLabel}: base directory must be a real directory`);
+  const currentRealPath = await fs.realpath(params.installBaseDir);
+  if (currentRealPath !== params.expectedRealPath) {
+    throw new Error(INSTALL_BASE_CHANGED_ERROR_MESSAGE);
   }
-  const baseRealPath = await fs.realpath(baseDir);
+}
 
-  const validateDirectory = async (dirPath: string): Promise<void> => {
-    const dirLstat = await fs.lstat(dirPath);
-    if (!dirLstat.isDirectory() || dirLstat.isSymbolicLink()) {
-      throw new Error(`Invalid path: must stay within ${params.boundaryLabel}`);
-    }
-    const dirRealPath = await fs.realpath(dirPath);
-    if (!isPathInside(baseRealPath, dirRealPath)) {
-      throw new Error(`Invalid path: must stay within ${params.boundaryLabel}`);
-    }
+export async function resolveInstallPublishTarget(params: {
+  installBaseDir: string;
+  targetDir: string;
+}): Promise<{ installBaseRealPath: string; canonicalTargetDir: string }> {
+  const installBaseResolved = path.resolve(params.installBaseDir);
+  const targetResolved = path.resolve(params.targetDir);
+  const targetRelativePath = path.relative(installBaseResolved, targetResolved);
+  if (
+    !targetRelativePath ||
+    targetRelativePath === ".." ||
+    targetRelativePath.startsWith(`..${path.sep}`)
+  ) {
+    throw new Error("invalid install target path");
+  }
+  const installBaseRealPath = await fs.realpath(params.installBaseDir);
+  return {
+    installBaseRealPath,
+    canonicalTargetDir: path.join(installBaseRealPath, targetRelativePath),
   };
-
-  try {
-    await validateDirectory(candidatePath);
-    return;
-  } catch (err) {
-    const code = (err as { code?: string }).code;
-    if (code !== "ENOENT") {
-      throw err;
-    }
-  }
-  await validateDirectory(path.dirname(candidatePath));
 }

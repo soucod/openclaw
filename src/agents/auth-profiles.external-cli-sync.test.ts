@@ -1,98 +1,93 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { AuthProfileStore } from "./auth-profiles/types.js";
+import { MINIMAX_CLI_PROFILE_ID } from "./auth-profiles/constants.js";
+import {
+  readExternalCliBootstrapCredential,
+  resolveExternalCliAuthProfiles,
+} from "./auth-profiles/external-cli-sync.js";
+import type { AuthProfileStore, OAuthCredential } from "./auth-profiles/types.js";
 
 const mocks = vi.hoisted(() => ({
-  readCodexCliCredentialsCached: vi.fn(),
-  readQwenCliCredentialsCached: vi.fn(() => null),
-  readMiniMaxCliCredentialsCached: vi.fn(() => null),
+  readCodexCliCredentialsCached: vi.fn<() => OAuthCredential | null>(() => null),
+  readMiniMaxCliCredentialsCached: vi.fn<() => OAuthCredential | null>(() => null),
 }));
+vi.mock("./cli-credentials.js", () => mocks);
 
-let syncExternalCliCredentials: typeof import("./auth-profiles/external-cli-sync.js").syncExternalCliCredentials;
-let CODEX_CLI_PROFILE_ID: typeof import("./auth-profiles/constants.js").CODEX_CLI_PROFILE_ID;
+const oauth = (overrides: Partial<OAuthCredential> = {}): OAuthCredential => ({
+  type: "oauth",
+  provider: "minimax-portal",
+  access: "cli-access",
+  refresh: "cli-refresh",
+  expires: Date.now() + 86_400_000,
+  ...overrides,
+});
+const store = (credential?: OAuthCredential): AuthProfileStore => ({
+  version: 1,
+  profiles: credential ? { [MINIMAX_CLI_PROFILE_ID]: credential } : {},
+});
 
-const OPENAI_CODEX_DEFAULT_PROFILE_ID = "openai-codex:default";
+beforeEach(() => {
+  mocks.readCodexCliCredentialsCached.mockReset().mockReturnValue(oauth({ provider: "openai" }));
+  mocks.readMiniMaxCliCredentialsCached.mockReset().mockReturnValue(null);
+});
 
-describe("syncExternalCliCredentials", () => {
-  beforeEach(async () => {
-    vi.resetModules();
-    mocks.readCodexCliCredentialsCached.mockReset();
-    mocks.readQwenCliCredentialsCached.mockReset().mockReturnValue(null);
-    mocks.readMiniMaxCliCredentialsCached.mockReset().mockReturnValue(null);
-    vi.doMock("./cli-credentials.js", () => ({
-      readCodexCliCredentialsCached: mocks.readCodexCliCredentialsCached,
-      readQwenCliCredentialsCached: mocks.readQwenCliCredentialsCached,
-      readMiniMaxCliCredentialsCached: mocks.readMiniMaxCliCredentialsCached,
-    }));
-    ({ syncExternalCliCredentials } = await import("./auth-profiles/external-cli-sync.js"));
-    ({ CODEX_CLI_PROFILE_ID } = await import("./auth-profiles/constants.js"));
+describe("external CLI OAuth resolution", () => {
+  it("does not bootstrap an OpenAI profile from retired Codex storage", () => {
+    expect(
+      readExternalCliBootstrapCredential({
+        profileId: "openai:default",
+        credential: oauth({ provider: "openai" }),
+      }),
+    ).toBeNull();
+    expect(mocks.readCodexCliCredentialsCached).not.toHaveBeenCalled();
   });
 
-  it("syncs Codex CLI credentials into the supported default auth profile", () => {
-    const expires = Date.now() + 60_000;
-    mocks.readCodexCliCredentialsCached.mockReturnValue({
-      type: "oauth",
-      provider: "openai-codex",
-      access: "access-token",
-      refresh: "refresh-token",
-      expires,
-      accountId: "acct_123",
-    });
-
-    const store: AuthProfileStore = {
-      version: 1,
-      profiles: {},
-    };
-
-    const mutated = syncExternalCliCredentials(store);
-
-    expect(mutated).toBe(true);
-    expect(mocks.readCodexCliCredentialsCached).toHaveBeenCalledWith(
-      expect.objectContaining({ ttlMs: expect.any(Number) }),
-    );
-    expect(store.profiles[OPENAI_CODEX_DEFAULT_PROFILE_ID]).toMatchObject({
-      type: "oauth",
-      provider: "openai-codex",
-      access: "access-token",
-      refresh: "refresh-token",
-      expires,
-      accountId: "acct_123",
-    });
-    expect(store.profiles[CODEX_CLI_PROFILE_ID]).toBeUndefined();
+  it("does not probe CLI stores outside the requested provider scope", () => {
+    expect(
+      resolveExternalCliAuthProfiles(store(), {
+        providerIds: ["openai", "codex-app-server"],
+        profileIds: ["openai:default"],
+        allowKeychainPrompt: false,
+      }),
+    ).toEqual([]);
+    expect(mocks.readCodexCliCredentialsCached).not.toHaveBeenCalled();
+    expect(mocks.readMiniMaxCliCredentialsCached).not.toHaveBeenCalled();
   });
 
-  it("refreshes stored Codex expiry from external CLI even when the cached profile looks fresh", () => {
-    const staleExpiry = Date.now() + 30 * 60_000;
-    const freshExpiry = Date.now() + 5 * 24 * 60 * 60_000;
-    mocks.readCodexCliCredentialsCached.mockReturnValue({
-      type: "oauth",
-      provider: "openai-codex",
-      access: "new-access-token",
-      refresh: "new-refresh-token",
-      expires: freshExpiry,
-      accountId: "acct_456",
-    });
-
-    const store: AuthProfileStore = {
-      version: 1,
-      profiles: {
-        [OPENAI_CODEX_DEFAULT_PROFILE_ID]: {
-          type: "oauth",
-          provider: "openai-codex",
-          access: "old-access-token",
-          refresh: "old-refresh-token",
-          expires: staleExpiry,
-          accountId: "acct_456",
-        },
+  it("replaces unusable MiniMax credentials with fresher CLI credentials", () => {
+    const imported = oauth({ email: "user@example.test" });
+    mocks.readMiniMaxCliCredentialsCached.mockReturnValue(imported);
+    expect(
+      resolveExternalCliAuthProfiles(
+        store(
+          oauth({
+            access: "old-access",
+            refresh: "old-refresh",
+            expires: Date.now() - 5_000,
+            email: "user@example.test",
+          }),
+        ),
+      ),
+    ).toEqual([
+      {
+        profileId: MINIMAX_CLI_PROFILE_ID,
+        credential: { ...imported, authFlow: "external-cli" },
+        persistence: "persisted",
       },
-    };
+    ]);
+  });
 
-    const mutated = syncExternalCliCredentials(store);
-
-    expect(mutated).toBe(true);
-    expect(store.profiles[OPENAI_CODEX_DEFAULT_PROFILE_ID]).toMatchObject({
-      access: "new-access-token",
-      refresh: "new-refresh-token",
-      expires: freshExpiry,
-    });
+  it("keeps a usable local MiniMax credential even when the CLI token expires later", () => {
+    mocks.readMiniMaxCliCredentialsCached.mockReturnValue(oauth());
+    expect(
+      resolveExternalCliAuthProfiles(
+        store(
+          oauth({
+            access: "local-access",
+            refresh: "local-refresh",
+            expires: Date.now() + 600_000,
+          }),
+        ),
+      ),
+    ).toEqual([]);
   });
 });

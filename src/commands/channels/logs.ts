@@ -1,113 +1,87 @@
-import fs from "node:fs/promises";
-import { listChannelPlugins } from "../../channels/plugins/index.js";
-import { getResolvedLoggerSettings } from "../../logging.js";
-import { parseLogLine } from "../../logging/parse-log-line.js";
-import { defaultRuntime, type RuntimeEnv, writeRuntimeJson } from "../../runtime.js";
-import { theme } from "../../terminal/theme.js";
-
-export type ChannelsLogsOptions = {
-  channel?: string;
-  lines?: string | number;
-  json?: boolean;
-};
-
-type LogLine = ReturnType<typeof parseLogLine>;
+import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
+import { theme } from "../../../packages/terminal-core/src/theme.js";
+import {
+  CHAT_CHANNEL_ORDER,
+  normalizeChatChannelId as normalizeBundledChannelId,
+} from "../../channels/registry.js";
+import { parseLogsPositiveInt } from "../../cli/logs-cli.options.js";
+import { readConfiguredParsedLogTail } from "../../logging/log-tail.js";
+import { loadPluginManifestRegistryForPluginRegistry } from "../../plugins/plugin-registry.js";
+import { defaultRuntime } from "../../runtime.js";
 
 const DEFAULT_LIMIT = 200;
 const MAX_BYTES = 1_000_000;
 
-const getChannelSet = () =>
-  new Set<string>([...listChannelPlugins().map((plugin) => plugin.id), "all"]);
-
-function parseChannelFilter(raw?: string) {
-  const trimmed = raw?.trim().toLowerCase();
-  if (!trimmed) {
-    return "all";
-  }
-  return getChannelSet().has(trimmed) ? trimmed : "all";
+function matchesChannelContext(value: string | undefined, channel: string) {
+  return [channel, `channels/${channel}`, `gateway/channels/${channel}`].some(
+    (root) => value === root || value?.startsWith(`${root}/`) === true,
+  );
 }
 
-function matchesChannel(line: NonNullable<LogLine>, channel: string) {
-  if (channel === "all") {
-    return true;
+/** Print or serialize recent log lines matching one channel subsystem/module. */
+export async function channelsLogsCommand(opts: {
+  channel?: string;
+  lines?: string | number;
+  json?: boolean;
+}) {
+  let channel = opts.channel === undefined ? "all" : normalizeLowercaseStringOrEmpty(opts.channel);
+  const pluginIds = new Set<string>();
+  if (channel !== "all") {
+    const manifestChannels = loadPluginManifestRegistryForPluginRegistry({
+      includeDisabled: true,
+      env: process.env,
+    }).plugins.flatMap((plugin) =>
+      plugin.channels.flatMap((rawChannel) => {
+        const id = normalizeLowercaseStringOrEmpty(rawChannel);
+        return id ? [{ id, pluginId: plugin.id }] : [];
+      }),
+    );
+    const bundled = normalizeBundledChannelId(channel);
+    channel = bundled ?? channel;
+    for (const entry of manifestChannels) {
+      if (entry.id === channel) {
+        pluginIds.add(entry.pluginId);
+      }
+    }
+    if (!bundled && pluginIds.size === 0) {
+      const manifestIds = [...new Set(manifestChannels.map((entry) => entry.id))].toSorted();
+      const validChannels = ["all", ...new Set([...CHAT_CHANNEL_ORDER, ...manifestIds])];
+      throw new Error(
+        `Unknown channel ${JSON.stringify(opts.channel)}. Valid channels: ${validChannels.join(", ")}`,
+      );
+    }
   }
-  const needle = `gateway/channels/${channel}`;
-  if (line.subsystem?.includes(needle)) {
-    return true;
-  }
-  if (line.module?.includes(channel)) {
-    return true;
-  }
-  return false;
-}
+  const limit = parseLogsPositiveInt(opts.lines, DEFAULT_LIMIT, "--lines");
 
-async function readTailLines(file: string, limit: number): Promise<string[]> {
-  const stat = await fs.stat(file).catch(() => null);
-  if (!stat) {
-    return [];
-  }
-  const size = stat.size;
-  const start = Math.max(0, size - MAX_BYTES);
-  const handle = await fs.open(file, "r");
-  try {
-    const length = Math.max(0, size - start);
-    if (length === 0) {
-      return [];
-    }
-    const buffer = Buffer.alloc(length);
-    const readResult = await handle.read(buffer, 0, length, start);
-    const text = buffer.toString("utf8", 0, readResult.bytesRead);
-    let lines = text.split("\n");
-    if (start > 0) {
-      lines = lines.slice(1);
-    }
-    if (lines.length && lines[lines.length - 1] === "") {
-      lines = lines.slice(0, -1);
-    }
-    if (lines.length > limit) {
-      lines = lines.slice(lines.length - limit);
-    }
-    return lines;
-  } finally {
-    await handle.close();
-  }
-}
-
-export async function channelsLogsCommand(
-  opts: ChannelsLogsOptions,
-  runtime: RuntimeEnv = defaultRuntime,
-) {
-  const channel = parseChannelFilter(opts.channel);
-  const limitRaw = typeof opts.lines === "string" ? Number(opts.lines) : opts.lines;
-  const limit =
-    typeof limitRaw === "number" && Number.isFinite(limitRaw) && limitRaw > 0
-      ? Math.floor(limitRaw)
-      : DEFAULT_LIMIT;
-
-  const file = getResolvedLoggerSettings().file;
-  const rawLines = await readTailLines(file, limit * 4);
-  const parsed = rawLines
-    .map(parseLogLine)
-    .filter((line): line is NonNullable<LogLine> => Boolean(line));
-  const filtered = parsed.filter((line) => matchesChannel(line, channel));
-  const lines = filtered.slice(Math.max(0, filtered.length - limit));
+  const tail = await readConfiguredParsedLogTail({
+    limit,
+    maxBytes: MAX_BYTES,
+    filter: (line) =>
+      channel === "all" ||
+      [line.subsystem, line.module].some((value) => matchesChannelContext(value, channel)) ||
+      (line.plugin !== undefined && pluginIds.has(line.plugin)),
+  });
+  const { lines, truncated } = tail;
 
   if (opts.json) {
-    writeRuntimeJson(runtime, { file, channel, lines });
+    defaultRuntime.writeJson({ file: tail.file, channel, truncated, lines });
     return;
   }
 
-  runtime.log(theme.info(`Log file: ${file}`));
+  defaultRuntime.log(theme.info(`Log file: ${tail.file}`));
   if (channel !== "all") {
-    runtime.log(theme.info(`Channel: ${channel}`));
+    defaultRuntime.log(theme.info(`Channel: ${channel}`));
+  }
+  if (truncated) {
+    defaultRuntime.log(theme.warn("Log tail truncated; earlier entries were omitted."));
   }
   if (lines.length === 0) {
-    runtime.log(theme.muted("No matching log lines."));
+    defaultRuntime.log(theme.muted("No matching log lines."));
     return;
   }
   for (const line of lines) {
     const ts = line.time ? `${line.time} ` : "";
-    const level = line.level ? `${line.level.toLowerCase()} ` : "";
-    runtime.log(`${ts}${level}${line.message}`.trim());
+    const level = line.level ? `${normalizeLowercaseStringOrEmpty(line.level)} ` : "";
+    defaultRuntime.log(`${ts}${level}${line.message}`.trim());
   }
 }

@@ -1,181 +1,267 @@
+import { expectDefined } from "@openclaw/normalization-core/expect";
 import { Command } from "commander";
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { withCliTty } from "../run-main.bare-root.test-support.js";
+import { registerCoreCliCommands } from "./command-registry-core.js";
+import { createProgramContext } from "./context.js";
+import { expectNoCalls } from "./program.test-helpers.js";
+import { registerOnboardCommand } from "./register.onboard.js";
+import { registerSetupCommand } from "./register.setup.js";
 
-const setupWizardCommandMock = vi.fn();
-
-const runtime = {
-  log: vi.fn(),
-  error: vi.fn(),
-  exit: vi.fn(),
-};
-
-vi.mock("../../commands/auth-choice-options.static.js", () => ({
-  formatStaticAuthChoiceChoicesForCli: () => "token|oauth",
+const {
+  acknowledge,
+  recommendations,
+  refresh,
+  systemAgent,
+  wizard,
+  setup,
+  config,
+  onboardingState,
+  runtime,
+} = vi.hoisted(() => ({
+  setup: vi.fn(),
+  config: vi.fn(),
+  onboardingState: vi.fn(),
+  acknowledge: vi.fn(),
+  recommendations: vi.fn(),
+  refresh: vi.fn(),
+  systemAgent: vi.fn(),
+  wizard: vi.fn(),
+  runtime: { log: vi.fn(), error: vi.fn(), exit: vi.fn() },
 }));
 
 vi.mock("../../commands/auth-choice-options.js", () => ({
   formatAuthChoiceChoicesForCli: () => "token|oauth|openai-api-key",
 }));
 
-vi.mock("../../commands/onboard-core-auth-flags.js", () => ({
-  CORE_ONBOARD_AUTH_FLAGS: [
-    {
-      cliOption: "--mistral-api-key <key>",
-      description: "Mistral API key",
-      optionKey: "mistralApiKey",
-    },
-  ] as Array<{ cliOption: string; description: string; optionKey: string }>,
-}));
-
+// mock-isolation: CLI parsing uses fixed manifest flags, independent of installed plugins.
 vi.mock("../../plugins/provider-auth-choices.js", () => ({
-  resolveManifestProviderOnboardAuthFlags: () => [
-    {
-      cliOption: "--openai-api-key <key>",
-      description: "OpenAI API key",
-      optionKey: "openaiApiKey",
-    },
-  ],
+  resolveProviderOnboardAuthFlags: () =>
+    [
+      ["--openai-api-key <key>", "openaiApiKey"],
+      ["--openai-api-key <key>", "anotherProviderApiKey"],
+      ["--local-embedding-only", "localEmbeddingOnly"],
+    ].map(([cliOption, optionKey]) => ({ cliOption, optionKey, description: "Fixture flag" })),
 }));
 
-vi.mock("../../commands/onboard.js", () => ({
-  setupWizardCommand: setupWizardCommandMock,
+// mock-isolation: Setup routes use synthetic config and never run setup or read shared state.
+vi.mock("../../commands/setup.js", () => ({ setupCommand: setup }));
+// mock-isolation: Route parsing reads a synthetic config without opening shared state.
+vi.mock("../../config/config.js", () => ({ readConfigFileSnapshot: config }));
+// mock-isolation: Onboarding status comes from the route fixture, not the local database.
+vi.mock("../../state/local-onboarding-state.js", () => ({
+  readLocalOnboardingStateForConfigAsync: onboardingState,
+}));
+// mock-isolation: Capture wizard dispatch without executing onboarding side effects.
+vi.mock("../../commands/onboard.js", () => ({ setupWizardCommand: wizard }));
+
+// mock-isolation: Capture dispatch without onboarding, inference, or recommendation state.
+vi.mock("../../commands/onboard-recommendations.js", () => ({
+  acknowledgeOnboardRecommendationsCommand: acknowledge,
+  onboardRecommendationsCommand: recommendations,
+  refreshOnboardRecommendationsCommand: refresh,
 }));
 
-vi.mock("../../runtime.js", () => ({
+// mock-isolation: CLI parsing captures command dispatch without running onboarding, inference, or recommendation state.
+vi.mock("../../commands/system-agent-with-inference.js", () => ({
+  runSystemAgentWithInference: systemAgent,
+}));
+
+vi.mock("../../runtime.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../runtime.js")>()),
   defaultRuntime: runtime,
 }));
 
-const mockedModuleIds = [
-  "../../commands/auth-choice-options.static.js",
-  "../../commands/auth-choice-options.js",
-  "../../commands/onboard-core-auth-flags.js",
-  "../../plugins/provider-auth-choices.js",
-  "../../commands/onboard.js",
-  "../../runtime.js",
-];
+function createProgram() {
+  const program = new Command().enablePositionalOptions().exitOverride();
+  registerOnboardCommand(program);
+  return program;
+}
+async function runCli(args: string[] | string, route: "onboard" | "setup" = "onboard") {
+  const argv = typeof args === "string" ? args.split(" ") : args;
+  const program = route === "onboard" ? createProgram() : new Command();
+  if (route === "setup") {
+    registerSetupCommand(program);
+  }
+  await program.parseAsync([route, ...argv], { from: "user" });
+}
+function expectOptionFailure(message: string, json: boolean) {
+  const diagnostic = expect.stringContaining(message);
+  expect(runtime.error).toHaveBeenCalledExactlyOnceWith(diagnostic);
+  expect(runtime.exit).toHaveBeenCalledExactlyOnceWith(1);
+  expectNoCalls(setup, recommendations, acknowledge, refresh, wizard, systemAgent);
+  if (json) {
+    expect(runtime.log).toHaveBeenCalledOnce();
+    const call = expectDefined(runtime.log.mock.calls[0], "JSON option diagnostic");
+    expect(JSON.parse(call[0])).toMatchObject({
+      ok: false,
+      phase: "options",
+      error: { type: "cli_error", message: diagnostic },
+    });
+  } else {
+    expectNoCalls(runtime.log);
+  }
+}
+function expectCall(target: typeof wizard, ...args: unknown[]) {
+  expect(target.mock.calls).toEqual([args]);
+}
 
-let registerOnboardCommand: typeof import("./register.onboard.js").registerOnboardCommand;
+beforeEach(() => vi.resetAllMocks());
 
-beforeAll(async () => {
-  ({ registerOnboardCommand } = await import("./register.onboard.js"));
+it("passes a plugin's boolean consent flag without string coercion", async () => {
+  await runCli(["--non-interactive", "--accept-risk", "--local-embedding-only"]);
+  expect(wizard.mock.calls).toContainEqual([
+    expect.objectContaining({ localEmbeddingOnly: true }),
+    runtime,
+  ]);
+});
+it.each([
+  ["recommendations --agent writer --json", recommendations, { agent: "writer", json: true }],
+  ["recommendations acknowledge", acknowledge, { retry: undefined }],
+] as const)("routes %s", async (args, target, options) => {
+  await runCli(args);
+  expectCall(target, options, runtime);
+  expect(wizard).not.toHaveBeenCalled();
 });
 
-afterAll(() => {
-  for (const id of mockedModuleIds) {
-    vi.doUnmock(id);
-  }
-  vi.resetModules();
+it("preserves an explicitly blank leaf agent over its parent", async () => {
+  await runCli(["recommendations", "--agent", "writer", "refresh", "--agent", ""]);
+  expectCall(refresh, { agent: "" }, runtime);
 });
 
-describe("registerOnboardCommand", () => {
-  async function runCli(args: string[]) {
-    const program = new Command();
-    registerOnboardCommand(program);
-    await program.parseAsync(args, { from: "user" });
+it("inherits the parent agent instead of a leaf default", async () => {
+  const program = createProgram();
+  const recommendationGroup = program.commands
+    .find((command) => command.name() === "onboard")
+    ?.commands.find((command) => command.name() === "recommendations");
+  const leaf = recommendationGroup?.commands.find((command) => command.name() === "refresh");
+  expect(leaf).toBeDefined();
+  leaf?.setOptionValueWithSource("agent", "analyst", "default");
+  await program.parseAsync("onboard recommendations --agent writer refresh".split(" "), {
+    from: "user",
+  });
+  expectCall(refresh, { agent: "writer" }, runtime);
+});
+
+it("resolves explicitly disabled daemon installation", async () => {
+  await runCli("--no-install-daemon");
+  expectCall(wizard, expect.objectContaining({ installDaemon: false }), runtime);
+  expect(wizard.mock.calls[0]?.[0]).not.toHaveProperty("tailscaleResetOnExit");
+});
+
+it.each([
+  ["recommendations --json refresh", "parent option(s): --json.", false],
+  ["--json --reset recommendations", "parent option(s): --reset.", true],
+  [
+    "--custom-image-input --custom-text-input --json",
+    "Use either --custom-image-input or --custom-text-input, not both.",
+    true,
+  ],
+  ["--json --modern --non-interactive", "explicit risk acknowledgement", true],
+  ["--modern --no-install-daemon", "--modern cannot be combined with: --no-install-daemon.", false],
+] as const)("rejects invalid options: %s", async (args, message, json) => {
+  await runCli(args);
+  expectOptionFailure(message, json);
+});
+
+it.each([
+  ["--modern --json", { json: true, interactive: true }, {}],
+  [
+    "--modern --non-interactive --accept-risk",
+    { json: false, interactive: false },
+    { acceptRisk: true },
+  ],
+  [
+    "--modern --workspace /tmp/work --accept-risk",
+    { json: false, interactive: true, setupWorkspace: "/tmp/work" },
+    { workspace: "/tmp/work", acceptRisk: true },
+  ],
+] as const)("routes inference-gated onboarding for %s", async (args, options, fallback) => {
+  await runCli(args);
+  expectCall(
+    systemAgent,
+    { yes: false, welcomeVariant: "onboarding", ...options },
+    runtime,
+    fallback,
+  );
+  expect(wizard).not.toHaveBeenCalled();
+});
+
+describe("setup routing", () => {
+  const runSetup = (args: string | string[]) => runCli(args, "setup");
+  const configPath = "/tmp/openclaw.json";
+  function configSnapshot(sourceConfig = {}, exists = true) {
+    config.mockResolvedValue({ exists, valid: true, path: configPath, sourceConfig });
   }
+  function expectWizard(options: Record<string, unknown>) {
+    expect(wizard).toHaveBeenCalledExactlyOnceWith(expect.objectContaining(options), runtime);
+    expect(systemAgent).not.toHaveBeenCalled();
+  }
+  beforeEach(() => configSnapshot({}, false));
 
-  beforeEach(() => {
-    vi.clearAllMocks();
-    setupWizardCommandMock.mockResolvedValue(undefined);
+  it.each([
+    ["pending inference", { agents: { defaults: { model: "acme/verified" } } }, true, true],
+    ["remote Gateway", { gateway: { mode: "remote" } }, true, false],
+  ] as const)(
+    "routes interactive setup for %s",
+    async (name, sourceConfig, pending, onboarding) => {
+      configSnapshot(sourceConfig);
+      onboardingState.mockResolvedValue(pending ? { status: "pending" } : undefined);
+      await withCliTty(true, async () => {
+        await runSetup([]);
+        expect(onboardingState.mock.calls).toEqual(
+          name === "pending inference" ? [["/tmp/openclaw.json", sourceConfig]] : [],
+        );
+        if (onboarding) {
+          expectWizard({ json: false });
+        } else {
+          expect(systemAgent).toHaveBeenCalledExactlyOnceWith(
+            { message: undefined, yes: false, json: false },
+            runtime,
+          );
+          expect(wizard).not.toHaveBeenCalled();
+        }
+      });
+    },
+  );
+
+  it("routes JSON setup for an unconfigured system", async () => {
+    await runSetup("--json");
+    expectWizard({ json: true });
   });
 
-  it("defaults installDaemon to undefined when no daemon flags are provided", async () => {
-    await runCli(["onboard"]);
-
-    expect(setupWizardCommandMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        installDaemon: undefined,
-      }),
-      runtime,
-    );
-  });
-
-  it("sets installDaemon from explicit install flags and prioritizes --skip-daemon", async () => {
-    await runCli(["onboard", "--install-daemon"]);
-    expect(setupWizardCommandMock).toHaveBeenNthCalledWith(
-      1,
-      expect.objectContaining({
-        installDaemon: true,
-      }),
-      runtime,
-    );
-
-    await runCli(["onboard", "--no-install-daemon"]);
-    expect(setupWizardCommandMock).toHaveBeenNthCalledWith(
-      2,
-      expect.objectContaining({
-        installDaemon: false,
-      }),
-      runtime,
-    );
-
-    await runCli(["onboard", "--install-daemon", "--skip-daemon"]);
-    expect(setupWizardCommandMock).toHaveBeenNthCalledWith(
-      3,
-      expect.objectContaining({
-        installDaemon: false,
-      }),
-      runtime,
-    );
-  });
-
-  it("parses numeric gateway port and drops invalid values", async () => {
-    await runCli(["onboard", "--gateway-port", "18789"]);
-    expect(setupWizardCommandMock).toHaveBeenNthCalledWith(
-      1,
-      expect.objectContaining({
-        gatewayPort: 18789,
-      }),
-      runtime,
-    );
-
-    await runCli(["onboard", "--gateway-port", "nope"]);
-    expect(setupWizardCommandMock).toHaveBeenNthCalledWith(
-      2,
-      expect.objectContaining({
-        gatewayPort: undefined,
-      }),
+  it("registers the hidden retired-name alias through lazy registration", async () => {
+    const program = new Command().name("openclaw");
+    registerCoreCliCommands(program, createProgramContext(), ["node", "openclaw", "--help"]);
+    expect(program.helpInformation()).not.toContain("crestodian");
+    await program.parseAsync(["crestodian", "--message", "status"], { from: "user" });
+    expect(systemAgent).toHaveBeenCalledWith(
+      { message: "status", yes: false, json: false },
       runtime,
     );
   });
 
-  it("forwards --reset-scope to setup wizard options", async () => {
-    await runCli(["onboard", "--reset", "--reset-scope", "full"]);
-    expect(setupWizardCommandMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        reset: true,
-        resetScope: "full",
-      }),
-      runtime,
-    );
+  it.each([
+    ["--baseline --mode remote --json", "--baseline cannot be combined with: --mode.", true],
+    [["--gateway-port", ""], "--gateway-port must be an integer between 1 and 65535.", false],
+  ] as const)("rejects invalid setup options: %s", async (args, message, json) => {
+    await runSetup(typeof args === "string" ? args : [...args]);
+    expectOptionFailure(message, json);
   });
 
-  it("parses --mistral-api-key and forwards mistralApiKey", async () => {
-    await runCli(["onboard", "--mistral-api-key", "sk-mistral-test"]);
-    expect(setupWizardCommandMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        mistralApiKey: "sk-mistral-test", // pragma: allowlist secret
-      }),
-      runtime,
+  it("dispatches scripted onboarding controls", async () => {
+    await runSetup(
+      "--non-interactive --accept-risk --team --gateway-port 18789 --install-daemon --skip-daemon --json --custom-text-input",
     );
-  });
-
-  it("forwards --gateway-token-ref-env", async () => {
-    await runCli(["onboard", "--gateway-token-ref-env", "OPENCLAW_GATEWAY_TOKEN"]);
-    expect(setupWizardCommandMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        gatewayTokenRefEnv: "OPENCLAW_GATEWAY_TOKEN",
-      }),
-      runtime,
-    );
-  });
-
-  it("reports errors via runtime on setup wizard command failures", async () => {
-    setupWizardCommandMock.mockRejectedValueOnce(new Error("setup failed"));
-
-    await runCli(["onboard"]);
-
-    expect(runtime.error).toHaveBeenCalledWith("Error: setup failed");
-    expect(runtime.exit).toHaveBeenCalledWith(1);
+    expectWizard({
+      nonInteractive: true,
+      acceptRisk: true,
+      team: true,
+      gatewayPort: 18789,
+      installDaemon: false,
+      json: true,
+      customImageInput: false,
+    });
+    expect(setup).not.toHaveBeenCalled();
   });
 });

@@ -1,140 +1,25 @@
+import { withFetchPreconnect } from "openclaw/plugin-sdk/test-env";
 import { describe, expect, it } from "vitest";
-import { withFetchPreconnect } from "../../../test/helpers/extensions/fetch-mock.js";
 import { resolveDiscordUserAllowlist } from "./resolve-users.js";
 import { jsonResponse, urlToString } from "./test-http-helpers.js";
 
-function createGuildListProbeFetcher() {
-  let guildsCalled = false;
-  const fetcher = withFetchPreconnect(async (input: RequestInfo | URL) => {
-    const url = urlToString(input);
-    if (url.endsWith("/users/@me/guilds")) {
-      guildsCalled = true;
-      return jsonResponse([]);
-    }
-    return new Response("not found", { status: 404 });
-  });
-  return {
-    fetcher,
-    wasGuildsCalled: () => guildsCalled,
-  };
-}
-
-function createGuildsForbiddenFetcher() {
-  return withFetchPreconnect(async (input: RequestInfo | URL) => {
-    const url = urlToString(input);
-    if (url.endsWith("/users/@me/guilds")) {
-      throw new Error("Forbidden: Missing Access");
-    }
-    return new Response("not found", { status: 404 });
-  });
-}
-
 describe("resolveDiscordUserAllowlist", () => {
-  it("resolves plain user ids without calling listGuilds", async () => {
-    const { fetcher, wasGuildsCalled } = createGuildListProbeFetcher();
-
+  it("resolves a mention without calling listGuilds", async () => {
+    const entry = "<@123456789012345678>";
+    const requests: string[] = [];
     const results = await resolveDiscordUserAllowlist({
       token: "test",
-      entries: ["123456789012345678"],
-      fetcher,
+      entries: [entry],
+      fetcher: withFetchPreconnect(async (input) => {
+        const url = urlToString(input);
+        requests.push(url);
+        return url.endsWith("/users/@me/guilds")
+          ? jsonResponse([])
+          : new Response("not found", { status: 404 });
+      }),
     });
-
-    expect(results).toEqual([
-      {
-        input: "123456789012345678",
-        resolved: true,
-        id: "123456789012345678",
-      },
-    ]);
-    expect(wasGuildsCalled()).toBe(false);
-  });
-
-  it("resolves mention-format ids without calling listGuilds", async () => {
-    const { fetcher, wasGuildsCalled } = createGuildListProbeFetcher();
-
-    const results = await resolveDiscordUserAllowlist({
-      token: "test",
-      entries: ["<@!123456789012345678>"],
-      fetcher,
-    });
-
-    expect(results).toEqual([
-      {
-        input: "<@!123456789012345678>",
-        resolved: true,
-        id: "123456789012345678",
-      },
-    ]);
-    expect(wasGuildsCalled()).toBe(false);
-  });
-
-  it("resolves prefixed ids (user:, discord:) without calling listGuilds", async () => {
-    const { fetcher, wasGuildsCalled } = createGuildListProbeFetcher();
-
-    const results = await resolveDiscordUserAllowlist({
-      token: "test",
-      entries: ["user:111", "discord:222"],
-      fetcher,
-    });
-
-    expect(results).toHaveLength(2);
-    expect(results[0]).toMatchObject({ resolved: true, id: "111" });
-    expect(results[1]).toMatchObject({ resolved: true, id: "222" });
-    expect(wasGuildsCalled()).toBe(false);
-  });
-
-  it("resolves user ids even when listGuilds would fail", async () => {
-    const fetcher = createGuildsForbiddenFetcher();
-
-    // Before the fix, this would throw because listGuilds() was called eagerly
-    const results = await resolveDiscordUserAllowlist({
-      token: "test",
-      entries: ["994979735488692324"],
-      fetcher,
-    });
-
-    expect(results).toEqual([
-      {
-        input: "994979735488692324",
-        resolved: true,
-        id: "994979735488692324",
-      },
-    ]);
-  });
-
-  it("calls listGuilds lazily when resolving usernames", async () => {
-    let guildsCalled = false;
-    const fetcher = withFetchPreconnect(async (input: RequestInfo | URL) => {
-      const url = urlToString(input);
-      if (url.endsWith("/users/@me/guilds")) {
-        guildsCalled = true;
-        return jsonResponse([{ id: "g1", name: "Test Guild" }]);
-      }
-      if (url.includes("/guilds/g1/members/search")) {
-        return jsonResponse([
-          {
-            user: { id: "u1", username: "alice", bot: false },
-            nick: null,
-          },
-        ]);
-      }
-      return new Response("not found", { status: 404 });
-    });
-
-    const results = await resolveDiscordUserAllowlist({
-      token: "test",
-      entries: ["alice"],
-      fetcher,
-    });
-
-    expect(guildsCalled).toBe(true);
-    expect(results).toHaveLength(1);
-    expect(results[0]).toMatchObject({
-      input: "alice",
-      resolved: true,
-      id: "u1",
-      name: "alice",
-    });
+    expect(results).toEqual([{ input: entry, resolved: true, id: "123456789012345678" }]);
+    expect(requests).toEqual([]);
   });
 
   it("fetches guilds only once for multiple username entries", async () => {
@@ -146,13 +31,9 @@ describe("resolveDiscordUserAllowlist", () => {
         return jsonResponse([{ id: "g1", name: "Test Guild" }]);
       }
       if (url.includes("/guilds/g1/members/search")) {
-        const params = new URL(url).searchParams;
-        const query = params.get("query") ?? "";
+        const query = new URL(url).searchParams.get("query") ?? "";
         return jsonResponse([
-          {
-            user: { id: `u-${query}`, username: query, bot: false },
-            nick: null,
-          },
+          { user: { id: `u-${query}`, username: query, bot: false }, nick: null },
         ]);
       }
       return new Response("not found", { status: 404 });
@@ -165,58 +46,33 @@ describe("resolveDiscordUserAllowlist", () => {
     });
 
     expect(guildsCallCount).toBe(1);
-    expect(results).toHaveLength(2);
-    expect(results[0]).toMatchObject({ resolved: true, id: "u-alice" });
-    expect(results[1]).toMatchObject({ resolved: true, id: "u-bob" });
-  });
-
-  it("handles mixed ids and usernames — ids resolve even if guilds fail", async () => {
-    const fetcher = createGuildsForbiddenFetcher();
-
-    // IDs should succeed, username should fail (listGuilds throws)
-    await expect(
-      resolveDiscordUserAllowlist({
-        token: "test",
-        entries: ["123456789012345678", "alice"],
-        fetcher,
-      }),
-    ).rejects.toThrow("Forbidden");
-
-    // But if we only pass IDs, it should work fine
-    const results = await resolveDiscordUserAllowlist({
-      token: "test",
-      entries: ["123456789012345678", "<@999>"],
-      fetcher,
-    });
-
-    expect(results).toHaveLength(2);
-    expect(results[0]).toMatchObject({ resolved: true, id: "123456789012345678" });
-    expect(results[1]).toMatchObject({ resolved: true, id: "999" });
+    expect(results).toMatchObject([
+      { resolved: true, input: "alice", id: "u-alice", name: "alice" },
+      { resolved: true, input: "bob", id: "u-bob", name: "bob" },
+    ]);
   });
 
   it("returns unresolved for empty/blank entries", async () => {
-    const fetcher = withFetchPreconnect(async () => {
-      return new Response("not found", { status: 404 });
-    });
-
     const results = await resolveDiscordUserAllowlist({
       token: "test",
       entries: ["", "  "],
-      fetcher,
+      fetcher: withFetchPreconnect(async () => new Response("not found", { status: 404 })),
     });
-
-    expect(results).toHaveLength(2);
-    expect(results[0]).toMatchObject({ resolved: false });
-    expect(results[1]).toMatchObject({ resolved: false });
+    expect(results).toEqual([
+      { input: "", resolved: false },
+      { input: "  ", resolved: false },
+    ]);
   });
 
-  it("returns all unresolved when token is empty", async () => {
+  it("returns ordered unresolved entries when token is blank", async () => {
     const results = await resolveDiscordUserAllowlist({
-      token: "",
+      token: "  ",
       entries: ["123456789012345678", "alice"],
     });
 
-    expect(results).toHaveLength(2);
-    expect(results.every((r) => !r.resolved)).toBe(true);
+    expect(results).toEqual([
+      { input: "123456789012345678", resolved: false },
+      { input: "alice", resolved: false },
+    ]);
   });
 });

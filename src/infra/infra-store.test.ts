@@ -1,36 +1,50 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { expect, it } from "vitest";
 import { withTempDir } from "../test-utils/temp-dir.js";
+import { createDedupeCache } from "./dedupe.js";
 import { readSessionStoreJson5 } from "./state-migrations.fs.js";
+import { loadVoiceWakeRoutingConfig } from "./voicewake-routing.js";
+import { defaultVoiceWakeTriggers, setVoiceWakeTriggers } from "./voicewake.js";
 
-describe("infra store", () => {
-  describe("state migrations fs", () => {
-    it("treats array session stores as invalid", async () => {
-      await withTempDir("openclaw-session-store-", async (dir) => {
-        const storePath = path.join(dir, "sessions.json");
-        await fs.writeFile(storePath, "[]", "utf-8");
-
-        const result = readSessionStoreJson5(storePath);
-        expect(result.ok).toBe(false);
-        expect(result.store).toEqual({});
-      });
+it.each([true, false])("reads JSON5, preserving bytes (valid UTF-8: %s)", async (valid) => {
+  await withTempDir("openclaw-session-store-", async (dir) => {
+    const storePath = path.join(dir, "sessions.json");
+    const bytes = Buffer.from("// JSON5 comment\n{main:{sessionId:'s1', updatedAt:123},}");
+    if (!valid) {
+      bytes[bytes.indexOf("s1")] = 0xff;
+    }
+    await fs.writeFile(storePath, bytes);
+    expect(readSessionStoreJson5(storePath)).toEqual({
+      ok: valid,
+      store: valid ? { main: { sessionId: "s1", updatedAt: 123 } } : {},
     });
+    expect(await fs.readFile(storePath)).toEqual(bytes);
+  });
+});
 
-    it("parses JSON5 object session stores", async () => {
-      await withTempDir("openclaw-session-store-", async (dir) => {
-        const storePath = path.join(dir, "sessions.json");
-        await fs.writeFile(
-          storePath,
-          "{\n  // comment allowed in JSON5\n  main: { sessionId: 's1', updatedAt: 123 },\n}\n",
-          "utf-8",
-        );
-
-        const result = readSessionStoreJson5(storePath);
-        expect(result.ok).toBe(true);
-        expect(result.store.main?.sessionId).toBe("s1");
-        expect(result.store.main?.updatedAt).toBe(123);
-      });
+it("returns voicewake routing defaults when its store is missing", async () => {
+  await withTempDir("openclaw-voicewake-routing-", async (baseDir) => {
+    expect(await loadVoiceWakeRoutingConfig(baseDir)).toStrictEqual({
+      version: 1,
+      defaultTarget: { mode: "current" },
+      routes: [],
+      updatedAtMs: 0,
     });
   });
+});
+
+it("falls back to defaults when triggers empty", async () => {
+  await withTempDir("openclaw-voicewake-", async (baseDir) => {
+    const saved = await setVoiceWakeTriggers(["", "   "], baseDir);
+    expect(saved.triggers).toEqual(defaultVoiceWakeTriggers());
+  });
+});
+
+it("supports non-mutating existence checks via peek()", () => {
+  const cache = createDedupeCache({ ttlMs: 1000, maxSize: 10 });
+  expect(cache.peek("a", 100)).toBe(false);
+  expect(cache.check("a", 100)).toBe(false);
+  expect(cache.peek("a", 200)).toBe(true);
+  expect(cache.peek("a", 1201)).toBe(false);
 });

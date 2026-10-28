@@ -1,161 +1,134 @@
-import { Separator, TextDisplay } from "@buape/carbon";
+import { DEFAULT_ACCOUNT_ID } from "openclaw/plugin-sdk/account-id";
 import {
   buildLegacyDmAccountAllowlistAdapter,
   createAccountScopedAllowlistNameResolver,
   createNestedAllowlistOverrideResolver,
 } from "openclaw/plugin-sdk/allowlist-config-edit";
-import { createScopedDmSecurityResolver } from "openclaw/plugin-sdk/channel-config-helpers";
+import { createChatChannelPlugin, type ChannelPlugin } from "openclaw/plugin-sdk/channel-core";
+import { createChannelMessageAdapterFromOutbound } from "openclaw/plugin-sdk/channel-outbound";
 import { createPairingPrefixStripper } from "openclaw/plugin-sdk/channel-pairing";
-import { createOpenProviderConfiguredRouteWarningCollector } from "openclaw/plugin-sdk/channel-policy";
-import { resolveTargetsWithOptionalToken } from "openclaw/plugin-sdk/channel-targets";
-import { createChatChannelPlugin } from "openclaw/plugin-sdk/core";
+import {
+  buildTokenChannelStatusSummary,
+  PAIRING_APPROVED_MESSAGE,
+  projectCredentialSnapshotFields,
+  resolveConfiguredFromCredentialStatuses,
+} from "openclaw/plugin-sdk/channel-status";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import {
   createChannelDirectoryAdapter,
   createRuntimeDirectoryLiveAdapter,
 } from "openclaw/plugin-sdk/directory-runtime";
+import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
+import { createRuntimeConfigReader } from "openclaw/plugin-sdk/runtime-config-snapshot";
+import { sleepWithAbort } from "openclaw/plugin-sdk/runtime-env";
 import {
-  createRuntimeOutboundDelegates,
-  resolveOutboundSendDep,
-} from "openclaw/plugin-sdk/infra-runtime";
-import {
-  buildOutboundBaseSessionKey,
-  normalizeMessageChannel,
-  normalizeOutboundThreadId,
-  resolveThreadSessionKeys,
-  type RoutePeer,
-} from "openclaw/plugin-sdk/routing";
+  resolveDefaultGroupPolicy,
+  resolveOpenProviderRuntimeGroupPolicy,
+} from "openclaw/plugin-sdk/runtime-group-policy";
 import {
   createComputedAccountStatusAdapter,
   createDefaultChannelRuntimeState,
 } from "openclaw/plugin-sdk/status-helpers";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { resolveTargetsWithOptionalToken } from "openclaw/plugin-sdk/target-resolver-runtime";
 import {
-  listDiscordAccountIds,
+  listDiscordStartupAccountIds,
   resolveDiscordAccount,
+  resolveDiscordAccountAllowFrom,
   type ResolvedDiscordAccount,
 } from "./accounts.js";
-import { auditDiscordChannelPermissions, collectDiscordAuditChannelIds } from "./audit.js";
+import { getDiscordApprovalCapability } from "./approval-native.js";
+import { resolveRequiredDiscordChannelPermissions } from "./audit-core.js";
+import { discordMessageActions } from "./channel-actions.js";
 import {
-  listDiscordDirectoryGroupsFromConfig,
-  listDiscordDirectoryPeersFromConfig,
-} from "./directory-config.js";
+  resolveDiscordAttachedOutboundTarget,
+  resolveDiscordCommandConversation,
+  resolveDiscordInboundConversation,
+} from "./channel.conversation.js";
 import {
-  isDiscordExecApprovalClientEnabled,
-  shouldSuppressLocalDiscordExecApprovalPrompt,
-} from "./exec-approvals.js";
+  loadDiscordAuditModule,
+  loadDiscordDirectoryConfigModule,
+  loadDiscordDirectoryLiveModule,
+  loadDiscordProbeRuntime,
+  loadDiscordProviderRuntime,
+  loadDiscordResolveChannelsModule,
+  loadDiscordResolveUsersModule,
+  loadDiscordSendModule,
+  loadDiscordTargetResolverModule,
+  probeDiscordStatusAccount,
+} from "./channel.loaders.js";
+import { openDiscordCommandDeployHashStore } from "./command-deploy-store.js";
+import { prepareDiscordConversationRouteOwnersAsync } from "./conversation-route-owner.js";
+import { shouldSuppressLocalDiscordExecApprovalPrompt } from "./exec-approvals.js";
 import {
   resolveDiscordGroupRequireMention,
   resolveDiscordGroupToolPolicy,
 } from "./group-policy.js";
+import { withDiscordRequestAuthority } from "./internal/request-authority.js";
+import { withAbortTimeout } from "./monitor/timeouts.js";
 import {
   looksLikeDiscordTargetId,
+  matchesDiscordToolContextTarget,
   normalizeDiscordMessagingTarget,
-  normalizeDiscordOutboundTarget,
 } from "./normalize.js";
-import { probeDiscord, type DiscordProbe } from "./probe.js";
-import { resolveDiscordUserAllowlist } from "./resolve-users.js";
-import {
-  buildTokenChannelStatusSummary,
-  type ChannelMessageActionAdapter,
-  type ChannelPlugin,
-  DEFAULT_ACCOUNT_ID,
-  getChatChannelMeta,
-  PAIRING_APPROVED_MESSAGE,
-  projectCredentialSnapshotFields,
-  resolveConfiguredFromCredentialStatuses,
-  type OpenClawConfig,
-} from "./runtime-api.js";
+import { discordOutbound } from "./outbound-payload.js";
+import { resolveDiscordOutboundSessionRoute } from "./outbound-session-route.js";
+import type { DiscordProbe } from "./probe.js";
 import { getDiscordRuntime } from "./runtime.js";
-import { fetchChannelPermissionsDiscord } from "./send.js";
-import { discordSetupAdapter } from "./setup-core.js";
+import { discordSecurityAdapter } from "./security.js";
+import { normalizeExplicitDiscordSessionKey } from "./session-key-normalization.js";
+import { discordSetupContract } from "./setup-adapter.js";
 import { createDiscordPluginBase, discordConfigAdapter } from "./shared.js";
 import { collectDiscordStatusIssues } from "./status-issues.js";
-import { parseDiscordTarget } from "./targets.js";
-import { DiscordUiContainer } from "./ui.js";
+import { parseDiscordTarget } from "./target-parsing.js";
+import { discordConversationBindings } from "./thread-bindings-channel.js";
 
-type DiscordSendFn = ReturnType<
-  typeof getDiscordRuntime
->["channel"]["discord"]["sendMessageDiscord"];
-
-let discordProviderRuntimePromise:
-  | Promise<typeof import("./monitor/provider.runtime.js")>
-  | undefined;
-
-async function loadDiscordProviderRuntime() {
-  discordProviderRuntimePromise ??= import("./monitor/provider.runtime.js");
-  return await discordProviderRuntimePromise;
-}
-
-const meta = getChatChannelMeta("discord");
-const REQUIRED_DISCORD_PERMISSIONS = ["ViewChannel", "SendMessages"] as const;
-
-const resolveDiscordDmPolicy = createScopedDmSecurityResolver<ResolvedDiscordAccount>({
-  channelKey: "discord",
-  resolvePolicy: (account) => account.config.dm?.policy,
-  resolveAllowFrom: (account) => account.config.dm?.allowFrom,
-  allowFromPathSuffix: "dm.",
-  normalizeEntry: (raw) =>
-    raw
-      .trim()
-      .replace(/^(discord|user):/i, "")
-      .replace(/^<@!?(\d+)>$/, "$1"),
+const DISCORD_ACCOUNT_STARTUP_STAGGER_MS = 10_000;
+const discordMessageAdapter = createChannelMessageAdapterFromOutbound({
+  id: "discord",
+  outbound: discordOutbound,
+  live: {
+    capabilities: {
+      draftPreview: true,
+      previewFinalization: true,
+      progressUpdates: true,
+    },
+    finalizer: {
+      capabilities: {
+        finalEdit: false,
+        normalFallback: true,
+        discardPending: true,
+      },
+    },
+  },
 });
 
-function formatDiscordIntents(intents?: {
-  messageContent?: string;
-  guildMembers?: string;
-  presence?: string;
-}) {
-  if (!intents) {
-    return "unknown";
-  }
-  return [
-    `messageContent=${intents.messageContent ?? "unknown"}`,
-    `guildMembers=${intents.guildMembers ?? "unknown"}`,
-    `presence=${intents.presence ?? "unknown"}`,
-  ].join(" ");
-}
-
-const discordMessageActions: ChannelMessageActionAdapter = {
-  describeMessageTool: (ctx) =>
-    getDiscordRuntime().channel.discord.messageActions?.describeMessageTool?.(ctx) ?? null,
-  extractToolSend: (ctx) =>
-    getDiscordRuntime().channel.discord.messageActions?.extractToolSend?.(ctx) ?? null,
-  handleAction: async (ctx) => {
-    const ma = getDiscordRuntime().channel.discord.messageActions;
-    if (!ma?.handleAction) {
-      throw new Error("Discord message actions not available");
-    }
-    return ma.handleAction(ctx);
-  },
-  requiresTrustedRequesterSender: ({ action, toolContext }) =>
-    Boolean(toolContext && (action === "timeout" || action === "kick" || action === "ban")),
-};
-
-function buildDiscordCrossContextComponents(params: {
-  originLabel: string;
-  message: string;
+async function sendDiscordHeartbeatTyping(params: {
   cfg: OpenClawConfig;
+  to: string;
   accountId?: string | null;
+  threadId?: string | number | null;
+  signal?: AbortSignal;
+  assertPlatformSendAuthorized?: () => void;
 }) {
-  const trimmed = params.message.trim();
-  const components: Array<TextDisplay | Separator> = [];
-  if (trimmed) {
-    components.push(new TextDisplay(params.message));
-    components.push(new Separator({ divider: true, spacing: "small" }));
+  const resolvedTo = resolveDiscordAttachedOutboundTarget(params);
+  const target = parseDiscordTarget(resolvedTo, { defaultKind: "channel" });
+  if (!target || target.kind !== "channel") {
+    return;
   }
-  components.push(new TextDisplay(`*From ${params.originLabel}*`));
-  return [new DiscordUiContainer({ cfg: params.cfg, accountId: params.accountId, components })];
-}
-
-function hasDiscordExecApprovalDmRoute(cfg: OpenClawConfig): boolean {
-  return listDiscordAccountIds(cfg).some((accountId) => {
-    const execApprovals = resolveDiscordAccount({ cfg, accountId }).config.execApprovals;
-    if (!execApprovals?.enabled || (execApprovals.approvers?.length ?? 0) === 0) {
-      return false;
-    }
-    const target = execApprovals.target ?? "dm";
-    return target === "dm" || target === "both";
-  });
+  const { sendTypingDiscord } = await loadDiscordSendModule();
+  const assertCurrent = () => {
+    params.signal?.throwIfAborted();
+    params.assertPlatformSendAuthorized?.();
+  };
+  assertCurrent();
+  await withDiscordRequestAuthority(assertCurrent, () =>
+    sendTypingDiscord(target.id, {
+      cfg: params.cfg,
+      accountId: params.accountId ?? undefined,
+      signal: params.signal,
+    }),
+  );
 }
 
 const resolveDiscordAllowlistGroupOverrides = createNestedAllowlistOverrideResolver({
@@ -170,158 +143,24 @@ const resolveDiscordAllowlistGroupOverrides = createNestedAllowlistOverrideResol
 const resolveDiscordAllowlistNames = createAccountScopedAllowlistNameResolver({
   resolveAccount: resolveDiscordAccount,
   resolveToken: (account: ResolvedDiscordAccount) => account.token,
-  resolveNames: ({ token, entries }) => resolveDiscordUserAllowlist({ token, entries }),
+  resolveNames: async ({ token, entries }) =>
+    (await loadDiscordResolveUsersModule()).resolveDiscordUserAllowlist({ token, entries }),
 });
 
-const collectDiscordSecurityWarnings =
-  createOpenProviderConfiguredRouteWarningCollector<ResolvedDiscordAccount>({
-    providerConfigPresent: (cfg) => cfg.channels?.discord !== undefined,
-    resolveGroupPolicy: (account) => account.config.groupPolicy,
-    resolveRouteAllowlistConfigured: (account) =>
-      Object.keys(account.config.guilds ?? {}).length > 0,
-    configureRouteAllowlist: {
-      surface: "Discord guilds",
-      openScope: "any channel not explicitly denied",
-      groupPolicyPath: "channels.discord.groupPolicy",
-      routeAllowlistPath: "channels.discord.guilds.<id>.channels",
-    },
-    missingRouteAllowlist: {
-      surface: "Discord guilds",
-      openBehavior: "with no guild/channel allowlist; any channel can trigger (mention-gated)",
-      remediation:
-        'Set channels.discord.groupPolicy="allowlist" and configure channels.discord.guilds.<id>.channels',
-    },
-  });
+const discordPluginBase = createDiscordPluginBase({ setupContract: discordSetupContract });
 
-function normalizeDiscordAcpConversationId(conversationId: string) {
-  const normalized = conversationId.trim();
-  return normalized ? { conversationId: normalized } : null;
-}
-
-function matchDiscordAcpConversation(params: {
-  bindingConversationId: string;
-  conversationId: string;
-  parentConversationId?: string;
-}) {
-  if (params.bindingConversationId === params.conversationId) {
-    return { conversationId: params.conversationId, matchPriority: 2 };
-  }
-  if (
-    params.parentConversationId &&
-    params.parentConversationId !== params.conversationId &&
-    params.bindingConversationId === params.parentConversationId
-  ) {
-    return {
-      conversationId: params.parentConversationId,
-      matchPriority: 1,
-    };
-  }
-  return null;
-}
-
-function parseDiscordExplicitTarget(raw: string) {
-  try {
-    const target = parseDiscordTarget(raw, { defaultKind: "channel" });
-    if (!target) {
-      return null;
-    }
-    return {
-      to: target.id,
-      chatType: target.kind === "user" ? ("direct" as const) : ("channel" as const),
-    };
-  } catch {
-    return null;
-  }
-}
-
-function buildDiscordBaseSessionKey(params: {
-  cfg: OpenClawConfig;
-  agentId: string;
-  accountId?: string | null;
-  peer: RoutePeer;
-}) {
-  return buildOutboundBaseSessionKey({ ...params, channel: "discord" });
-}
-
-function resolveDiscordOutboundTargetKindHint(params: {
-  target: string;
-  resolvedTarget?: { kind: string };
-}): "user" | "channel" | undefined {
-  const resolvedKind = params.resolvedTarget?.kind;
-  if (resolvedKind === "user") {
-    return "user";
-  }
-  if (resolvedKind === "group" || resolvedKind === "channel") {
-    return "channel";
-  }
-
-  const target = params.target.trim();
-  if (/^channel:/i.test(target)) {
-    return "channel";
-  }
-  if (/^(user:|discord:|@|<@!?)/i.test(target)) {
-    return "user";
-  }
-  return undefined;
-}
-
-function resolveDiscordOutboundSessionRoute(params: {
-  cfg: OpenClawConfig;
-  agentId: string;
-  accountId?: string | null;
-  target: string;
-  resolvedTarget?: { kind: string };
-  replyToId?: string | null;
-  threadId?: string | number | null;
-}) {
-  const parsed = parseDiscordTarget(params.target, {
-    defaultKind: resolveDiscordOutboundTargetKindHint(params),
-  });
-  if (!parsed) {
-    return null;
-  }
-  const isDm = parsed.kind === "user";
-  const peer: RoutePeer = {
-    kind: isDm ? "direct" : "channel",
-    id: parsed.id,
-  };
-  const baseSessionKey = buildDiscordBaseSessionKey({
-    cfg: params.cfg,
-    agentId: params.agentId,
-    accountId: params.accountId,
-    peer,
-  });
-  const explicitThreadId = normalizeOutboundThreadId(params.threadId);
-  const threadCandidate = explicitThreadId ?? normalizeOutboundThreadId(params.replyToId);
-  const threadKeys = resolveThreadSessionKeys({
-    baseSessionKey,
-    threadId: threadCandidate,
-    useSuffix: false,
-  });
-  return {
-    sessionKey: threadKeys.sessionKey,
-    baseSessionKey,
-    peer,
-    chatType: isDm ? ("direct" as const) : ("channel" as const),
-    from: isDm ? `discord:${parsed.id}` : `discord:channel:${parsed.id}`,
-    to: isDm ? `user:${parsed.id}` : `channel:${parsed.id}`,
-    threadId: explicitThreadId ?? undefined,
-  };
-}
-
-export const discordPlugin: ChannelPlugin<ResolvedDiscordAccount, DiscordProbe> =
-  createChatChannelPlugin<ResolvedDiscordAccount, DiscordProbe>({
+export const discordPlugin: ChannelPlugin<ResolvedDiscordAccount, DiscordProbe, unknown, 2> =
+  createChatChannelPlugin<ResolvedDiscordAccount, DiscordProbe, unknown, 2>({
     base: {
-      ...createDiscordPluginBase({
-        setup: discordSetupAdapter,
-      }),
+      ...discordPluginBase,
       allowlist: {
         ...buildLegacyDmAccountAllowlistAdapter({
           channelId: "discord",
           resolveAccount: resolveDiscordAccount,
           normalize: ({ cfg, accountId, values }) =>
             discordConfigAdapter.formatAllowFrom!({ cfg, accountId, allowFrom: values }),
-          resolveDmAllowFrom: (account) => account.config.allowFrom ?? account.config.dm?.allowFrom,
+          resolveDmAllowFrom: (account, { cfg }) =>
+            resolveDiscordAccountAllowFrom({ cfg, accountId: account.accountId }),
           resolveGroupPolicy: (account) => account.config.groupPolicy,
           resolveGroupOverrides: resolveDiscordAllowlistGroupOverrides,
         }),
@@ -335,48 +174,89 @@ export const discordPlugin: ChannelPlugin<ResolvedDiscordAccount, DiscordProbe> 
         stripPatterns: () => ["<@!?\\d+>"],
       },
       agentPrompt: {
+        questionInputMode: "buttons",
         messageToolHints: () => [
+          "- Discord mentions: use supported mention syntax: users `<@USER_ID>`, channels `<#CHANNEL_ID>`, and roles `<@&ROLE_ID>`. Plain `@name` text only pings when a configured `mentionAliases` entry rewrites it; do not use the legacy `<@!USER_ID>` nickname form.",
           "- Discord components: set `components` when sending messages to include buttons, selects, or v2 containers.",
           "- Forms: add `components.modal` (title, fields). OpenClaw adds a trigger button and routes submissions as new messages.",
         ],
       },
       messaging: {
+        directTargetStyle: discordPluginBase.messaging?.directTargetStyle,
+        inferTargetChatType: discordPluginBase.messaging?.inferTargetChatType,
+        prepareConversationRouteOwnersAsync: prepareDiscordConversationRouteOwnersAsync,
+        targetPrefixes: ["discord"],
+        targetIdComparison: "lowercase",
         normalizeTarget: normalizeDiscordMessagingTarget,
+        resolveInboundConversation: resolveDiscordInboundConversation,
+        normalizeExplicitSessionKey: ({ sessionKey, ctx }) =>
+          normalizeExplicitDiscordSessionKey(sessionKey, ctx),
         resolveSessionTarget: ({ id }) => normalizeDiscordMessagingTarget(`channel:${id}`),
-        parseExplicitTarget: ({ raw }) => parseDiscordExplicitTarget(raw),
-        inferTargetChatType: ({ to }) => parseDiscordExplicitTarget(to)?.chatType,
-        buildCrossContextComponents: buildDiscordCrossContextComponents,
-        resolveOutboundSessionRoute: (params) => resolveDiscordOutboundSessionRoute(params),
+        buildCrossContextPresentation: ({ originLabel, message }) => {
+          const trimmed = message.trim();
+          return {
+            tone: "neutral" as const,
+            blocks: [
+              ...(trimmed
+                ? ([
+                    { type: "text" as const, text: message },
+                    { type: "divider" as const },
+                  ] as const)
+                : []),
+              { type: "context" as const, text: `From ${originLabel}` },
+            ],
+          };
+        },
+        resolveOutboundSessionRoute: resolveDiscordOutboundSessionRoute,
         targetResolver: {
           looksLikeId: looksLikeDiscordTargetId,
           hint: "<channelId|user:ID|channel:ID>",
+          resolveTarget: async ({ cfg, accountId, input, normalized, preferredKind }) => {
+            const defaultKind =
+              preferredKind === "user" || normalized.startsWith("user:")
+                ? "user"
+                : preferredKind === "channel" ||
+                    preferredKind === "group" ||
+                    normalized.startsWith("channel:")
+                  ? "channel"
+                  : undefined;
+            const resolved = await (
+              await loadDiscordTargetResolverModule()
+            ).resolveDiscordTarget(input, { cfg, accountId }, defaultKind ? { defaultKind } : {});
+            // Shared directory lookup owns mutable names. Fallback may only return
+            // a canonical Discord snowflake, never an unresolved channel/user name.
+            if (!resolved || !looksLikeDiscordTargetId(resolved.normalized)) {
+              return null;
+            }
+            if (
+              !looksLikeDiscordTargetId(input) &&
+              defaultKind === "channel" &&
+              resolved.kind === "user"
+            ) {
+              return null;
+            }
+            return {
+              to: resolved.normalized,
+              kind: resolved.kind === "user" ? "user" : "channel",
+              display: resolved.raw,
+              source: resolved.normalized === normalized ? "normalized" : "directory",
+            };
+          },
         },
       },
-      execApprovals: {
-        getInitiatingSurfaceState: ({ cfg, accountId }) =>
-          isDiscordExecApprovalClientEnabled({ cfg, accountId })
-            ? { kind: "enabled" }
-            : { kind: "disabled" },
-        shouldSuppressLocalPrompt: ({ cfg, accountId, payload }) =>
-          shouldSuppressLocalDiscordExecApprovalPrompt({
-            cfg,
-            accountId,
-            payload,
-          }),
-        hasConfiguredDmRoute: ({ cfg }) => hasDiscordExecApprovalDmRoute(cfg),
-        shouldSuppressForwardingFallback: ({ cfg, target }) =>
-          (normalizeMessageChannel(target.channel) ?? target.channel) === "discord" &&
-          isDiscordExecApprovalClientEnabled({ cfg, accountId: target.accountId }),
-      },
+      approvalCapability: getDiscordApprovalCapability(),
       directory: createChannelDirectoryAdapter({
-        listPeers: async (params) => listDiscordDirectoryPeersFromConfig(params),
-        listGroups: async (params) => listDiscordDirectoryGroupsFromConfig(params),
+        listPeers: async (params) =>
+          (await loadDiscordDirectoryConfigModule()).listDiscordDirectoryPeersFromConfig(params),
+        listGroups: async (params) =>
+          (await loadDiscordDirectoryConfigModule()).listDiscordDirectoryGroupsFromConfig(params),
         ...createRuntimeDirectoryLiveAdapter({
-          getRuntime: () => getDiscordRuntime().channel.discord,
-          listPeersLive: (runtime) => runtime.listDirectoryPeersLive,
-          listGroupsLive: (runtime) => runtime.listDirectoryGroupsLive,
+          getRuntime: loadDiscordDirectoryLiveModule,
+          listPeersLive: (runtime) => runtime.listDiscordDirectoryPeersLive,
+          listGroupsLive: (runtime) => runtime.listDiscordDirectoryGroupsLive,
         }),
       }),
+      message: discordMessageAdapter,
       resolver: {
         resolveTargets: async ({ cfg, accountId, inputs, kind }) => {
           const account = resolveDiscordAccount({ cfg, accountId });
@@ -385,10 +265,10 @@ export const discordPlugin: ChannelPlugin<ResolvedDiscordAccount, DiscordProbe> 
               token: account.token,
               inputs,
               missingTokenNote: "missing Discord token",
-              resolveWithToken: ({ token, inputs }) =>
-                getDiscordRuntime().channel.discord.resolveChannelAllowlist({
+              resolveWithToken: async ({ token, inputs: inputsValue }) =>
+                (await loadDiscordResolveChannelsModule()).resolveDiscordChannelAllowlist({
                   token,
-                  entries: inputs,
+                  entries: inputsValue,
                 }),
               mapResolved: (entry) => ({
                 input: entry.input,
@@ -406,10 +286,10 @@ export const discordPlugin: ChannelPlugin<ResolvedDiscordAccount, DiscordProbe> 
             token: account.token,
             inputs,
             missingTokenNote: "missing Discord token",
-            resolveWithToken: ({ token, inputs }) =>
-              getDiscordRuntime().channel.discord.resolveUserAllowlist({
+            resolveWithToken: async ({ token, inputs: inputsLocal }) =>
+              (await loadDiscordResolveUsersModule()).resolveDiscordUserAllowlist({
                 token,
-                entries: inputs,
+                entries: inputsLocal,
               }),
             mapResolved: (entry) => ({
               input: entry.input,
@@ -423,16 +303,35 @@ export const discordPlugin: ChannelPlugin<ResolvedDiscordAccount, DiscordProbe> 
       },
       actions: discordMessageActions,
       bindings: {
-        compileConfiguredBinding: ({ conversationId }) =>
-          normalizeDiscordAcpConversationId(conversationId),
-        matchInboundConversation: ({ compiledBinding, conversationId, parentConversationId }) =>
-          matchDiscordAcpConversation({
-            bindingConversationId: compiledBinding.conversationId,
-            conversationId,
-            parentConversationId,
-          }),
+        compileConfiguredBinding: ({ conversationId }) => {
+          const normalized = conversationId.trim();
+          return normalized ? { conversationId: normalized } : null;
+        },
+        matchInboundConversation: ({ compiledBinding, conversationId, parentConversationId }) => {
+          const bindingConversationId = compiledBinding.conversationId;
+          if (bindingConversationId === conversationId) {
+            return { conversationId, matchPriority: 2 };
+          }
+          if (
+            parentConversationId &&
+            parentConversationId !== conversationId &&
+            bindingConversationId === parentConversationId
+          ) {
+            return {
+              conversationId: parentConversationId,
+              matchPriority: 1,
+            };
+          }
+          return null;
+        },
+        resolveCommandConversation: resolveDiscordCommandConversation,
       },
-      status: createComputedAccountStatusAdapter<ResolvedDiscordAccount, DiscordProbe, unknown>({
+      conversationBindings: discordConversationBindings,
+      heartbeat: {
+        sendTyping: sendDiscordHeartbeatTyping,
+        sendTypingGuarded: sendDiscordHeartbeatTyping,
+      },
+      status: createComputedAccountStatusAdapter<ResolvedDiscordAccount, DiscordProbe>({
         defaultRuntime: createDefaultChannelRuntimeState(DEFAULT_ACCOUNT_ID, {
           connected: false,
           reconnectAttempts: 0,
@@ -444,28 +343,30 @@ export const discordPlugin: ChannelPlugin<ResolvedDiscordAccount, DiscordProbe> 
         buildChannelSummary: ({ snapshot }) =>
           buildTokenChannelStatusSummary(snapshot, { includeMode: false }),
         probeAccount: async ({ account, timeoutMs }) =>
-          probeDiscord(account.token, timeoutMs, {
-            includeApplication: true,
-          }),
+          await probeDiscordStatusAccount({ token: account.token, timeoutMs }),
         formatCapabilitiesProbe: ({ probe }) => {
-          const discordProbe = probe as DiscordProbe | undefined;
+          const discordProbe = probe;
           const lines = [];
           if (discordProbe?.bot?.username) {
             const botId = discordProbe.bot.id ? ` (${discordProbe.bot.id})` : "";
             lines.push({ text: `Bot: @${discordProbe.bot.username}${botId}` });
           }
-          if (discordProbe?.application?.intents) {
-            lines.push({
-              text: `Intents: ${formatDiscordIntents(discordProbe.application.intents)}`,
-            });
+          const intents = discordProbe?.application?.intents;
+          if (intents) {
+            const summary = [
+              `messageContent=${intents.messageContent ?? "unknown"}`,
+              `guildMembers=${intents.guildMembers ?? "unknown"}`,
+              `presence=${intents.presence ?? "unknown"}`,
+            ].join(" ");
+            lines.push({ text: `Intents: ${summary}` });
           }
           return lines;
         },
-        buildCapabilitiesDiagnostics: async ({ account, timeoutMs, target }) => {
+        buildCapabilitiesDiagnostics: async ({ account, target, timeoutMs }) => {
           if (!target?.trim()) {
             return undefined;
           }
-          const parsedTarget = parseDiscordTarget(target.trim(), { defaultKind: "channel" });
+          const parsedTarget = parseDiscordTarget(target, { defaultKind: "channel" });
           const details: Record<string, unknown> = {
             target: {
               raw: target,
@@ -474,35 +375,48 @@ export const discordPlugin: ChannelPlugin<ResolvedDiscordAccount, DiscordProbe> 
               channelId: parsedTarget?.kind === "channel" ? parsedTarget.id : undefined,
             },
           };
+          const permissionError = (text: string) => ({
+            details,
+            lines: [{ text, tone: "error" as const }],
+          });
           if (!parsedTarget || parsedTarget.kind !== "channel") {
-            return {
-              details,
-              lines: [
-                {
-                  text: "Permissions: Target looks like a DM user; pass channel:<id> to audit channel permissions.",
-                  tone: "error",
-                },
-              ],
-            };
+            return permissionError(
+              "Permissions: Target looks like a DM user; pass channel:<id> to audit channel permissions.",
+            );
           }
           const token = account.token?.trim();
           if (!token) {
-            return {
-              details,
-              lines: [
-                {
-                  text: "Permissions: Discord bot token missing for permission audit.",
-                  tone: "error",
-                },
-              ],
-            };
+            return permissionError("Permissions: Discord bot token missing for permission audit.");
           }
+          const statusCfg: OpenClawConfig = {
+            channels: {
+              discord: {
+                accounts: {
+                  [account.accountId]: {
+                    ...account.config,
+                    token,
+                  },
+                },
+              },
+            },
+          };
           try {
-            const perms = await fetchChannelPermissionsDiscord(parsedTarget.id, {
-              token,
-              accountId: account.accountId ?? undefined,
+            const sendModule = await loadDiscordSendModule();
+            const perms = await withAbortTimeout({
+              timeoutMs,
+              createTimeoutError: () =>
+                new Error(`Capabilities diagnostic timed out after ${timeoutMs}ms`),
+              run: async (signal) =>
+                await sendModule.fetchChannelPermissionsDiscord(parsedTarget.id, {
+                  cfg: statusCfg,
+                  token,
+                  accountId: account.accountId ?? undefined,
+                  signal,
+                  timeoutMs,
+                }),
             });
-            const missingRequired = REQUIRED_DISCORD_PERMISSIONS.filter(
+            const requiredPermissions = resolveRequiredDiscordChannelPermissions(perms.channelType);
+            const missingRequired = requiredPermissions.filter(
               (permission) => !perms.permissions.includes(permission),
             );
             details.permissions = {
@@ -526,15 +440,14 @@ export const discordPlugin: ChannelPlugin<ResolvedDiscordAccount, DiscordProbe> 
               ],
             };
           } catch (err) {
-            const message = err instanceof Error ? err.message : String(err);
+            const message = formatErrorMessage(err);
             details.permissions = { channelId: parsedTarget.id, error: message };
-            return {
-              details,
-              lines: [{ text: `Permissions: ${message}`, tone: "error" }],
-            };
+            return permissionError(`Permissions: ${message}`);
           }
         },
         auditAccount: async ({ account, timeoutMs, cfg }) => {
+          const { auditDiscordChannelPermissions, collectDiscordAuditChannelIds } =
+            await loadDiscordAuditModule();
           const { channelIds, unresolvedChannels } = collectDiscordAuditChannelIds({
             cfg,
             accountId: account.accountId,
@@ -553,6 +466,7 @@ export const discordPlugin: ChannelPlugin<ResolvedDiscordAccount, DiscordProbe> 
             };
           }
           const audit = await auditDiscordChannelPermissions({
+            cfg,
             token: botToken,
             accountId: account.accountId,
             channelIds,
@@ -560,11 +474,16 @@ export const discordPlugin: ChannelPlugin<ResolvedDiscordAccount, DiscordProbe> 
           });
           return { ...audit, unresolvedChannels };
         },
-        resolveAccountSnapshot: ({ account, runtime, probe, audit }) => {
+        resolveAccountSnapshot: ({ account, cfg, runtime, probe, audit }) => {
           const configured =
             resolveConfiguredFromCredentialStatuses(account) ?? Boolean(account.token?.trim());
           const app = runtime?.application ?? (probe as { application?: unknown })?.application;
           const bot = runtime?.bot ?? (probe as { bot?: unknown })?.bot;
+          const { groupPolicy } = resolveOpenProviderRuntimeGroupPolicy({
+            providerConfigPresent: cfg.channels?.discord !== undefined,
+            groupPolicy: account.config.groupPolicy,
+            defaultGroupPolicy: resolveDefaultGroupPolicy(cfg),
+          });
           return {
             accountId: account.accountId,
             name: account.name,
@@ -580,53 +499,110 @@ export const discordPlugin: ChannelPlugin<ResolvedDiscordAccount, DiscordProbe> 
               application: app ?? undefined,
               bot: bot ?? undefined,
               audit,
+              groupPolicy,
+              guildsConfigured: Object.keys(account.config.guilds ?? {}).length,
             },
           };
         },
       }),
       gateway: {
+        apiVersion: 2,
         startAccount: async (ctx) => {
+          const readConfig = createRuntimeConfigReader(ctx.cfg);
           const account = ctx.account;
-          const token = account.token.trim();
-          let discordBotLabel = "";
-          try {
-            const probe = await probeDiscord(token, 2500, {
-              includeApplication: true,
-            });
-            const username = probe.ok ? probe.bot?.username?.trim() : null;
-            if (username) {
-              discordBotLabel = ` (@${username})`;
-            }
-            ctx.setStatus({
-              accountId: account.accountId,
-              bot: probe.bot,
-              application: probe.application,
-            });
-            const messageContent = probe.application?.intents?.messageContent;
-            if (messageContent === "disabled") {
-              ctx.log?.warn(
-                `[${account.accountId}] Discord Message Content Intent is disabled; bot may not respond to channel messages. Enable it in Discord Dev Portal (Bot → Privileged Gateway Intents) or require mentions.`,
-              );
-            } else if (messageContent === "limited") {
-              ctx.log?.info(
-                `[${account.accountId}] Discord Message Content Intent is limited; bots under 100 servers can use it without verification.`,
-              );
-            }
-          } catch (err) {
-            if (getDiscordRuntime().logging.shouldLogVerbose()) {
-              ctx.log?.debug?.(`[${account.accountId}] bot probe failed: ${String(err)}`);
+          if (account.tokenStatus === "configured_unavailable") {
+            throw new Error(
+              `Discord bot token configured for account "${account.accountId}" is unavailable; resolve SecretRefs against the active runtime snapshot before using this account.`,
+            );
+          }
+          const startupIndex = listDiscordStartupAccountIds(ctx.cfg).indexOf(account.accountId);
+          const startupDelayMs = Math.max(0, startupIndex) * DISCORD_ACCOUNT_STARTUP_STAGGER_MS;
+          if (startupDelayMs > 0) {
+            ctx.log?.info(
+              `[${account.accountId}] delaying provider startup ${Math.round(startupDelayMs / 1000)}s to reduce Discord startup rate limits`,
+            );
+            try {
+              await sleepWithAbort(startupDelayMs, ctx.abortSignal);
+            } catch {
+              return;
             }
           }
-          ctx.log?.info(`[${account.accountId}] starting provider${discordBotLabel}`);
-          return (await loadDiscordProviderRuntime()).monitorDiscordProvider({
+          const token = account.token.trim();
+          void (async () => {
+            try {
+              const probe = await (
+                await loadDiscordProbeRuntime()
+              ).probeDiscord(token, 2500, {
+                includeApplication: true,
+              });
+              if (ctx.abortSignal.aborted) {
+                return;
+              }
+              ctx.setStatus({
+                accountId: account.accountId,
+                bot: probe.bot,
+                application: probe.application,
+              });
+              if (probe.ok) {
+                const username = probe.bot?.username?.trim();
+                if (username) {
+                  ctx.log?.info?.(`[${account.accountId}] Discord bot check resolved @${username}`);
+                }
+              } else if (getDiscordRuntime().logging.shouldLogVerbose()) {
+                ctx.log?.debug?.(
+                  `[${account.accountId}] bot check degraded: ${probe.error ?? `status ${probe.status ?? "unknown"}`}`,
+                );
+              }
+
+              const messageContent = probe.application?.intents?.messageContent;
+              if (messageContent === "disabled") {
+                ctx.log?.warn?.(
+                  `[${account.accountId}] Discord Message Content Intent is disabled; bot may not respond to channel messages. Enable it in Discord Dev Portal (Bot → Privileged Gateway Intents) or require mentions.`,
+                );
+              } else if (messageContent === "limited") {
+                ctx.log?.info?.(
+                  `[${account.accountId}] Discord Message Content Intent is limited; bots under 100 servers can use it without verification.`,
+                );
+              }
+            } catch (err) {
+              if (!ctx.abortSignal.aborted) {
+                ctx.setStatus({
+                  accountId: account.accountId,
+                  bot: undefined,
+                  application: undefined,
+                });
+              }
+              if (getDiscordRuntime().logging.shouldLogVerbose()) {
+                ctx.log?.debug?.(`[${account.accountId}] bot check failed: ${String(err)}`);
+              }
+            }
+          })();
+          ctx.log?.info(`[${account.accountId}] starting provider`);
+          let commandDeployHashStore;
+          try {
+            commandDeployHashStore = openDiscordCommandDeployHashStore(
+              getDiscordRuntime().state.openKeyedStore,
+            );
+          } catch (error) {
+            ctx.log?.warn?.(
+              `[${account.accountId}] Discord command deploy cache unavailable; continuing without persistence: ${formatErrorMessage(error)}`,
+            );
+          }
+          await (
+            await loadDiscordProviderRuntime()
+          ).monitorDiscordProvider({
+            scheduler: ctx.scheduler,
             token,
             accountId: account.accountId,
             config: ctx.cfg,
+            readConfig,
             runtime: ctx.runtime,
+            channelRuntime: ctx.channelRuntime,
             abortSignal: ctx.abortSignal,
             mediaMaxMb: account.config.mediaMaxMb,
             historyLimit: account.config.historyLimit,
             setStatus: (patch) => ctx.setStatus({ accountId: account.accountId, ...patch }),
+            commandDeployHashStore,
           });
         },
       },
@@ -636,70 +612,59 @@ export const discordPlugin: ChannelPlugin<ResolvedDiscordAccount, DiscordProbe> 
         idLabel: "discordUserId",
         message: PAIRING_APPROVED_MESSAGE,
         normalizeAllowEntry: createPairingPrefixStripper(/^(discord|user):/i),
-        notify: async ({ id, message }) => {
-          await getDiscordRuntime().channel.discord.sendMessageDiscord(`user:${id}`, message);
+        notify: async ({ cfg, id, message, accountId }) => {
+          await (
+            await loadDiscordSendModule()
+          ).sendMessageDiscord(`user:${id}`, message, {
+            cfg,
+            ...(accountId ? { accountId } : {}),
+          });
         },
       },
     },
-    security: {
-      resolveDmPolicy: resolveDiscordDmPolicy,
-      collectWarnings: collectDiscordSecurityWarnings,
-    },
+    security: discordSecurityAdapter,
     threading: {
-      topLevelReplyToMode: "discord",
+      matchesToolContextTarget: matchesDiscordToolContextTarget,
+      // A Discord thread is addressed by its own channel id, so only a send to
+      // that thread's channel carries the current thread. Parent and sibling
+      // channels stay unthreaded; this never redirects a send into the thread.
+      resolveAutoThreadId: ({ to, toolContext }) => {
+        const threadId = normalizeOptionalString(toolContext?.currentThreadTs);
+        if (!threadId) {
+          return undefined;
+        }
+        return normalizeDiscordMessagingTarget(to) === `channel:${threadId}` ? threadId : undefined;
+      },
+      scopedAccountReplyToMode: {
+        resolveAccount: (cfg, accountId) => resolveDiscordAccount({ cfg, accountId }),
+        resolveReplyToMode: (account) => account.config.replyToMode,
+        fallback: "off",
+      },
+      buildToolContext: ({ context, hasRepliedRef }) => {
+        const currentMessagingTarget = normalizeOptionalString(context.To);
+        const nativeChannelId = normalizeOptionalString(context.NativeChannelId);
+        const currentChatType =
+          context.ChatType === "direct" ||
+          context.ChatType === "group" ||
+          context.ChatType === "channel"
+            ? context.ChatType
+            : undefined;
+        return {
+          currentChannelId: nativeChannelId
+            ? normalizeDiscordMessagingTarget(nativeChannelId)
+            : currentMessagingTarget,
+          currentChatType,
+          currentMessagingTarget,
+          currentMessageId: context.CurrentMessageId,
+          hasRepliedRef,
+        };
+      },
     },
     outbound: {
-      base: {
-        deliveryMode: "direct",
-        chunker: null,
-        textChunkLimit: 2000,
-        pollMaxOptions: 10,
-        resolveTarget: ({ to }) => normalizeDiscordOutboundTarget(to),
-      },
-      attachedResults: {
-        channel: "discord",
-        sendText: async ({ cfg, to, text, accountId, deps, replyToId, silent }) => {
-          const send =
-            resolveOutboundSendDep<DiscordSendFn>(deps, "discord") ??
-            getDiscordRuntime().channel.discord.sendMessageDiscord;
-          return await send(to, text, {
-            verbose: false,
-            cfg,
-            replyTo: replyToId ?? undefined,
-            accountId: accountId ?? undefined,
-            silent: silent ?? undefined,
-          });
-        },
-        sendMedia: async ({
-          cfg,
-          to,
-          text,
-          mediaUrl,
-          mediaLocalRoots,
-          accountId,
-          deps,
-          replyToId,
-          silent,
-        }) => {
-          const send =
-            resolveOutboundSendDep<DiscordSendFn>(deps, "discord") ??
-            getDiscordRuntime().channel.discord.sendMessageDiscord;
-          return await send(to, text, {
-            verbose: false,
-            cfg,
-            mediaUrl,
-            mediaLocalRoots,
-            replyTo: replyToId ?? undefined,
-            accountId: accountId ?? undefined,
-            silent: silent ?? undefined,
-          });
-        },
-        sendPoll: async ({ cfg, to, poll, accountId, silent }) =>
-          await getDiscordRuntime().channel.discord.sendPollDiscord(to, poll, {
-            cfg,
-            accountId: accountId ?? undefined,
-            silent: silent ?? undefined,
-          }),
-      },
+      ...discordOutbound,
+      preferFinalAssistantVisibleText: true,
+      shouldTreatDeliveredTextAsVisible: ({ kind, text }) =>
+        kind === "block" && typeof text === "string" && text.trim().length > 0,
+      shouldSuppressLocalPayloadPrompt: shouldSuppressLocalDiscordExecApprovalPrompt,
     },
   });

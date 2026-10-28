@@ -1,16 +1,11 @@
+// Covers SCP remote host and path normalization.
 import { describe, expect, it } from "vitest";
-import {
-  isSafeScpRemoteHost,
-  isSafeScpRemotePath,
-  normalizeScpRemoteHost,
-  normalizeScpRemotePath,
-} from "./scp-host.js";
+import { isSafeScpRemoteHost, normalizeScpRemoteHost, normalizeScpRemotePath } from "./scp-host.js";
 
 describe("scp remote host", () => {
   it.each([
     { value: "gateway-host", expected: "gateway-host" },
     { value: " bot@gateway-host ", expected: "bot@gateway-host" },
-    { value: "bot@192.168.64.3", expected: "bot@192.168.64.3" },
     { value: "bot@[fe80::1]", expected: "bot@[fe80::1]" },
   ])("normalizes safe hosts for %j", ({ value, expected }) => {
     expect(normalizeScpRemoteHost(value)).toBe(expected);
@@ -18,8 +13,6 @@ describe("scp remote host", () => {
 
   it.each([
     null,
-    undefined,
-    "",
     "   ",
     "-oProxyCommand=whoami",
     "bot@gateway-host -oStrictHostKeyChecking=no",
@@ -40,38 +33,35 @@ describe("scp remote host", () => {
 });
 
 describe("scp remote path", () => {
-  it.each([
-    {
-      value: "/Users/demo/Library/Messages/Attachments/ab/cd/photo.jpg",
-      expected: "/Users/demo/Library/Messages/Attachments/ab/cd/photo.jpg",
-    },
-    {
-      value: " /Users/demo/Library/Messages/Attachments/ab/cd/IMG 1234 (1).jpg ",
-      expected: "/Users/demo/Library/Messages/Attachments/ab/cd/IMG 1234 (1).jpg",
-    },
-  ])("normalizes safe paths for %j", ({ value, expected }) => {
-    expect(normalizeScpRemotePath(value)).toBe(expected);
-    expect(isSafeScpRemotePath(value)).toBe(true);
-  });
-
-  it.each([
-    null,
-    undefined,
-    "",
-    "   ",
-    "relative/path.jpg",
-    "/Users/demo/Library/Messages/Attachments/ab/cd/bad$path.jpg",
-    "/Users/demo/Library/Messages/Attachments/ab/cd/bad`path`.jpg",
-    "/Users/demo/Library/Messages/Attachments/ab/cd/bad;path.jpg",
-    "/Users/demo/Library/Messages/Attachments/ab/cd/bad|path.jpg",
-    "/Users/demo/Library/Messages/Attachments/ab/cd/bad&path.jpg",
-    "/Users/demo/Library/Messages/Attachments/ab/cd/bad<path.jpg",
-    "/Users/demo/Library/Messages/Attachments/ab/cd/bad>path.jpg",
-    '/Users/demo/Library/Messages/Attachments/ab/cd/bad"path.jpg',
-    "/Users/demo/Library/Messages/Attachments/ab/cd/bad'path.jpg",
-    "/Users/demo/Library/Messages/Attachments/ab/cd/bad\\path.jpg",
-  ])("rejects unsafe path tokens: %j", (value) => {
-    expect(normalizeScpRemotePath(value)).toBeUndefined();
-    expect(isSafeScpRemotePath(value)).toBe(false);
+  it.each(
+    [
+      {
+        value: "/Users/demo/Library/Messages/Attachments/ab/cd/photo.jpg",
+        normalized: "/Users/demo/Library/Messages/Attachments/ab/cd/photo.jpg",
+      },
+      {
+        value: " /Users/demo/Library/Messages/Attachments/ab/cd/IMG 1234 (1).jpg ",
+        normalized: "/Users/demo/Library/Messages/Attachments/ab/cd/IMG 1234 (1).jpg",
+      },
+      null,
+      "   ",
+      "relative/path.jpg",
+      "/Users/demo/Library/Messages/Attachments/ab/cd/bad$path.jpg",
+      "/Users/demo/Library/Messages/Attachments/ab/cd/bad`path`.jpg",
+      "/Users/demo/Library/Messages/Attachments/ab/cd/bad;path.jpg",
+      "/Users/demo/Library/Messages/Attachments/ab/cd/bad|path.jpg",
+      "/Users/demo/Library/Messages/Attachments/ab/cd/bad&path.jpg",
+      "/Users/demo/Library/Messages/Attachments/ab/cd/bad<path.jpg",
+      "/Users/demo/Library/Messages/Attachments/ab/cd/bad>path.jpg",
+      '/Users/demo/Library/Messages/Attachments/ab/cd/bad"path.jpg',
+      "/Users/demo/Library/Messages/Attachments/ab/cd/bad'path.jpg",
+      "/Users/demo/Library/Messages/Attachments/ab/cd/bad\\path.jpg",
+    ].map((entry) =>
+      typeof entry === "object" && entry !== null && "value" in entry
+        ? entry
+        : { value: entry, normalized: undefined },
+    ),
+  )("classifies path token %j", ({ value, normalized }) => {
+    expect(normalizeScpRemotePath(value)).toBe(normalized);
   });
 });

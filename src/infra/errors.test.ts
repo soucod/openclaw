@@ -1,80 +1,87 @@
-import { describe, expect, it } from "vitest";
-import {
-  collectErrorGraphCandidates,
-  extractErrorCode,
-  formatErrorMessage,
-  formatUncaughtError,
-  hasErrnoCode,
-  isErrno,
-  readErrorName,
-} from "./errors.js";
+import { expect, it } from "vitest";
+import { attachErrorDiagnostic, formatErrorMessageForDisplay } from "./error-diagnostics.js";
+import * as errors from "./errors.js";
 
-describe("error helpers", () => {
-  it("extracts codes and names from string and numeric error metadata", () => {
-    expect(extractErrorCode({ code: "EADDRINUSE" })).toBe("EADDRINUSE");
-    expect(extractErrorCode({ code: 429 })).toBe("429");
-    expect(extractErrorCode({ code: false })).toBeUndefined();
-    expect(extractErrorCode("boom")).toBeUndefined();
+const token = "sk-abcdefghijklmnopqrstuv";
+function expectRedacted(formatted: string, visible: string[], secrets = [token]) {
+  visible.forEach((value) => expect(formatted).toContain(value));
+  secrets.forEach((value) => expect(formatted).not.toContain(value));
+}
 
-    expect(readErrorName({ name: "AbortError" })).toBe("AbortError");
-    expect(readErrorName({ name: 42 })).toBe("");
-    expect(readErrorName(null)).toBe("");
+it("keeps bounded redacted diagnostics off frozen errors and follows wrapper graphs", () => {
+  const error = Object.freeze(new Error("native failure"));
+  const before = Object.getOwnPropertyDescriptors(error);
+  const diagnostic = `Authorization: Bearer ${token}\n${"x".repeat(4_000)}`;
+  expect(attachErrorDiagnostic(error, diagnostic)).toBe(error);
+  const wrapper = new AggregateError([{ cause: error }], "outer failure");
+  const display = formatErrorMessageForDisplay(wrapper);
+  expectRedacted(display, ["Authorization: Bearer"]);
+  expect(display.length).toBeLessThanOrEqual('outer failure | {"cause":{}}\n'.length + 2_048);
+  expect(errors.formatErrorMessage(wrapper)).toBe('outer failure | {"cause":{}}');
+  expect(Object.getOwnPropertyDescriptors(error)).toEqual(before);
+  expect(formatErrorMessageForDisplay(new Error("unrelated failure"))).toBe("unrelated failure");
+});
+
+it("reads primitive causes and propagates accessor failures", async () => {
+  expect(errors.readErrorCause("boom")).toBeUndefined();
+  const failure = new Error("cause access failed");
+  const error = {
+    get cause(): never {
+      throw failure;
+    },
+  };
+  expect(() => errors.readErrorCause(error)).toThrow(failure);
+  await expect(async () =>
+    errors.collectErrorGraphCandidates(error, function* (current) {
+      yield errors.readErrorCause(current);
+    }),
+  ).rejects.toBe(failure);
+});
+
+it("matches errno-shaped errors by code", () => {
+  const err = Object.assign(new Error("busy"), { code: "EADDRINUSE" });
+  expect(errors.isErrno(err)).toBe(true);
+  expect(errors.hasErrnoCode(err, "EADDRINUSE")).toBe(true);
+  expect(errors.hasErrnoCode(err, "ENOENT")).toBe(false);
+  expect(errors.isErrno("busy")).toBe(false);
+});
+
+it("does not classify other fs-safe or errno failures as missing paths", () => {
+  expect(errors.isMissingPathError({ code: "path-alias" })).toBe(false);
+  expect(errors.isMissingPathError(new Error("ENOENT"))).toBe(false);
+});
+
+it("redacts sensitive tokens from formatted error messages", () => {
+  const formatted = errors.formatErrorMessage(new Error(`Authorization: Bearer ${token}`));
+  const codeFormatted = errors.formatErrorMessageWithCode(
+    Object.assign(new Error("request failed"), { code: `token=${token}` }),
+  );
+  expectRedacted(formatted, ["Authorization: Bearer"]);
+  expectRedacted(codeFormatted, ["request failed"]);
+});
+
+it("redacts HTTP client config secrets from formatted error chains", () => {
+  const appSecret = "feishu_app_secret_1234567890";
+  const tenantToken = "feishu_tenant_access_abcdef123456";
+  const rootCause = new Error(
+    `request config: { appSecret: '${appSecret}', headers: { authorization: 'Bearer ${tenantToken}' } }`,
+  );
+  const httpError = new Error("POST /auth/v3/tenant_access_token failed", { cause: rootCause });
+  expectRedacted(
+    errors.formatErrorMessage(httpError),
+    ["POST /auth/v3/tenant_access_token failed", "appSecret:", "authorization:"],
+    [appSecret, tenantToken],
+  );
+});
+
+it("uses message-only formatting for INVALID_CONFIG and stack formatting otherwise", () => {
+  const invalidConfig = Object.assign(new Error(`TOKEN=${token}`), {
+    code: "INVALID_CONFIG",
+    stack: `Error: TOKEN=${token}\n    at ignored`,
   });
+  expect(errors.formatUncaughtError(invalidConfig)).not.toContain("at ignored");
 
-  it("walks nested error graphs once in breadth-first order", () => {
-    const leaf = { name: "leaf" };
-    const child = { name: "child" } as {
-      name: string;
-      cause?: unknown;
-      errors?: unknown[];
-    };
-    const root = { name: "root", cause: child, errors: [leaf, child] };
-    child.cause = root;
-
-    expect(
-      collectErrorGraphCandidates(root, (current) => [
-        current.cause,
-        ...((current as { errors?: unknown[] }).errors ?? []),
-      ]),
-    ).toEqual([root, child, leaf]);
-    expect(collectErrorGraphCandidates(null)).toEqual([]);
-  });
-
-  it("matches errno-shaped errors by code", () => {
-    const err = Object.assign(new Error("busy"), { code: "EADDRINUSE" });
-    expect(isErrno(err)).toBe(true);
-    expect(hasErrnoCode(err, "EADDRINUSE")).toBe(true);
-    expect(hasErrnoCode(err, "ENOENT")).toBe(false);
-    expect(isErrno("busy")).toBe(false);
-  });
-
-  it("formats primitives and circular objects without throwing", () => {
-    const circular: { self?: unknown } = {};
-    circular.self = circular;
-
-    expect(formatErrorMessage(123n)).toBe("123");
-    expect(formatErrorMessage(false)).toBe("false");
-    expect(formatErrorMessage(circular)).toBe("[object Object]");
-  });
-
-  it("redacts sensitive tokens from formatted error messages", () => {
-    const token = "sk-abcdefghijklmnopqrstuv";
-    const formatted = formatErrorMessage(new Error(`Authorization: Bearer ${token}`));
-    expect(formatted).toContain("Authorization: Bearer");
-    expect(formatted).not.toContain(token);
-  });
-
-  it("uses message-only formatting for INVALID_CONFIG and stack formatting otherwise", () => {
-    const invalidConfig = Object.assign(new Error("TOKEN=sk-abcdefghijklmnopqrstuv"), {
-      code: "INVALID_CONFIG",
-      stack: "Error: TOKEN=sk-abcdefghijklmnopqrstuv\n    at ignored",
-    });
-    expect(formatUncaughtError(invalidConfig)).not.toContain("at ignored");
-
-    const uncaught = new Error("boom");
-    uncaught.stack = "Error: Authorization: Bearer sk-abcdefghijklmnopqrstuv\n    at runTask";
-    const formatted = formatUncaughtError(uncaught);
-    expect(formatted).toContain("at runTask");
-    expect(formatted).not.toContain("sk-abcdefghijklmnopqrstuv");
-  });
+  const uncaught = new Error("boom");
+  uncaught.stack = `Error: Authorization: Bearer ${token}\n    at runTask`;
+  expectRedacted(errors.formatUncaughtError(uncaught), ["at runTask"]);
 });

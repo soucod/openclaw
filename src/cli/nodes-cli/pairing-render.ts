@@ -1,25 +1,27 @@
+import { terminalText } from "../../../packages/terminal-core/src/safe-text.js";
+import { renderTable } from "../../../packages/terminal-core/src/table.js";
 import { formatTimeAgo } from "../../infra/format-time/format-relative.ts";
-import { renderTable } from "../../terminal/table.js";
-import type { PendingRequest } from "./types.js";
+import { resolveNodePairApprovalScopes } from "../../infra/node-pairing-authz.js";
+import type { PendingRequest } from "../../shared/node-list-types.js";
 
+/** Render pending pairing requests with sanitized labels and relative request age. */
 export function renderPendingPairingRequestsTable(params: {
   pending: PendingRequest[];
   now: number;
   tableWidth: number;
   theme: {
     heading: (text: string) => string;
-    warn: (text: string) => string;
     muted: (text: string) => string;
   };
 }) {
   const { pending, now, tableWidth, theme } = params;
   const rows = pending.map((r) => ({
-    Request: r.requestId,
-    Node: r.displayName?.trim() ? r.displayName.trim() : r.nodeId,
-    IP: r.remoteIp ?? "",
+    Request: terminalText`${r.requestId}`,
+    Node: terminalText`${r.displayName?.trim() || r.nodeId}`,
+    IP: terminalText`${r.remoteIp ?? ""}`,
+    Scopes: terminalText`${resolveNodePairApprovalScopes(r.commands, r.requiredApproveScopes).join(", ")}`,
     Requested:
       typeof r.ts === "number" ? formatTimeAgo(Math.max(0, now - r.ts)) : theme.muted("unknown"),
-    Repair: r.isRepair ? theme.warn("yes") : "",
   }));
   return {
     heading: theme.heading("Pending"),
@@ -30,7 +32,7 @@ export function renderPendingPairingRequestsTable(params: {
         { key: "Node", header: "Node", minWidth: 14, flex: true },
         { key: "IP", header: "IP", minWidth: 10 },
         { key: "Requested", header: "Requested", minWidth: 12 },
-        { key: "Repair", header: "Repair", minWidth: 6 },
+        { key: "Scopes", header: "Approval scopes", minWidth: 14, flex: true },
       ],
       rows,
     }).trimEnd(),

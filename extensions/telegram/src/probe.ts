@@ -1,19 +1,36 @@
 import type { BaseProbeResult } from "openclaw/plugin-sdk/channel-contract";
-import { fetchWithTimeout } from "openclaw/plugin-sdk/text-runtime";
-import type { TelegramNetworkConfig } from "../runtime-api.js";
-import { resolveTelegramApiBase, resolveTelegramFetch } from "./fetch.js";
-import { makeProxyFetch } from "./proxy.js";
+import type { TelegramNetworkConfig } from "openclaw/plugin-sdk/config-contracts";
+import { formatErrorMessage, toErrorObject } from "openclaw/plugin-sdk/error-runtime";
+import { makeProxyFetch } from "openclaw/plugin-sdk/fetch-runtime";
+import { readResponseWithLimit } from "openclaw/plugin-sdk/response-limit-runtime";
+import { sleepWithAbort } from "openclaw/plugin-sdk/runtime-env";
+import { asBoolean } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { fetchWithTimeout, runChannelProbe } from "openclaw/plugin-sdk/text-utility-runtime";
+import { normalizeTelegramBotInfo, type TelegramBotInfo } from "./bot-info.js";
+import {
+  resolveTelegramApiBase,
+  resolveTelegramTransport,
+  type TelegramTransport,
+} from "./fetch.js";
 
 export type TelegramProbe = BaseProbeResult & {
   status?: number | null;
   elapsedMs: number;
   bot?: {
     id?: number | null;
+    isBot?: boolean | null;
+    firstName?: string | null;
     username?: string | null;
     canJoinGroups?: boolean | null;
     canReadAllGroupMessages?: boolean | null;
+    canManageBots?: boolean | null;
     supportsInlineQueries?: boolean | null;
+    canConnectToBusiness?: boolean | null;
+    hasMainWebApp?: boolean | null;
+    hasTopicsEnabled?: boolean | null;
+    allowsUsersToCreateTopics?: boolean | null;
   };
+  botInfo?: TelegramBotInfo;
   webhook?: { url?: string | null; hasCustomCert?: boolean | null };
 };
 
@@ -22,32 +39,17 @@ export type TelegramProbeOptions = {
   network?: TelegramNetworkConfig;
   accountId?: string;
   apiRoot?: string;
+  includeWebhookInfo?: boolean;
+  abortSignal?: AbortSignal;
 };
 
-const probeFetcherCache = new Map<string, typeof fetch>();
-const MAX_PROBE_FETCHER_CACHE_SIZE = 64;
+const probeTransportCache = new Map<string, TelegramTransport>();
+const MAX_PROBE_TRANSPORT_CACHE_SIZE = 64;
+// Generous cap: Telegram Bot API responses for getMe/getWebhookInfo are always < 1 KiB.
+// 4 MiB guards against a misbehaving or hostile API endpoint streaming an oversized payload.
+const TELEGRAM_BOT_API_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 
-export function resetTelegramProbeFetcherCacheForTests(): void {
-  probeFetcherCache.clear();
-}
-
-function resolveProbeOptions(
-  proxyOrOptions?: string | TelegramProbeOptions,
-): TelegramProbeOptions | undefined {
-  if (!proxyOrOptions) {
-    return undefined;
-  }
-  if (typeof proxyOrOptions === "string") {
-    return { proxyUrl: proxyOrOptions };
-  }
-  return proxyOrOptions;
-}
-
-function shouldUseProbeFetcherCache(): boolean {
-  return !process.env.VITEST && process.env.NODE_ENV !== "test";
-}
-
-function buildProbeFetcherCacheKey(token: string, options?: TelegramProbeOptions): string {
+function resolveProbeTransport(token: string, options?: TelegramProbeOptions): TelegramTransport {
   const cacheIdentity = options?.accountId?.trim() || token;
   const cacheIdentityKind = options?.accountId?.trim() ? "account" : "token";
   const proxyKey = options?.proxyUrl?.trim() ?? "";
@@ -56,40 +58,40 @@ function buildProbeFetcherCacheKey(token: string, options?: TelegramProbeOptions
     typeof autoSelectFamily === "boolean" ? String(autoSelectFamily) : "default";
   const dnsResultOrderKey = options?.network?.dnsResultOrder ?? "default";
   const apiRootKey = options?.apiRoot?.trim() ?? "";
-  return `${cacheIdentityKind}:${cacheIdentity}::${proxyKey}::${autoSelectFamilyKey}::${dnsResultOrderKey}::${apiRootKey}`;
-}
-
-function setCachedProbeFetcher(cacheKey: string, fetcher: typeof fetch): typeof fetch {
-  probeFetcherCache.set(cacheKey, fetcher);
-  if (probeFetcherCache.size > MAX_PROBE_FETCHER_CACHE_SIZE) {
-    const oldestKey = probeFetcherCache.keys().next().value;
-    if (oldestKey !== undefined) {
-      probeFetcherCache.delete(oldestKey);
-    }
-  }
-  return fetcher;
-}
-
-function resolveProbeFetcher(token: string, options?: TelegramProbeOptions): typeof fetch {
-  const cacheEnabled = shouldUseProbeFetcherCache();
-  const cacheKey = cacheEnabled ? buildProbeFetcherCacheKey(token, options) : null;
-  if (cacheKey) {
-    const cachedFetcher = probeFetcherCache.get(cacheKey);
-    if (cachedFetcher) {
-      return cachedFetcher;
-    }
+  const cacheKey = `${cacheIdentityKind}:${cacheIdentity}::${proxyKey}::${autoSelectFamilyKey}::${dnsResultOrderKey}::${apiRootKey}`;
+  const cached = probeTransportCache.get(cacheKey);
+  if (cached) {
+    return cached;
   }
 
   const proxyUrl = options?.proxyUrl?.trim();
   const proxyFetch = proxyUrl ? makeProxyFetch(proxyUrl) : undefined;
-  const resolved = resolveTelegramFetch(proxyFetch, {
+  const transport = resolveTelegramTransport(proxyFetch, {
     network: options?.network,
   });
 
-  if (cacheKey) {
-    return setCachedProbeFetcher(cacheKey, resolved);
+  probeTransportCache.set(cacheKey, transport);
+  if (probeTransportCache.size > MAX_PROBE_TRANSPORT_CACHE_SIZE) {
+    const oldestKey = probeTransportCache.keys().next().value;
+    if (oldestKey !== undefined) {
+      const oldestTransport = probeTransportCache.get(oldestKey);
+      probeTransportCache.delete(oldestKey);
+      void oldestTransport?.close();
+    }
   }
-  return resolved;
+  return transport;
+}
+
+async function readTelegramDiagnosticJson(response: Response, timeoutMs: number): Promise<unknown> {
+  const body = await readResponseWithLimit(response, TELEGRAM_BOT_API_MAX_RESPONSE_BYTES, {
+    timeoutMs,
+    chunkTimeoutMs: timeoutMs / 2,
+    onIdleTimeout: ({ chunkTimeoutMs }) =>
+      new Error(`Telegram diagnostic response body stalled for ${chunkTimeoutMs}ms`),
+    onTimeout: ({ timeoutMs: resolvedTimeoutMs }) =>
+      new Error(`Telegram diagnostic response body timed out after ${resolvedTimeoutMs}ms`),
+  });
+  return JSON.parse(body.toString("utf8"));
 }
 
 export async function probeTelegram(
@@ -97,128 +99,151 @@ export async function probeTelegram(
   timeoutMs: number,
   proxyOrOptions?: string | TelegramProbeOptions,
 ): Promise<TelegramProbe> {
-  const started = Date.now();
-  const timeoutBudgetMs = Math.max(1, Math.floor(timeoutMs));
-  const deadlineMs = started + timeoutBudgetMs;
-  const options = resolveProbeOptions(proxyOrOptions);
-  const fetcher = resolveProbeFetcher(token, options);
-  const apiBase = resolveTelegramApiBase(options?.apiRoot);
-  const base = `${apiBase}/bot${token}`;
-  const retryDelayMs = Math.max(50, Math.min(1000, Math.floor(timeoutBudgetMs / 5)));
-  const resolveRemainingBudgetMs = () => Math.max(0, deadlineMs - Date.now());
-
-  const result: TelegramProbe = {
-    ok: false,
-    status: null,
-    error: null,
-    elapsedMs: 0,
-  };
-
-  try {
-    let meRes: Response | null = null;
-    let fetchError: unknown = null;
-
-    // Retry loop for initial connection (handles network/DNS startup races)
-    for (let i = 0; i < 3; i++) {
-      const remainingBudgetMs = resolveRemainingBudgetMs();
-      if (remainingBudgetMs <= 0) {
-        break;
-      }
-      try {
-        meRes = await fetchWithTimeout(
-          `${base}/getMe`,
-          {},
+  return await runChannelProbe(
+    undefined,
+    async ({ startedAt }) => {
+      const timeoutBudgetMs = Math.max(1, Math.floor(timeoutMs));
+      const deadlineMs = startedAt + timeoutBudgetMs;
+      const options =
+        typeof proxyOrOptions === "string"
+          ? proxyOrOptions
+            ? { proxyUrl: proxyOrOptions }
+            : undefined
+          : proxyOrOptions;
+      const abortSignal = options?.abortSignal;
+      const includeWebhookInfo = options?.includeWebhookInfo !== false;
+      const apiBase = resolveTelegramApiBase(options?.apiRoot);
+      const transport = resolveProbeTransport(token, options);
+      const fetcher = transport.fetch;
+      const base = `${apiBase}/bot${token}`;
+      const fetchMethod = (method: "getMe" | "getWebhookInfo", remainingBudgetMs: number) =>
+        fetchWithTimeout(
+          `${base}/${method}`,
+          { signal: abortSignal },
           Math.max(1, Math.min(timeoutBudgetMs, remainingBudgetMs)),
           fetcher,
         );
-        break;
-      } catch (err) {
-        fetchError = err;
-        if (i < 2) {
-          const remainingAfterAttemptMs = resolveRemainingBudgetMs();
-          if (remainingAfterAttemptMs <= 0) {
-            break;
-          }
-          const delayMs = Math.min(retryDelayMs, remainingAfterAttemptMs);
-          if (delayMs > 0) {
-            await new Promise((resolve) => setTimeout(resolve, delayMs));
-          }
-        }
-      }
-    }
-
-    if (!meRes) {
-      throw fetchError ?? new Error(`probe timed out after ${timeoutBudgetMs}ms`);
-    }
-
-    const meJson = (await meRes.json()) as {
-      ok?: boolean;
-      description?: string;
-      result?: {
-        id?: number;
-        username?: string;
-        can_join_groups?: boolean;
-        can_read_all_group_messages?: boolean;
-        supports_inline_queries?: boolean;
+      const retryDelayMs = Math.max(50, Math.min(1000, Math.floor(timeoutBudgetMs / 5)));
+      const resolveRemainingBudgetMs = () => Math.max(0, deadlineMs - Date.now());
+      const result: Omit<TelegramProbe, "elapsedMs"> = {
+        ok: false,
+        status: null,
+        error: null,
       };
-    };
-    if (!meRes.ok || !meJson?.ok) {
-      result.status = meRes.status;
-      result.error = meJson?.description ?? `getMe failed (${meRes.status})`;
-      return { ...result, elapsedMs: Date.now() - started };
-    }
+      let meRes: Response | null = null;
+      let fetchError: unknown = null;
 
-    result.bot = {
-      id: meJson.result?.id ?? null,
-      username: meJson.result?.username ?? null,
-      canJoinGroups:
-        typeof meJson.result?.can_join_groups === "boolean" ? meJson.result?.can_join_groups : null,
-      canReadAllGroupMessages:
-        typeof meJson.result?.can_read_all_group_messages === "boolean"
-          ? meJson.result?.can_read_all_group_messages
-          : null,
-      supportsInlineQueries:
-        typeof meJson.result?.supports_inline_queries === "boolean"
-          ? meJson.result?.supports_inline_queries
-          : null,
-    };
-
-    // Try to fetch webhook info, but don't fail health if it errors.
-    try {
-      const webhookRemainingBudgetMs = resolveRemainingBudgetMs();
-      if (webhookRemainingBudgetMs > 0) {
-        const webhookRes = await fetchWithTimeout(
-          `${base}/getWebhookInfo`,
-          {},
-          Math.max(1, Math.min(timeoutBudgetMs, webhookRemainingBudgetMs)),
-          fetcher,
-        );
-        const webhookJson = (await webhookRes.json()) as {
-          ok?: boolean;
-          result?: { url?: string; has_custom_certificate?: boolean };
-        };
-        if (webhookRes.ok && webhookJson?.ok) {
-          result.webhook = {
-            url: webhookJson.result?.url ?? null,
-            hasCustomCert: webhookJson.result?.has_custom_certificate ?? null,
-          };
+      // Retry loop for initial connection (handles network/DNS startup races)
+      for (let i = 0; i < 3; i++) {
+        const remainingBudgetMs = resolveRemainingBudgetMs();
+        if (remainingBudgetMs <= 0 || abortSignal?.aborted) {
+          break;
+        }
+        try {
+          meRes = await fetchMethod("getMe", remainingBudgetMs);
+          break;
+        } catch (err) {
+          fetchError = err;
+          if (abortSignal?.aborted) {
+            throw err;
+          }
+          // On timeout or network error, promote the transport to its IPv4
+          // fallback dispatcher so the next retry (and all future probes
+          // sharing this cached transport) skip the stalled IPv6 path.
+          // Keep the original socket code in transport fallback diagnostics.
+          transport.forceFallback?.("check timeout/network error", err);
+          if (i < 2) {
+            const remainingAfterAttemptMs = resolveRemainingBudgetMs();
+            if (remainingAfterAttemptMs <= 0) {
+              break;
+            }
+            const delayMs = Math.min(retryDelayMs, remainingAfterAttemptMs);
+            if (delayMs > 0) {
+              await sleepWithAbort(delayMs, abortSignal);
+            }
+          }
         }
       }
-    } catch {
-      // ignore webhook errors for probe
-    }
 
-    result.ok = true;
-    result.status = null;
-    result.error = null;
-    result.elapsedMs = Date.now() - started;
-    return result;
-  } catch (err) {
-    return {
-      ...result,
-      status: err instanceof Response ? err.status : result.status,
-      error: err instanceof Error ? err.message : String(err),
-      elapsedMs: Date.now() - started,
-    };
-  }
+      if (!meRes) {
+        throw toErrorObject(
+          fetchError ?? new Error(`check timed out after ${timeoutBudgetMs}ms`),
+          "Non-Error thrown",
+        );
+      }
+
+      const meJson = (await readTelegramDiagnosticJson(
+        meRes,
+        Math.min(timeoutBudgetMs, resolveRemainingBudgetMs()),
+      )) as {
+        ok?: boolean;
+        description?: string;
+        result?: unknown;
+      };
+      if (!meRes.ok || !meJson?.ok) {
+        result.status = meRes.status;
+        result.error = meJson?.description ?? `getMe failed (${meRes.status})`;
+        return result;
+      }
+
+      const botInfo = normalizeTelegramBotInfo(meJson.result);
+      const rawBot = meJson.result && typeof meJson.result === "object" ? meJson.result : {};
+      const bot = rawBot as Record<string, unknown>;
+      if (botInfo) {
+        result.botInfo = botInfo;
+      }
+      result.bot = {
+        id: typeof bot.id === "number" ? bot.id : null,
+        isBot: asBoolean(bot.is_bot) ?? null,
+        firstName: typeof bot.first_name === "string" ? bot.first_name : null,
+        username: typeof bot.username === "string" ? bot.username : null,
+        canJoinGroups: asBoolean(bot.can_join_groups) ?? null,
+        canReadAllGroupMessages: asBoolean(bot.can_read_all_group_messages) ?? null,
+        canManageBots: asBoolean(bot.can_manage_bots) ?? null,
+        supportsInlineQueries: asBoolean(bot.supports_inline_queries) ?? null,
+        canConnectToBusiness: asBoolean(bot.can_connect_to_business) ?? null,
+        hasMainWebApp: asBoolean(bot.has_main_web_app) ?? null,
+        hasTopicsEnabled: asBoolean(bot.has_topics_enabled) ?? null,
+        allowsUsersToCreateTopics: asBoolean(bot.allows_users_to_create_topics) ?? null,
+      };
+
+      if (includeWebhookInfo) {
+        // Try to fetch webhook info, but don't fail health if it errors.
+        try {
+          const webhookRemainingBudgetMs = resolveRemainingBudgetMs();
+          if (webhookRemainingBudgetMs > 0) {
+            const webhookRes = await fetchMethod("getWebhookInfo", webhookRemainingBudgetMs);
+            const webhookJson = (await readTelegramDiagnosticJson(
+              webhookRes,
+              Math.min(timeoutBudgetMs, resolveRemainingBudgetMs()),
+            )) as {
+              ok?: boolean;
+              result?: { url?: string; has_custom_certificate?: boolean };
+            };
+            if (webhookRes.ok && webhookJson?.ok) {
+              result.webhook = {
+                url: webhookJson.result?.url ?? null,
+                hasCustomCert: webhookJson.result?.has_custom_certificate ?? null,
+              };
+            }
+          }
+        } catch (err) {
+          if (abortSignal?.aborted) {
+            throw err;
+          }
+          // ignore webhook errors for probe
+        }
+      }
+
+      result.ok = true;
+      result.status = null;
+      result.error = null;
+      return result;
+    },
+    (error) => ({
+      ok: false,
+      status: error instanceof Response ? error.status : null,
+      error: formatErrorMessage(error),
+    }),
+  );
 }

@@ -1,7 +1,14 @@
-import type { Message, UserFromGetMe } from "@grammyjs/types";
+import type { Context } from "grammy";
+import type { ChatFullInfo, Message, Update, UserFromGetMe } from "grammy/types";
 
-/** App-specific stream mode for Telegram stream previews. */
-export type TelegramStreamMode = "off" | "partial" | "block";
+export type { StreamingMode as TelegramStreamMode } from "openclaw/plugin-sdk/channel-outbound";
+
+export type TelegramChatDetails = {
+  id?: number | string;
+  available_reactions?: ChatFullInfo["available_reactions"] | null;
+  is_forum?: boolean;
+};
+export type TelegramGetChat = (chatId: number | string) => Promise<TelegramChatDetails>;
 
 /**
  * Minimal context projection from Grammy's Context class.
@@ -10,15 +17,13 @@ export type TelegramStreamMode = "off" | "partial" | "block";
  */
 export type TelegramContext = {
   message: Message;
+  update?: Update;
   me?: UserFromGetMe;
-  getFile: () => Promise<{ file_path?: string }>;
+  getFile: Context["getFile"];
 };
 
-/** Telegram sticker metadata for context enrichment and caching. */
 export interface StickerMetadata {
-  /** Emoji associated with the sticker. */
   emoji?: string;
-  /** Name of the sticker set the sticker belongs to. */
   setName?: string;
   /** Telegram file_id for sending the sticker back. */
   fileId?: string;

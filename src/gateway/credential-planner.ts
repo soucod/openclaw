@@ -1,54 +1,17 @@
-import type { OpenClawConfig } from "../config/config.js";
+import { normalizeOptionalString } from "../../packages/normalization-core/src/string-coerce.js";
 import { containsEnvVarReference } from "../config/env-substitution.js";
+import {
+  getAuthoredConfigSecretRef,
+  getConfigResolutionFacts,
+  hasUnresolvedConfigPath,
+} from "../config/resolution-facts.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { hasConfiguredSecretInput, resolveSecretInputRef } from "../config/types.secrets.js";
+import type { SupportedGatewaySecretInputPath } from "./secret-input-paths.js";
 
-export type GatewayCredentialInputPath =
-  | "gateway.auth.token"
-  | "gateway.auth.password"
-  | "gateway.remote.token"
-  | "gateway.remote.password";
+export type GatewayCredentialPlan = ReturnType<typeof createGatewayCredentialPlan>;
 
-export type GatewayConfiguredCredentialInput = {
-  path: GatewayCredentialInputPath;
-  configured: boolean;
-  value?: string;
-  refPath?: GatewayCredentialInputPath;
-  hasSecretRef: boolean;
-};
-
-export type GatewayCredentialPlan = {
-  configuredMode: "local" | "remote";
-  authMode?: string;
-  envToken?: string;
-  envPassword?: string;
-  localToken: GatewayConfiguredCredentialInput;
-  localPassword: GatewayConfiguredCredentialInput;
-  remoteToken: GatewayConfiguredCredentialInput;
-  remotePassword: GatewayConfiguredCredentialInput;
-  localTokenCanWin: boolean;
-  localPasswordCanWin: boolean;
-  localTokenSurfaceActive: boolean;
-  tokenCanWin: boolean;
-  passwordCanWin: boolean;
-  remoteMode: boolean;
-  remoteUrlConfigured: boolean;
-  tailscaleRemoteExposure: boolean;
-  remoteConfiguredSurface: boolean;
-  remoteTokenFallbackActive: boolean;
-  remoteTokenActive: boolean;
-  remotePasswordFallbackActive: boolean;
-  remotePasswordActive: boolean;
-};
-
-type GatewaySecretDefaults = NonNullable<OpenClawConfig["secrets"]>["defaults"];
-
-export function trimToUndefined(value: unknown): string | undefined {
-  if (typeof value !== "string") {
-    return undefined;
-  }
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : undefined;
-}
+export const trimToUndefined = normalizeOptionalString;
 
 /**
  * Like trimToUndefined but also rejects unresolved env var placeholders (e.g. `${VAR}`).
@@ -65,83 +28,66 @@ export function trimCredentialToUndefined(value: unknown): string | undefined {
   return trimmed;
 }
 
-export function readGatewayTokenEnv(env: NodeJS.ProcessEnv = process.env): string | undefined {
-  return trimToUndefined(env.OPENCLAW_GATEWAY_TOKEN);
-}
-
-export function readGatewayPasswordEnv(env: NodeJS.ProcessEnv = process.env): string | undefined {
-  return trimToUndefined(env.OPENCLAW_GATEWAY_PASSWORD);
-}
-
-export function hasGatewayTokenEnvCandidate(env: NodeJS.ProcessEnv = process.env): boolean {
-  return Boolean(readGatewayTokenEnv(env));
-}
-
-export function hasGatewayPasswordEnvCandidate(env: NodeJS.ProcessEnv = process.env): boolean {
-  return Boolean(readGatewayPasswordEnv(env));
-}
-
-function resolveConfiguredGatewayCredentialInput(params: {
-  value: unknown;
-  defaults?: GatewaySecretDefaults;
-  path: GatewayCredentialInputPath;
-}): GatewayConfiguredCredentialInput {
-  const ref = resolveSecretInputRef({
-    value: params.value,
-    defaults: params.defaults,
-  }).ref;
-  return {
-    path: params.path,
-    configured: hasConfiguredSecretInput(params.value, params.defaults),
-    value: ref ? undefined : trimToUndefined(params.value),
-    refPath: ref ? params.path : undefined,
-    hasSecretRef: ref !== null,
-  };
-}
-
 export function createGatewayCredentialPlan(params: {
   config: OpenClawConfig;
   env?: NodeJS.ProcessEnv;
-  defaults?: GatewaySecretDefaults;
-}): GatewayCredentialPlan {
+  defaults?: NonNullable<OpenClawConfig["secrets"]>["defaults"];
+}) {
   const env = params.env ?? process.env;
   const gateway = params.config.gateway;
   const remote = gateway?.remote;
   const defaults = params.defaults ?? params.config.secrets?.defaults;
   const authMode = gateway?.auth?.mode;
-  const envToken = readGatewayTokenEnv(env);
-  const envPassword = readGatewayPasswordEnv(env);
+  const envToken = trimToUndefined(env.OPENCLAW_GATEWAY_TOKEN);
+  const envPassword = trimToUndefined(env.OPENCLAW_GATEWAY_PASSWORD);
 
-  const localToken = resolveConfiguredGatewayCredentialInput({
-    value: gateway?.auth?.token,
-    defaults,
-    path: "gateway.auth.token",
-  });
-  const localPassword = resolveConfiguredGatewayCredentialInput({
-    value: gateway?.auth?.password,
-    defaults,
-    path: "gateway.auth.password",
-  });
-  const remoteToken = resolveConfiguredGatewayCredentialInput({
-    value: remote?.token,
-    defaults,
-    path: "gateway.remote.token",
-  });
-  const remotePassword = resolveConfiguredGatewayCredentialInput({
-    value: remote?.password,
-    defaults,
-    path: "gateway.remote.password",
-  });
+  function resolveInput(path: SupportedGatewaySecretInputPath, value: unknown) {
+    const resolutionFacts = getConfigResolutionFacts(params.config);
+    if (
+      hasUnresolvedConfigPath(params.config, path) ||
+      getAuthoredConfigSecretRef(params.config, path)
+    ) {
+      return {
+        path,
+        configured: true,
+        refPath: path,
+        hasSecretRef: false,
+      };
+    }
+    if (resolutionFacts !== null && typeof value === "string") {
+      return {
+        path,
+        configured: Boolean(trimToUndefined(value)),
+        value: trimToUndefined(value),
+        hasSecretRef: false,
+      };
+    }
+    const ref = resolveSecretInputRef({ value, defaults }).ref;
+    return {
+      path,
+      configured: hasConfiguredSecretInput(value, defaults),
+      value: ref ? undefined : trimToUndefined(value),
+      refPath: ref ? path : undefined,
+      hasSecretRef: ref !== null,
+    };
+  }
 
+  const localToken = resolveInput("gateway.auth.token", gateway?.auth?.token);
+  const localPassword = resolveInput("gateway.auth.password", gateway?.auth?.password);
+  const remoteToken = resolveInput("gateway.remote.token", remote?.token);
+  const remotePassword = resolveInput("gateway.remote.password", remote?.password);
+
+  // The local token surface is disabled by password/none/trusted-proxy modes so
+  // token refs do not get resolved for auth modes that cannot consume them.
   const localTokenCanWin =
     authMode !== "password" && authMode !== "none" && authMode !== "trusted-proxy";
   const tokenCanWin = Boolean(envToken || localToken.configured || remoteToken.configured);
   const passwordCanWin =
     authMode === "password" ||
-    (authMode !== "token" && authMode !== "none" && authMode !== "trusted-proxy" && !tokenCanWin);
+    authMode === "trusted-proxy" ||
+    (authMode !== "token" && authMode !== "none" && !tokenCanWin);
   const localTokenSurfaceActive =
     localTokenCanWin &&
-    !envToken &&
     (authMode === "token" ||
       (authMode === undefined && !(envPassword || localPassword.configured)));
 
@@ -149,12 +95,17 @@ export function createGatewayCredentialPlan(params: {
   const remoteUrlConfigured = Boolean(trimToUndefined(remote?.url));
   const tailscaleRemoteExposure =
     gateway?.tailscale?.mode === "serve" || gateway?.tailscale?.mode === "funnel";
+  // Remote credential surfaces are considered active when the gateway is used
+  // remotely or when local auth may be borrowed for a published Tailscale URL.
   const remoteConfiguredSurface = remoteMode || remoteUrlConfigured || tailscaleRemoteExposure;
+  // Remote credentials may borrow local auth credentials only when the remote
+  // surface exists but no explicit remote/env candidate can satisfy the mode.
   const remoteTokenFallbackActive = localTokenCanWin && !envToken && !localToken.configured;
-  const remotePasswordFallbackActive = !envPassword && !localPassword.configured && passwordCanWin;
+  const remotePasswordFallbackActive =
+    authMode !== "trusted-proxy" && !envPassword && !localPassword.configured && passwordCanWin;
 
   return {
-    configuredMode: gateway?.mode === "remote" ? "remote" : "local",
+    configuredMode: gateway?.mode === "remote" ? ("remote" as const) : ("local" as const),
     authMode,
     envToken,
     envPassword,

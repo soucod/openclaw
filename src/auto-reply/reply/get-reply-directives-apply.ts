@@ -1,77 +1,75 @@
-import type { OpenClawConfig } from "../../config/config.js";
+import type { ModelContextTokenProjection } from "../../agents/context-resolution.js";
+import { resolveModelContextTokenProjection } from "../../agents/context.js";
+import { DEFAULT_CONTEXT_TOKENS } from "../../agents/defaults.js";
+import { modelKey } from "../../agents/model-selection.js";
+import { resolveStickyModelSelectionScope } from "../../agents/sticky-model-selection.js";
 import type { SessionEntry, SessionScope } from "../../config/sessions/types.js";
+import type { AgentConfig } from "../../config/types.agents.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { racePromiseWithAbortSignal } from "../../infra/abort-signal.js";
+import { resolveSystemEventQueueKey } from "../../infra/system-event-ownership.js";
 import { enqueueSystemEvent } from "../../infra/system-events.js";
+import {
+  isModelSelectionLocked,
+  MODEL_SELECTION_LOCKED_MESSAGE,
+} from "../../sessions/model-overrides.js";
+import { readSessionInputProfileId } from "../../sessions/session-participant-input.js";
+import { createLazyImportLoader } from "../../shared/lazy-promise.js";
 import type { MsgContext } from "../templating.js";
 import type { ElevatedLevel } from "../thinking.js";
 import type { ReplyPayload } from "../types.js";
 import type { CommandContext } from "./commands-types.js";
-import type { ApplyInlineDirectivesFastLaneParams } from "./directive-handling.params.js";
-import { isDirectiveOnly, type InlineDirectives } from "./directive-handling.parse.js";
+import { maybeHandleUnexpectedDirectiveArguments } from "./directive-handling.arguments.js";
+import { isDirectiveOnly } from "./directive-handling.directive-only.js";
+import { resolveModelRuntimeDirective } from "./directive-handling.model-runtime.js";
+import { resolveModelSelectionFromDirective } from "./directive-handling.model-selection.js";
+import type { HandleDirectiveOnlyParams } from "./directive-handling.params.js";
+import { hasSessionDirectives, type InlineDirectives } from "./directive-handling.parse.js";
+import { formatModelSelectionScopeAck } from "./directive-handling.shared.js";
 import { clearInlineDirectives } from "./get-reply-directives-utils.js";
 import type { createModelSelectionState } from "./model-selection.js";
+import type { ReplyPreRunRejectionCode } from "./reply-operation-run-state.js";
+import { assertReplyPreprocessingActive } from "./reply-preprocessing-abort.js";
 import type { TypingController } from "./typing.js";
 
 type AgentDefaults = NonNullable<OpenClawConfig["agents"]>["defaults"];
-type AgentEntry = NonNullable<NonNullable<OpenClawConfig["agents"]>["list"]>[number];
 
-let commandsStatusPromise: Promise<typeof import("./commands-status.runtime.js")> | null = null;
-let directiveLevelsPromise: Promise<typeof import("./directive-handling.levels.js")> | null = null;
-let directiveImplPromise: Promise<typeof import("./directive-handling.impl.js")> | null = null;
-let directiveFastLanePromise: Promise<typeof import("./directive-handling.fast-lane.js")> | null =
-  null;
-let directivePersistPromise: Promise<
-  typeof import("./directive-handling.persist.runtime.js")
-> | null = null;
+const commandsStatusLoader = createLazyImportLoader(() => import("./commands-status.runtime.js"));
+const directiveLevelsLoader = createLazyImportLoader(
+  () => import("./directive-handling.levels.js"),
+);
+const directiveImplLoader = createLazyImportLoader(() => import("./directive-handling.impl.js"));
+const directivePersistLoader = createLazyImportLoader(
+  () => import("../../model-picker/apply-session-model-selection.js"),
+);
 
-function loadCommandsStatus() {
-  commandsStatusPromise ??= import("./commands-status.runtime.js");
-  return commandsStatusPromise;
-}
-
-function loadDirectiveLevels() {
-  directiveLevelsPromise ??= import("./directive-handling.levels.js");
-  return directiveLevelsPromise;
-}
-
-function loadDirectiveImpl() {
-  directiveImplPromise ??= import("./directive-handling.impl.js");
-  return directiveImplPromise;
-}
-
-function loadDirectiveFastLane() {
-  directiveFastLanePromise ??= import("./directive-handling.fast-lane.js");
-  return directiveFastLanePromise;
-}
-
-function loadDirectivePersist() {
-  directivePersistPromise ??= import("./directive-handling.persist.runtime.js");
-  return directivePersistPromise;
-}
-
-export type ApplyDirectiveResult =
-  | { kind: "reply"; reply: ReplyPayload | ReplyPayload[] | undefined }
+type ApplyDirectiveResult =
+  | {
+      kind: "reply";
+      reply: ReplyPayload | ReplyPayload[] | undefined;
+      preRunRejection?: ReplyPreRunRejectionCode;
+    }
   | {
       kind: "continue";
       directives: InlineDirectives;
       provider: string;
       model: string;
       contextTokens: number;
+      contextTokenProjection?: ModelContextTokenProjection;
       directiveAck?: ReplyPayload;
       perMessageQueueMode?: InlineDirectives["queueMode"];
-      perMessageQueueOptions?: {
-        debounceMs?: number;
-        cap?: number;
-        dropPolicy?: InlineDirectives["dropPolicy"];
-      };
+      perMessageQueueOptions?: Pick<InlineDirectives, "debounceMs" | "cap" | "dropPolicy">;
     };
 
 export async function applyInlineDirectiveOverrides(params: {
   ctx: MsgContext;
+  abortSignal?: AbortSignal;
   cfg: OpenClawConfig;
   agentId: string;
   agentDir: string;
+  workspaceDir: string;
   agentCfg: AgentDefaults;
-  agentEntry?: AgentEntry;
+  agentEntry?: AgentConfig;
   sessionEntry: SessionEntry;
   sessionStore: Record<string, SessionEntry>;
   sessionKey: string;
@@ -81,13 +79,12 @@ export async function applyInlineDirectiveOverrides(params: {
   allowTextCommands: boolean;
   command: CommandContext;
   directives: InlineDirectives;
-  messageProviderKey: string;
   elevatedEnabled: boolean;
   elevatedAllowed: boolean;
   elevatedFailures: Array<{ gate: string; key: string }>;
   defaultProvider: string;
   defaultModel: string;
-  aliasIndex: ApplyInlineDirectivesFastLaneParams["aliasIndex"];
+  aliasIndex: HandleDirectiveOnlyParams["aliasIndex"];
   provider: string;
   model: string;
   modelState: Awaited<ReturnType<typeof createModelSelectionState>>;
@@ -96,6 +93,7 @@ export async function applyInlineDirectiveOverrides(params: {
   resolvedElevatedLevel: ElevatedLevel;
   defaultActivation: () => "always" | "mention";
   contextTokens: number;
+  contextTokenProjection?: ModelContextTokenProjection;
   effectiveModelDirective?: string;
   typing: TypingController;
 }): Promise<ApplyDirectiveResult> {
@@ -110,230 +108,368 @@ export async function applyInlineDirectiveOverrides(params: {
     sessionStore,
     sessionKey,
     storePath,
-    sessionScope,
     isGroup,
     allowTextCommands,
     command,
-    messageProviderKey,
-    elevatedEnabled,
-    elevatedAllowed,
-    elevatedFailures,
     defaultProvider,
     defaultModel,
     aliasIndex,
     modelState,
     initialModelLabel,
-    formatModelSwitchEvent,
-    resolvedElevatedLevel,
     defaultActivation,
     typing,
     effectiveModelDirective,
   } = params;
-  let { directives } = params;
-  let { provider, model } = params;
-  let { contextTokens } = params;
-  const directiveModelState = {
-    allowedModelKeys: modelState.allowedModelKeys,
-    allowedModelCatalog: modelState.allowedModelCatalog,
-    resetModelOverride: modelState.resetModelOverride,
+  const directiveRejection = (
+    code: ReplyPreRunRejectionCode,
+    text: string,
+  ): ApplyDirectiveResult => {
+    typing.cleanup();
+    return { kind: "reply", reply: { text, isError: true }, preRunRejection: code };
   };
-  const createDirectiveHandlingBase = () => ({
-    cfg,
-    directives,
-    sessionEntry,
-    sessionStore,
-    sessionKey,
-    storePath,
-    elevatedEnabled,
-    elevatedAllowed,
-    elevatedFailures,
-    messageProviderKey,
-    defaultProvider,
-    defaultModel,
-    aliasIndex,
-    ...directiveModelState,
-    provider,
-    model,
-    initialModelLabel,
-    formatModelSwitchEvent,
-  });
-
+  const requesterProfileId = readSessionInputProfileId(ctx);
+  let { directives, provider, model, contextTokens, contextTokenProjection } = params;
   let directiveAck: ReplyPayload | undefined;
+  let selectionCatalog = modelState.allowedModelCatalog;
 
-  if (modelState.resetModelOverride) {
-    enqueueSystemEvent(
-      `Model override not allowed for this agent; reverted to ${initialModelLabel}.`,
-      {
-        sessionKey,
-        contextKey: `model:reset:${initialModelLabel}`,
-      },
-    );
+  // Fire on the reason, not the boolean: a temporarily-unavailable override
+  // surfaces a notice without destroying the pin, so resetModelOverride stays false.
+  if (modelState.resetModelOverrideReason) {
+    function formatModelOverrideResetEvent(): string {
+      const rejectedRef = modelState.resetModelOverrideRef;
+      const reason = modelState.resetModelOverrideReason;
+      if (reason === "temporarily-unavailable") {
+        // Non-destructive: the pin is preserved and comes back once the catalog reloads.
+        const subject = rejectedRef
+          ? `Model override ${rejectedRef}`
+          : "Your pinned model override";
+        return `${subject} is temporarily unavailable (model catalog is still loading); using ${initialModelLabel} for this turn. Your pinned model is unchanged.`;
+      }
+      if (reason === "stale") {
+        if (rejectedRef) {
+          return `Stored model override ${rejectedRef} is stale for this session; reverted to ${initialModelLabel}. Pick a model again with /model if you still want to override the default.`;
+        }
+        return `Stored model override is stale for this session; reverted to ${initialModelLabel}.`;
+      }
+      if (rejectedRef) {
+        const policyPath = modelState.modelPolicyConfigPath ?? "modelPolicy.allow";
+        const repairPath = modelState.modelPolicyRepairConfigPath ?? "modelPolicy.allow";
+        return `Model override ${rejectedRef} is not allowed for this agent by ${policyPath}; reverted to ${initialModelLabel}. Add ${rejectedRef} to ${repairPath} or pick an allowed model with /model list.`;
+      }
+      return `Model override not allowed for this agent; reverted to ${initialModelLabel}.`;
+    }
+    enqueueSystemEvent(formatModelOverrideResetEvent(), {
+      sessionKey: resolveSystemEventQueueKey(sessionKey, agentId),
+      contextKey: `model:reset:${initialModelLabel}`,
+    });
   }
 
   if (!command.isAuthorizedSender) {
     directives = clearInlineDirectives(directives.cleaned);
   }
 
-  const hasAnyDirective =
-    directives.hasThinkDirective ||
-    directives.hasFastDirective ||
-    directives.hasVerboseDirective ||
-    directives.hasReasoningDirective ||
-    directives.hasElevatedDirective ||
-    directives.hasExecDirective ||
-    directives.hasModelDirective ||
-    directives.hasQueueDirective ||
-    directives.hasStatusDirective;
+  // Derive the persistent write target from the directives that survived the
+  // unauthorized-sender clearing above. Reading the pre-clearing value would let
+  // an unauthorized "/model … -a|-g" reach the authority error below instead of
+  // the plain-text path every other directive takes.
+  const modelSelectionScope = resolveStickyModelSelectionScope({
+    cfg,
+    scope: directives.modelScope,
+  });
+  const canWriteModelDefaults = Array.isArray(ctx.GatewayClientScopes)
+    ? ctx.GatewayClientScopes.includes("operator.admin")
+    : command.senderIsOwner;
+  const stickyModelSelectionTarget =
+    canWriteModelDefaults && modelSelectionScope === "agent"
+      ? ("agent" as const)
+      : canWriteModelDefaults && modelSelectionScope === "global"
+        ? ("defaults" as const)
+        : undefined;
+  const canPersistStickyModelSelection = modelSelectionScope !== "session" && canWriteModelDefaults;
 
-  if (!hasAnyDirective && !modelState.resetModelOverride) {
+  if (directives.modelScopeConflict) {
+    return directiveRejection("model-scope-conflict", "Use only one model scope option.");
+  }
+
+  if (
+    (directives.modelScope === "agent" || directives.modelScope === "global") &&
+    !canWriteModelDefaults
+  ) {
+    return directiveRejection(
+      "model-scope-not-authorized",
+      "Agent and global model defaults require owner authority or operator.admin scope.",
+    );
+  }
+
+  const resolveEffectiveModelSelection = () =>
+    resolveModelSelectionFromDirective({
+      directives: {
+        ...directives,
+        rawModelDirective: effectiveModelDirective,
+      },
+      cfg,
+      agentDir,
+      defaultProvider,
+      defaultModel,
+      aliasIndex,
+      modelPolicy: modelState.modelPolicy,
+      operatorAuthority: modelState.operatorAuthority,
+      allowedModelKeys: modelState.allowedModelKeys,
+      agentId,
+      requesterProfileId,
+    });
+  if (
+    directives.hasModelDirective &&
+    effectiveModelDirective &&
+    isModelSelectionLocked(sessionEntry)
+  ) {
+    const lockedModelResolution = await resolveEffectiveModelSelection();
+    if (lockedModelResolution.modelSelection) {
+      return directiveRejection("model-selection-locked", MODEL_SELECTION_LOCKED_MESSAGE);
+    }
+  }
+
+  const hasAnyDirective = hasSessionDirectives(directives) || directives.hasStatusDirective;
+
+  if (!hasAnyDirective && !modelState.resetModelOverride && !modelState.resetModelOverrideReason) {
     return {
       kind: "continue",
       directives,
       provider,
       model,
       contextTokens,
+      contextTokenProjection,
     };
   }
 
-  if (
-    isDirectiveOnly({
-      directives,
-      cleanedBody: directives.cleaned,
-      ctx,
-      cfg,
-      agentId,
-      isGroup,
-    })
-  ) {
-    if (!command.isAuthorizedSender) {
+  // Model-only directives have a focused persistence service; reject leftovers before that mutation.
+  if (directives.command?.name === "model") {
+    const unexpectedArguments = maybeHandleUnexpectedDirectiveArguments(directives);
+    if (unexpectedArguments) {
       typing.cleanup();
-      return { kind: "reply", reply: undefined };
+      return {
+        kind: "reply",
+        reply: unexpectedArguments,
+        preRunRejection: "session-directive-rejected",
+      };
     }
-    const {
-      currentThinkLevel: resolvedDefaultThinkLevel,
-      currentFastMode,
-      currentVerboseLevel,
-      currentReasoningLevel,
-      currentElevatedLevel,
-    } = await (
-      await loadDirectiveLevels()
+  }
+
+  const directiveOnly = isDirectiveOnly({
+    directives,
+    cleanedBody: directives.cleaned,
+    ctx,
+    cfg,
+    agentId,
+    isGroup,
+  });
+
+  const handleDirectives = async (
+    persistenceState?: NonNullable<HandleDirectiveOnlyParams["persistenceState"]>,
+  ) => {
+    let rejected = false;
+    assertReplyPreprocessingActive(params.abortSignal);
+    const currentLevels = await (
+      await directiveLevelsLoader.load()
     ).resolveCurrentDirectiveLevels({
       sessionEntry,
       agentEntry,
       agentCfg,
-      resolveDefaultThinkingLevel: () => modelState.resolveDefaultThinkingLevel(),
+      resolveDefaultThinkingLevel:
+        !persistenceState || directives.hasThinkDirective
+          ? () => {
+              assertReplyPreprocessingActive(params.abortSignal);
+              return racePromiseWithAbortSignal(
+                modelState.resolveDefaultThinkingLevel(),
+                params.abortSignal,
+              );
+            }
+          : async () => undefined,
     });
-    const currentThinkLevel = resolvedDefaultThinkLevel;
-    const directiveReply = await (
-      await loadDirectiveImpl()
+    assertReplyPreprocessingActive(params.abortSignal);
+    const thinkingCatalog = await racePromiseWithAbortSignal(
+      modelState.resolveThinkingCatalog(),
+      params.abortSignal,
+    );
+    assertReplyPreprocessingActive(params.abortSignal);
+    const reply = await (
+      await directiveImplLoader.load()
     ).handleDirectiveOnly({
-      ...createDirectiveHandlingBase(),
-      currentThinkLevel,
-      currentFastMode,
-      currentVerboseLevel,
-      currentReasoningLevel,
-      currentElevatedLevel,
+      ...params,
+      directives,
+      modelPolicy: modelState.modelPolicy,
+      operatorAuthority: modelState.operatorAuthority,
+      allowedModelKeys: modelState.allowedModelKeys,
+      allowedModelCatalog: modelState.allowedModelCatalog,
+      resetModelOverride: modelState.resetModelOverride,
+      provider,
+      model,
+      canPersistStickyModelSelection,
+      ...(stickyModelSelectionTarget ? { stickyModelSelectionTarget } : {}),
+      ...currentLevels,
+      thinkingCatalog,
+      messageProvider: ctx.Provider,
       surface: ctx.Surface,
       gatewayClientScopes: ctx.GatewayClientScopes,
+      commandAuthorized: command.isAuthorizedSender,
+      senderIsOwner: command.senderIsOwner,
+      onRejection: () => {
+        rejected = true;
+      },
+      ...(persistenceState ? { persistenceState } : {}),
     });
+    return { reply, rejected, currentLevels, thinkingCatalog };
+  };
+
+  if (directiveOnly) {
+    if (!command.isAuthorizedSender) {
+      typing.cleanup();
+      return { kind: "reply", reply: undefined };
+    }
+    // Only the exact model-only case uses the focused service; mixed directives
+    // fall through so their settings remain one broad atomic session transaction.
+    if (
+      directives.hasModelDirective &&
+      !hasSessionDirectives(directives, "model") &&
+      !directives.hasStatusDirective &&
+      effectiveModelDirective
+    ) {
+      const modelResolution = await resolveEffectiveModelSelection();
+      if (modelResolution.errorText) {
+        return directiveRejection("model-selection-rejected", modelResolution.errorText);
+      }
+      const modelSelection = modelResolution.modelSelection;
+      if (modelSelection) {
+        const runtime = resolveModelRuntimeDirective({
+          rawRuntime: directives.rawModelRuntime,
+          provider: modelSelection.provider,
+          cfg,
+          sessionEntry,
+        });
+        if (runtime.kind === "invalid") {
+          return directiveRejection("model-runtime-invalid", runtime.errorText);
+        }
+        const applied = await (
+          await directivePersistLoader.load()
+        ).applySessionModelSelectionInternal({
+          cfg,
+          agentId,
+          sessionKey,
+          storePath,
+          sessionEntry,
+          sessionStore,
+          defaultProvider,
+          defaultModel,
+          currentProvider: provider,
+          currentModel: model,
+          modelPolicy: modelState.modelPolicy,
+          operatorAuthority: modelState.operatorAuthority,
+          modelCatalog: modelState.allowedModelCatalog,
+          thinkingCatalog: modelState.allowedModelCatalog,
+          canPersistStickyModelSelection,
+          validateAuthProfileSelection: modelResolution.validateAuthProfileSelection,
+          ...(stickyModelSelectionTarget ? { stickyModelSelectionTarget } : {}),
+          request: {
+            ...modelSelection,
+            profileOverride: modelResolution.profileOverride,
+            // Preserve model-only intent so the service prepares the configured runtime
+            // after discarding an incompatible inherited pin.
+            runtime: directives.rawModelRuntime ? runtime : { kind: "unchanged" },
+          },
+          patchModel: effectiveModelDirective,
+          markLiveSwitchPending: true,
+        });
+        if (applied.status === "rejected" || applied.status === "conflict") {
+          return directiveRejection(`model-selection-${applied.status}`, applied.message);
+        }
+        // Model change first, then the thinking remap it triggered: the remap is a
+        // consequence of the model switch, so the cause is announced before the effect.
+        const parts = [
+          formatModelSelectionScopeAck({
+            selection: modelSelection,
+            configuredDefaultUpdate: applied.configuredDefaultUpdate,
+            ...(stickyModelSelectionTarget ? { stickyModelSelectionTarget } : {}),
+          }),
+          applied.runtimeChange?.kind === "clear"
+            ? "Runtime reset to configured policy."
+            : applied.runtimeChange?.kind === "set"
+              ? `Runtime set to ${applied.runtimeChange.runtime} for this session.`
+              : undefined,
+          modelResolution.profileOverride
+            ? `Auth profile set to ${modelResolution.profileOverride}.`
+            : undefined,
+        ].filter(Boolean);
+        typing.cleanup();
+        return { kind: "reply", reply: { text: parts.join(" ") } };
+      }
+    }
+    const {
+      reply: directiveReply,
+      rejected,
+      currentLevels,
+      thinkingCatalog,
+    } = await handleDirectives();
+    const preRunRejection = rejected ? "session-directive-rejected" : undefined;
+    const {
+      currentThinkLevel: resolvedDefaultThinkLevel,
+      currentVerboseLevel,
+      currentReasoningLevel,
+    } = currentLevels;
     let statusReply: ReplyPayload | undefined;
     if (directives.hasStatusDirective && allowTextCommands && command.isAuthorizedSender) {
-      const { buildStatusReply } = await loadCommandsStatus();
+      const { buildStatusReply } = await commandsStatusLoader.load();
+      const targetSessionEntry = sessionStore[sessionKey] ?? sessionEntry;
       statusReply = await buildStatusReply({
-        cfg,
-        command,
-        sessionEntry,
-        sessionKey,
-        parentSessionKey: ctx.ParentSessionKey,
-        sessionScope,
+        ...params,
+        sessionEntry: targetSessionEntry,
+        parentSessionKey: targetSessionEntry?.parentSessionKey ?? ctx.ParentSessionKey,
         provider,
         model,
         contextTokens,
+        thinkingCatalog,
         resolvedThinkLevel: resolvedDefaultThinkLevel,
         resolvedVerboseLevel: currentVerboseLevel ?? "off",
         resolvedReasoningLevel: currentReasoningLevel ?? "off",
-        resolvedElevatedLevel,
         resolveDefaultThinkingLevel: async () => resolvedDefaultThinkLevel,
-        isGroup,
         defaultGroupActivation: defaultActivation,
         mediaDecisions: ctx.MediaUnderstandingDecisions,
       });
     }
     typing.cleanup();
-    if (statusReply?.text && directiveReply?.text) {
-      return {
-        kind: "reply",
-        reply: { text: `${directiveReply.text}\n${statusReply.text}` },
-      };
-    }
-    return { kind: "reply", reply: statusReply ?? directiveReply };
+    return {
+      kind: "reply",
+      reply:
+        statusReply?.text && directiveReply?.text
+          ? { text: `${directiveReply.text}\n${statusReply.text}` }
+          : (statusReply ?? directiveReply),
+      preRunRejection,
+    };
   }
 
   if (hasAnyDirective && command.isAuthorizedSender) {
-    const fastLane = await (
-      await loadDirectiveFastLane()
-    ).applyInlineDirectivesFastLane({
-      directives,
-      commandAuthorized: command.isAuthorizedSender,
-      ctx,
-      cfg,
-      agentId,
-      isGroup,
-      sessionEntry,
-      sessionStore,
-      sessionKey,
-      storePath,
-      elevatedEnabled,
-      elevatedAllowed,
-      elevatedFailures,
-      messageProviderKey,
-      defaultProvider,
-      defaultModel,
-      aliasIndex,
-      ...directiveModelState,
-      provider,
-      model,
-      initialModelLabel,
-      formatModelSwitchEvent,
-      agentCfg,
-      modelState: {
-        resolveDefaultThinkingLevel: modelState.resolveDefaultThinkingLevel,
-        ...directiveModelState,
-      },
-    });
-    directiveAck = fastLane.directiveAck;
-    provider = fastLane.provider;
-    model = fastLane.model;
+    const persistenceState: NonNullable<HandleDirectiveOnlyParams["persistenceState"]> = {
+      outcome: { kind: "pending", provider, model },
+    };
+    directiveAck = (await handleDirectives(persistenceState)).reply;
+    if (persistenceState.outcome.kind === "rejected") {
+      return directiveRejection("session-directive-rejected", persistenceState.outcome.errorText);
+    }
+    ({ provider, model } = persistenceState.outcome);
+    selectionCatalog = persistenceState.outcome.modelCatalog ?? selectionCatalog;
   }
 
-  const persisted = await (
-    await loadDirectivePersist()
-  ).persistInlineDirectives({
-    directives,
-    effectiveModelDirective,
+  const selectedCatalogEntry = selectionCatalog.find(
+    (entry) => modelKey(entry.provider, entry.id) === modelKey(provider, model),
+  );
+  contextTokenProjection = resolveModelContextTokenProjection({
     cfg,
-    agentDir,
-    sessionEntry,
-    sessionStore,
-    sessionKey,
-    storePath,
-    elevatedEnabled,
-    elevatedAllowed,
-    defaultProvider,
-    defaultModel,
-    aliasIndex,
-    allowedModelKeys: modelState.allowedModelKeys,
+    allowAsyncLoad: false,
     provider,
     model,
-    initialModelLabel,
-    formatModelSwitchEvent,
-    agentCfg,
-    surface: ctx.Surface,
-    gatewayClientScopes: ctx.GatewayClientScopes,
+    modelContextWindow: selectedCatalogEntry?.contextWindow,
+    modelContextTokens: selectedCatalogEntry?.contextTokens,
   });
-  provider = persisted.provider;
-  model = persisted.model;
-  contextTokens = persisted.contextTokens;
+  contextTokens = contextTokenProjection.contextTokens ?? DEFAULT_CONTEXT_TOKENS;
 
   const perMessageQueueMode =
     directives.hasQueueDirective && !directives.queueReset ? directives.queueMode : undefined;
@@ -352,6 +488,7 @@ export async function applyInlineDirectiveOverrides(params: {
     provider,
     model,
     contextTokens,
+    contextTokenProjection,
     directiveAck,
     perMessageQueueMode,
     perMessageQueueOptions,

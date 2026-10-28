@@ -1,56 +1,71 @@
-import { ensureGlobalUndiciEnvProxyDispatcher } from "../infra/net/undici-global-dispatcher.js";
+import { resolvePositiveTimerTimeoutMs } from "@openclaw/normalization-core/number-coercion";
+import { readResponseBodySnippet } from "../infra/http-error-body.js";
+import {
+  postJsonRequest,
+  resolveProviderHttpRequestConfigWithOriginTrust,
+} from "../media-understanding/shared.js";
 import { isRecord } from "../utils.js";
 import { normalizeSecretInput } from "../utils/normalize-secret-input.js";
+import {
+  createProviderErrorTextRedactor,
+  readProviderJsonResponse,
+} from "./provider-http-errors.js";
+import { resolveProviderTransportSsrFPolicy } from "./provider-network-policy.js";
+import type { ModelProviderRequestTransportOverrides } from "./provider-request-config.types.js";
 
 type MinimaxBaseResp = {
   status_code?: number;
   status_msg?: string;
 };
 
+const MINIMAX_VLM_ERROR_BODY_MAX_BYTES = 8 * 1024;
+const MINIMAX_VLM_ERROR_BODY_MAX_CHARS = 400;
+const DEFAULT_MINIMAX_VLM_TIMEOUT_MS = 60_000;
+
 export function isMinimaxVlmProvider(provider: string): boolean {
-  return provider === "minimax" || provider === "minimax-portal";
+  const normalized = provider.trim().toLowerCase();
+  return ["minimax", "minimax-cn", "minimax-portal", "minimax-portal-cn"].includes(normalized);
 }
 
 export function isMinimaxVlmModel(provider: string, modelId: string): boolean {
   return isMinimaxVlmProvider(provider) && modelId.trim() === "MiniMax-VL-01";
 }
 
-function coerceApiHost(params: {
-  apiHost?: string;
-  modelBaseUrl?: string;
-  env?: NodeJS.ProcessEnv;
-}): string {
-  const env = params.env ?? process.env;
-  const raw =
-    params.apiHost?.trim() ||
-    env.MINIMAX_API_HOST?.trim() ||
-    params.modelBaseUrl?.trim() ||
-    "https://api.minimax.io";
-
-  try {
-    const url = new URL(raw);
-    return url.origin;
-  } catch {}
-
-  try {
-    const url = new URL(`https://${raw}`);
-    return url.origin;
-  } catch {
-    return "https://api.minimax.io";
-  }
+function resolveDefaultApiHost(provider: string | undefined): string {
+  const normalized = provider?.trim().toLowerCase();
+  return normalized === "minimax-cn" || normalized === "minimax-portal-cn"
+    ? "https://api.minimaxi.com"
+    : "https://api.minimax.io";
 }
 
-function pickString(rec: Record<string, unknown>, key: string): string {
-  const v = rec[key];
-  return typeof v === "string" ? v : "";
+function coerceApiHost(params: { modelBaseUrl?: string; provider?: string }): string {
+  const defaultHost = resolveDefaultApiHost(params.provider);
+  const raw = process.env.MINIMAX_API_HOST?.trim() || params.modelBaseUrl?.trim() || defaultHost;
+
+  const url = URL.parse(raw);
+  if (url) {
+    return url.origin;
+  }
+  // Retry bare hosts only; malformed absolute URLs use the provider default.
+  if (/^[a-z][a-z\d+.-]*:\/\//i.test(raw)) {
+    return defaultHost;
+  }
+
+  return URL.parse(`https://${raw}`)?.origin ?? defaultHost;
 }
 
 export async function minimaxUnderstandImage(params: {
   apiKey: string;
   prompt: string;
   imageDataUrl: string;
-  apiHost?: string;
   modelBaseUrl?: string;
+  provider?: string;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  /** Operator-configured private-network policy from the provider request config. */
+  allowPrivateNetwork?: boolean;
+  /** Resolved model request transport metadata, including proxy and TLS policy. */
+  request?: ModelProviderRequestTransportOverrides;
 }): Promise<string> {
   const apiKey = normalizeSecretInput(params.apiKey);
   if (!apiKey) {
@@ -68,59 +83,96 @@ export async function minimaxUnderstandImage(params: {
     throw new Error("MiniMax VLM: imageDataUrl must be a base64 data:image/(png|jpeg|webp) URL");
   }
 
-  const host = coerceApiHost({
-    apiHost: params.apiHost,
-    modelBaseUrl: params.modelBaseUrl,
+  const configuredHost = coerceApiHost(params);
+  const { baseUrl, allowPrivateNetwork, headers, dispatcherPolicy, trustConfiguredBaseUrlOrigin } =
+    resolveProviderHttpRequestConfigWithOriginTrust({
+      baseUrl: configuredHost,
+      defaultBaseUrl: resolveDefaultApiHost(params.provider),
+      allowPrivateNetwork: params.allowPrivateNetwork,
+      defaultHeaders: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        "MM-API-Source": "OpenClaw",
+      },
+      request: params.request,
+      provider: params.provider ?? "minimax",
+      capability: "image",
+      transport: "media-understanding",
+    });
+  const url = new URL("/v1/coding_plan/vlm", baseUrl).toString();
+
+  const timeoutMs = resolvePositiveTimerTimeoutMs(params.timeoutMs, DEFAULT_MINIMAX_VLM_TIMEOUT_MS);
+
+  const ssrfPolicy = resolveProviderTransportSsrFPolicy({
+    baseUrl,
+    url,
+    allowPrivateNetwork,
+    trustConfiguredBaseUrlOrigin,
   });
-  const url = new URL("/v1/coding_plan/vlm", host).toString();
 
-  // Ensure env-based proxy dispatcher is active before the outbound fetch call.
-  // Without this, HTTP_PROXY/HTTPS_PROXY env vars are silently ignored (#51619).
-  ensureGlobalUndiciEnvProxyDispatcher();
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-      "MM-API-Source": "OpenClaw",
-    },
-    body: JSON.stringify({
+  const guarded = await postJsonRequest({
+    url,
+    headers,
+    body: {
       prompt,
       image_url: imageDataUrl,
-    }),
+    },
+    timeoutMs,
+    ...(params.signal ? { signal: params.signal } : {}),
+    fetchFn: fetch,
+    allowPrivateNetwork,
+    ssrfPolicy,
+    dispatcherPolicy,
+    auditContext: "minimax-vlm",
+  });
+  const res = guarded.response;
+  const redactErrorText = createProviderErrorTextRedactor({
+    headers,
+    request: params.request,
+    defaultAuthHeader: "Authorization",
+    defaultAuthPrefix: "Bearer ",
   });
 
-  const traceId = res.headers.get("Trace-Id") ?? "";
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
+  try {
+    // All response fields below are provider-controlled and may reflect the
+    // authenticated request, so sanitize them before any error branch uses them.
+    const traceId = redactErrorText(res.headers.get("Trace-Id") ?? "");
     const trace = traceId ? ` Trace-Id: ${traceId}` : "";
-    throw new Error(
-      `MiniMax VLM request failed (${res.status} ${res.statusText}).${trace}${
-        body ? ` Body: ${body.slice(0, 400)}` : ""
-      }`,
-    );
-  }
+    if (!res.ok) {
+      const body = await readResponseBodySnippet(res, {
+        maxBytes: MINIMAX_VLM_ERROR_BODY_MAX_BYTES,
+        maxChars: MINIMAX_VLM_ERROR_BODY_MAX_CHARS,
+        redact: redactErrorText,
+      });
+      throw new Error(
+        `MiniMax VLM request failed (${res.status} ${redactErrorText(res.statusText)}).${trace}${
+          body ? ` Body: ${body}` : ""
+        }`,
+      );
+    }
 
-  const json = (await res.json().catch(() => null)) as unknown;
-  if (!isRecord(json)) {
-    const trace = traceId ? ` Trace-Id: ${traceId}` : "";
-    throw new Error(`MiniMax VLM response was not JSON.${trace}`);
-  }
+    const responseLabel = traceId
+      ? `MiniMax VLM response [Trace-Id=${traceId}]`
+      : "MiniMax VLM response";
+    const json = await readProviderJsonResponse<unknown>(res, responseLabel);
+    if (!isRecord(json)) {
+      throw new Error(`MiniMax VLM response was not JSON.${trace}`);
+    }
 
-  const baseResp = isRecord(json.base_resp) ? (json.base_resp as MinimaxBaseResp) : {};
-  const code = typeof baseResp.status_code === "number" ? baseResp.status_code : -1;
-  if (code !== 0) {
-    const msg = (baseResp.status_msg ?? "").trim();
-    const trace = traceId ? ` Trace-Id: ${traceId}` : "";
-    throw new Error(`MiniMax VLM API error (${code})${msg ? `: ${msg}` : ""}.${trace}`);
-  }
+    const baseResp = isRecord(json.base_resp) ? (json.base_resp as MinimaxBaseResp) : {};
+    const code = typeof baseResp.status_code === "number" ? baseResp.status_code : -1;
+    if (code !== 0) {
+      const msg = redactErrorText((baseResp.status_msg ?? "").trim());
+      throw new Error(`MiniMax VLM API error (${code})${msg ? `: ${msg}` : ""}.${trace}`);
+    }
 
-  const content = pickString(json, "content").trim();
-  if (!content) {
-    const trace = traceId ? ` Trace-Id: ${traceId}` : "";
-    throw new Error(`MiniMax VLM returned no content.${trace}`);
-  }
+    const content = typeof json.content === "string" ? json.content.trim() : "";
+    if (!content) {
+      throw new Error(`MiniMax VLM returned no content.${trace}`);
+    }
 
-  return content;
+    return content;
+  } finally {
+    await guarded.release();
+  }
 }

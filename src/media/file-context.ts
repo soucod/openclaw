@@ -1,24 +1,8 @@
-const XML_ESCAPE_MAP: Record<string, string> = {
-  "<": "&lt;",
-  ">": "&gt;",
-  "&": "&amp;",
-  '"': "&quot;",
-  "'": "&apos;",
-};
+import { sanitizeUntrustedFileName } from "@openclaw/fs-safe/advanced";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import { escapeXml } from "../shared/xml.js";
 
-function xmlEscapeAttr(value: string): string {
-  return value.replace(/[<>&"']/g, (char) => XML_ESCAPE_MAP[char] ?? char);
-}
-
-function escapeFileBlockContent(value: string): string {
-  return value.replace(/<\s*\/\s*file\s*>/gi, "&lt;/file&gt;").replace(/<\s*file\b/gi, "&lt;file");
-}
-
-function sanitizeFileName(value: string | null | undefined, fallbackName: string): string {
-  const normalized = typeof value === "string" ? value.replace(/[\r\n\t]+/g, " ").trim() : "";
-  return normalized || fallbackName;
-}
-
+/** Renders sanitized attachment text as a model-visible file block without allowing file-tag injection. */
 export function renderFileContextBlock(params: {
   filename?: string | null;
   fallbackName?: string;
@@ -26,17 +10,19 @@ export function renderFileContextBlock(params: {
   content: string;
   surroundContentWithNewlines?: boolean;
 }): string {
-  const fallbackName =
-    typeof params.fallbackName === "string" && params.fallbackName.trim().length > 0
-      ? params.fallbackName.trim()
-      : "attachment";
-  const safeName = sanitizeFileName(params.filename, fallbackName);
-  const safeContent = escapeFileBlockContent(params.content);
+  const fallbackName = normalizeOptionalString(params.fallbackName) ?? "attachment";
+  const normalizedName =
+    normalizeOptionalString(
+      typeof params.filename === "string" ? params.filename.replace(/[\r\n\t]+/g, " ") : undefined,
+    ) ?? "";
+  const safeName = sanitizeUntrustedFileName(normalizedName, fallbackName);
+  const safeContent = params.content
+    .replace(/<\s*\/\s*file\s*>/gi, "&lt;/file&gt;")
+    .replace(/<\s*file\b/gi, "&lt;file");
+  const mimeType = normalizeOptionalString(params.mimeType);
   const attrs = [
-    `name="${xmlEscapeAttr(safeName)}"`,
-    typeof params.mimeType === "string" && params.mimeType.trim()
-      ? `mime="${xmlEscapeAttr(params.mimeType.trim())}"`
-      : undefined,
+    `name="${escapeXml(safeName)}"`,
+    mimeType ? `mime="${escapeXml(mimeType)}"` : undefined,
   ]
     .filter(Boolean)
     .join(" ");

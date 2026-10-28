@@ -1,65 +1,59 @@
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
-import type { TelegramInlineButtonsScope } from "openclaw/plugin-sdk/config-runtime";
-import { listTelegramAccountIds, resolveTelegramAccount } from "./accounts.js";
+import type {
+  OpenClawConfig,
+  TelegramInlineButtonsScope,
+} from "openclaw/plugin-sdk/config-contracts";
+import {
+  normalizeLowercaseStringOrEmpty,
+  normalizeOptionalLowercaseString,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
+import { inspectTelegramAccount } from "./account-inspect.js";
+import { listTelegramAccountIds } from "./accounts.js";
 
 const DEFAULT_INLINE_BUTTONS_SCOPE: TelegramInlineButtonsScope = "allowlist";
 
-function normalizeInlineButtonsScope(value: unknown): TelegramInlineButtonsScope | undefined {
-  if (typeof value !== "string") {
+const INLINE_BUTTONS_SCOPES = ["off", "dm", "group", "all", "allowlist"] as const;
+
+export function resolveTelegramInlineButtonsConfigScope(
+  capabilities: unknown,
+): TelegramInlineButtonsScope | undefined {
+  if (
+    !capabilities ||
+    Array.isArray(capabilities) ||
+    typeof capabilities !== "object" ||
+    !("inlineButtons" in capabilities)
+  ) {
     return undefined;
   }
-  const trimmed = value.trim().toLowerCase();
-  if (
-    trimmed === "off" ||
-    trimmed === "dm" ||
-    trimmed === "group" ||
-    trimmed === "all" ||
-    trimmed === "allowlist"
-  ) {
-    return trimmed as TelegramInlineButtonsScope;
-  }
-  return undefined;
+  const trimmed = normalizeOptionalLowercaseString(capabilities.inlineButtons);
+  return INLINE_BUTTONS_SCOPES.find((scope) => scope === trimmed);
 }
 
-function resolveInlineButtonsScopeFromCapabilities(
+export function resolveTelegramInlineButtonsScopeFromCapabilities(
   capabilities: unknown,
 ): TelegramInlineButtonsScope {
-  if (!capabilities) {
-    return DEFAULT_INLINE_BUTTONS_SCOPE;
-  }
-  if (Array.isArray(capabilities)) {
+  if (Array.isArray(capabilities) && capabilities.length > 0) {
     const enabled = capabilities.some(
-      (entry) => String(entry).trim().toLowerCase() === "inlinebuttons",
+      (entry) => normalizeLowercaseStringOrEmpty(String(entry)) === "inlinebuttons",
     );
     return enabled ? "all" : "off";
   }
-  if (typeof capabilities === "object") {
-    const inlineButtons = (capabilities as { inlineButtons?: unknown }).inlineButtons;
-    return normalizeInlineButtonsScope(inlineButtons) ?? DEFAULT_INLINE_BUTTONS_SCOPE;
-  }
-  return DEFAULT_INLINE_BUTTONS_SCOPE;
+  return resolveTelegramInlineButtonsConfigScope(capabilities) ?? DEFAULT_INLINE_BUTTONS_SCOPE;
 }
 
 export function resolveTelegramInlineButtonsScope(params: {
   cfg: OpenClawConfig;
   accountId?: string | null;
 }): TelegramInlineButtonsScope {
-  const account = resolveTelegramAccount({ cfg: params.cfg, accountId: params.accountId });
-  return resolveInlineButtonsScopeFromCapabilities(account.config.capabilities);
+  const account = inspectTelegramAccount({ cfg: params.cfg, accountId: params.accountId });
+  return resolveTelegramInlineButtonsScopeFromCapabilities(account.config.capabilities);
 }
 
 export function isTelegramInlineButtonsEnabled(params: {
   cfg: OpenClawConfig;
   accountId?: string | null;
 }): boolean {
-  if (params.accountId) {
-    return resolveTelegramInlineButtonsScope(params) !== "off";
-  }
-  const accountIds = listTelegramAccountIds(params.cfg);
-  if (accountIds.length === 0) {
-    return resolveTelegramInlineButtonsScope(params) !== "off";
-  }
-  return accountIds.some(
+  const accountIds = params.accountId ? [params.accountId] : listTelegramAccountIds(params.cfg);
+  return (accountIds.length > 0 ? accountIds : [params.accountId]).some(
     (accountId) => resolveTelegramInlineButtonsScope({ cfg: params.cfg, accountId }) !== "off",
   );
 }

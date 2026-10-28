@@ -1,151 +1,62 @@
+import {
+  createMessageReceiptFromOutboundResults,
+  type MessageReceipt,
+} from "openclaw/plugin-sdk/channel-outbound";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import { stripChannelTargetPrefix, stripTargetKindPrefix } from "openclaw/plugin-sdk/core";
+import { truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
 import { resolveZaloAccount } from "./accounts.js";
-import type { ZaloFetch } from "./api.js";
 import { sendMessage, sendPhoto } from "./api.js";
 import { resolveZaloProxyFetch } from "./proxy.js";
-import type { OpenClawConfig } from "./runtime-api.js";
-import { resolveZaloToken } from "./token.js";
-
-export type ZaloSendOptions = {
-  token?: string;
-  accountId?: string;
-  cfg?: OpenClawConfig;
-  mediaUrl?: string;
-  caption?: string;
-  verbose?: boolean;
-  proxy?: string;
-};
-
-export type ZaloSendResult = {
-  ok: boolean;
-  messageId?: string;
-  error?: string;
-};
-
-function toZaloSendResult(response: {
-  ok?: boolean;
-  result?: { message_id?: string };
-}): ZaloSendResult {
-  if (response.ok && response.result) {
-    return { ok: true, messageId: response.result.message_id };
-  }
-  return { ok: false, error: "Failed to send message" };
-}
-
-async function runZaloSend(
-  failureMessage: string,
-  send: () => Promise<{ ok?: boolean; result?: { message_id?: string } }>,
-): Promise<ZaloSendResult> {
-  try {
-    const result = toZaloSendResult(await send());
-    return result.ok ? result : { ok: false, error: failureMessage };
-  } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : String(err) };
-  }
-}
-
-function resolveSendContext(options: ZaloSendOptions): {
-  token: string;
-  fetcher?: ZaloFetch;
-} {
-  if (options.cfg) {
-    const account = resolveZaloAccount({
-      cfg: options.cfg,
-      accountId: options.accountId,
-    });
-    const token = options.token || account.token;
-    const proxy = options.proxy ?? account.config.proxy;
-    return { token, fetcher: resolveZaloProxyFetch(proxy) };
-  }
-
-  const token = options.token ?? resolveZaloToken(undefined, options.accountId).token;
-  const proxy = options.proxy;
-  return { token, fetcher: resolveZaloProxyFetch(proxy) };
-}
-
-function resolveValidatedSendContext(
-  chatId: string,
-  options: ZaloSendOptions,
-): { ok: true; chatId: string; token: string; fetcher?: ZaloFetch } | { ok: false; error: string } {
-  const { token, fetcher } = resolveSendContext(options);
-  if (!token) {
-    return { ok: false, error: "No Zalo bot token configured" };
-  }
-  const trimmedChatId = chatId?.trim();
-  if (!trimmedChatId) {
-    return { ok: false, error: "No chat_id provided" };
-  }
-  return { ok: true, chatId: trimmedChatId, token, fetcher };
-}
-
-function resolveSendContextOrFailure(
-  chatId: string,
-  options: ZaloSendOptions,
-):
-  | { context: { chatId: string; token: string; fetcher?: ZaloFetch } }
-  | { failure: ZaloSendResult } {
-  const context = resolveValidatedSendContext(chatId, options);
-  return context.ok
-    ? { context }
-    : {
-        failure: { ok: false, error: context.error },
-      };
-}
 
 export async function sendMessageZalo(
   chatId: string,
   text: string,
-  options: ZaloSendOptions = {},
-): Promise<ZaloSendResult> {
-  const resolved = resolveSendContextOrFailure(chatId, options);
-  if ("failure" in resolved) {
-    return resolved.failure;
-  }
-  const { context } = resolved;
-
-  if (options.mediaUrl) {
-    return sendPhotoZalo(context.chatId, options.mediaUrl, {
-      ...options,
-      token: context.token,
-      caption: text || options.caption,
-    });
-  }
-
-  return await runZaloSend("Failed to send message", () =>
-    sendMessage(
-      context.token,
-      {
-        chat_id: context.chatId,
-        text: text.slice(0, 2000),
-      },
-      context.fetcher,
-    ),
-  );
-}
-
-export async function sendPhotoZalo(
-  chatId: string,
-  photoUrl: string,
-  options: ZaloSendOptions = {},
-): Promise<ZaloSendResult> {
-  const resolved = resolveSendContextOrFailure(chatId, options);
-  if ("failure" in resolved) {
-    return resolved.failure;
-  }
-  const { context } = resolved;
-
-  if (!photoUrl?.trim()) {
-    return { ok: false, error: "No photo URL provided" };
+  options: {
+    accountId?: string;
+    cfg: OpenClawConfig;
+    mediaUrl?: string;
+    assertDirectAdapterHandoff?: () => void;
+  },
+): Promise<{ messageId: string; receipt: MessageReceipt }> {
+  const account = resolveZaloAccount({ cfg: options.cfg, accountId: options.accountId });
+  const { token } = account;
+  const fetcher = resolveZaloProxyFetch(account.config.proxy);
+  const normalizedChatId = token
+    ? stripTargetKindPrefix(stripChannelTargetPrefix(chatId, "zalo", "zl"))
+    : "";
+  if (!token || !normalizedChatId) {
+    throw new Error(token ? "No chat_id provided" : "No Zalo bot token configured");
   }
 
-  return await runZaloSend("Failed to send photo", () =>
-    sendPhoto(
-      context.token,
-      {
-        chat_id: context.chatId,
-        photo: photoUrl.trim(),
-        caption: options.caption?.slice(0, 2000),
-      },
-      context.fetcher,
-    ),
-  );
+  const photoUrl = options.mediaUrl?.trim();
+  if (options.mediaUrl && !photoUrl && !text) {
+    throw new Error("No photo URL provided");
+  }
+  const response = photoUrl
+    ? await sendPhoto(
+        token,
+        { chat_id: normalizedChatId, photo: photoUrl, caption: text || undefined },
+        fetcher,
+        options.assertDirectAdapterHandoff,
+      )
+    : await sendMessage(
+        token,
+        { chat_id: normalizedChatId, text: truncateUtf16Safe(text, 2000) },
+        fetcher,
+        options.assertDirectAdapterHandoff,
+      );
+  if (!response.result) {
+    throw new Error(photoUrl ? "Failed to send photo" : "Failed to send message");
+  }
+  const messageId = response.result.message_id ?? "";
+  return {
+    messageId,
+    receipt: createMessageReceiptFromOutboundResults({
+      results: messageId.trim()
+        ? [{ channel: "zalo", messageId: messageId.trim(), chatId: normalizedChatId }]
+        : [],
+      kind: photoUrl ? "media" : "text",
+    }),
+  };
 }

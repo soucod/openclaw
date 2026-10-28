@@ -1,16 +1,8 @@
-import { applyAuthProfileConfig, buildApiKeyCredential } from "./provider-auth-helpers.js";
-import {
+export { upsertAuthProfileWithLockOrThrow } from "../agents/auth-profiles/profiles.js";
+export { applyAuthProfileConfig, buildApiKeyCredential } from "./provider-auth-helpers.js";
+export {
   ensureApiKeyFromOptionEnvOrPrompt,
   normalizeApiKeyInput,
   validateApiKeyInput,
 } from "./provider-auth-input.js";
-import { applyPrimaryModel } from "./provider-model-primary.js";
-
-export const providerApiKeyAuthRuntime = {
-  applyAuthProfileConfig,
-  applyPrimaryModel,
-  buildApiKeyCredential,
-  ensureApiKeyFromOptionEnvOrPrompt,
-  normalizeApiKeyInput,
-  validateApiKeyInput,
-};
+export { applyPrimaryModel } from "./provider-model-primary.js";

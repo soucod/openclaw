@@ -1,27 +1,47 @@
-import { readAcpSessionEntry, type AcpSessionStoreEntry } from "openclaw/plugin-sdk/acp-runtime";
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
-import { normalizeAccountId } from "openclaw/plugin-sdk/routing";
-import { parseDiscordTarget } from "../targets.js";
-import { resolveChannelIdForBinding } from "./thread-bindings.discord-api.js";
-import { getThreadBindingManager } from "./thread-bindings.manager.js";
+import {
+  readAcpSessionEntryAsync,
+  prepareAcpSessionEntryRead,
+  rethrowIncognitoSessionError,
+  type AcpSessionEntryPreparer,
+  type AcpSessionStoreEntry,
+  type PreparedAcpSessionEntryRead,
+} from "openclaw/plugin-sdk/acp-runtime";
+import { runTasksWithConcurrency } from "openclaw/plugin-sdk/concurrency-runtime";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import {
   resolveThreadBindingIntroText,
   resolveThreadBindingThreadName,
-} from "./thread-bindings.messages.js";
+} from "openclaw/plugin-sdk/conversation-runtime";
+import {
+  normalizeOptionalLowercaseString,
+  normalizeOptionalString,
+  normalizeOptionalStringifiedId,
+  uniqueStrings,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
+import { warnPluginSdkDeprecation } from "openclaw/plugin-sdk/thread-bindings-session-runtime";
+import { parseDiscordTarget } from "../target-parsing.js";
+import { resolveChannelIdForBinding } from "./thread-bindings.discord-api.js";
+import { getThreadBindingManager } from "./thread-bindings.manager.js";
+import { removeBindingRecordSync } from "./thread-bindings.persistence.js";
+import {
+  mutateBindingsForTargetSession,
+  resolveBindingIdsForTargetSession,
+} from "./thread-bindings.session-shared.js";
 import {
   BINDINGS_BY_THREAD_ID,
-  MANAGERS_BY_ACCOUNT_ID,
   ensureBindingsLoaded,
+  ensureBindingsLoadedAsync,
+  MANAGERS_BY_ACCOUNT_ID,
   getThreadBindingToken,
-  normalizeThreadId,
-  rememberRecentUnboundWebhookEcho,
-  removeBindingRecord,
-  resolveBindingIdsForSession,
-  saveBindingsToDisk,
-  setBindingRecord,
-  shouldPersistBindingMutations,
+  refreshUnboundThreadWebhookIdentity,
 } from "./thread-bindings.state.js";
 import type { ThreadBindingRecord, ThreadBindingTargetKind } from "./thread-bindings.types.js";
+export {
+  setThreadBindingIdleTimeoutBySessionKey,
+  setThreadBindingIdleTimeoutBySessionKeyAsync,
+  setThreadBindingMaxAgeBySessionKey,
+  setThreadBindingMaxAgeBySessionKeyAsync,
+} from "./thread-bindings.session-updates.js";
 
 export type AcpThreadBindingReconciliationResult = {
   checked: number;
@@ -29,120 +49,56 @@ export type AcpThreadBindingReconciliationResult = {
   staleSessionKeys: string[];
 };
 
-export type AcpThreadBindingHealthStatus = "healthy" | "stale" | "uncertain";
-
-export type AcpThreadBindingHealthProbe = (params: {
+type AcpThreadBindingHealthProbe = (params: {
   cfg: OpenClawConfig;
   accountId: string;
   sessionKey: string;
   binding: ThreadBindingRecord;
   session: AcpSessionStoreEntry;
 }) => Promise<{
-  status: AcpThreadBindingHealthStatus;
+  status: "healthy" | "stale" | "uncertain";
   reason?: string;
 }>;
 
 // Cap startup fan-out so large binding sets do not create unbounded ACP probe spikes.
 const ACP_STARTUP_HEALTH_PROBE_CONCURRENCY_LIMIT = 8;
 
-async function mapWithConcurrency<TItem, TResult>(params: {
-  items: TItem[];
-  limit: number;
-  worker: (item: TItem, index: number) => Promise<TResult>;
-}): Promise<TResult[]> {
-  if (params.items.length === 0) {
-    return [];
-  }
-  const limit = Math.max(1, Math.floor(params.limit));
-  const resultsByIndex = new Map<number, TResult>();
-  let nextIndex = 0;
-
-  const runWorker = async () => {
-    for (;;) {
-      const index = nextIndex;
-      nextIndex += 1;
-      if (index >= params.items.length) {
-        return;
-      }
-      resultsByIndex.set(index, await params.worker(params.items[index], index));
-    }
-  };
-
-  const workers = Array.from({ length: Math.min(limit, params.items.length) }, () => runWorker());
-  await Promise.all(workers);
-  return params.items.map((_item, index) => resultsByIndex.get(index)!);
-}
-
-function normalizeNonNegativeMs(raw: number): number {
-  if (!Number.isFinite(raw)) {
-    return 0;
-  }
-  return Math.max(0, Math.floor(raw));
-}
-
-function resolveBindingIdsForTargetSession(params: {
-  targetSessionKey: string;
-  accountId?: string;
-  targetKind?: ThreadBindingTargetKind;
-}) {
-  ensureBindingsLoaded();
-  const targetSessionKey = params.targetSessionKey.trim();
-  if (!targetSessionKey) {
-    return [];
-  }
-  const accountId = params.accountId ? normalizeAccountId(params.accountId) : undefined;
-  return resolveBindingIdsForSession({
-    targetSessionKey,
-    accountId,
-    targetKind: params.targetKind,
-  });
-}
-
-function updateBindingsForTargetSession(
-  ids: string[],
-  update: (existing: ThreadBindingRecord, now: number) => ThreadBindingRecord,
-) {
-  if (ids.length === 0) {
-    return [];
-  }
-  const now = Date.now();
-  const updated: ThreadBindingRecord[] = [];
-  for (const bindingKey of ids) {
-    const existing = BINDINGS_BY_THREAD_ID.get(bindingKey);
-    if (!existing) {
-      continue;
-    }
-    const nextRecord = update(existing, now);
-    setBindingRecord(nextRecord);
-    updated.push(nextRecord);
-  }
-  if (updated.length > 0 && shouldPersistBindingMutations()) {
-    saveBindingsToDisk({ force: true });
-  }
-  return updated;
-}
-
 export function listThreadBindingsForAccount(accountId?: string): ThreadBindingRecord[] {
-  const manager = getThreadBindingManager(accountId);
-  if (!manager) {
-    return [];
-  }
-  return manager.listBindings();
+  return getThreadBindingManager(accountId)?.listBindings() ?? [];
 }
 
+/** @deprecated Use listThreadBindingsBySessionKeyAsync; compatible through 2026-12-31, removed in the first January 2027 stable. */
 export function listThreadBindingsBySessionKey(params: {
   targetSessionKey: string;
   accountId?: string;
   targetKind?: ThreadBindingTargetKind;
 }): ThreadBindingRecord[] {
-  const ids = resolveBindingIdsForTargetSession(params);
-  return ids
+  warnPluginSdkDeprecation({
+    family: "conversation-bindings",
+    method: "listThreadBindingsBySessionKey",
+    replacement: "listThreadBindingsBySessionKeyAsync",
+  });
+  ensureBindingsLoaded();
+  return listLoadedThreadBindingsBySessionKey(params);
+}
+
+export async function listThreadBindingsBySessionKeyAsync(
+  params: Parameters<typeof listThreadBindingsBySessionKey>[0],
+): Promise<ThreadBindingRecord[]> {
+  await ensureBindingsLoadedAsync();
+  return listLoadedThreadBindingsBySessionKey(params);
+}
+
+function listLoadedThreadBindingsBySessionKey(
+  params: Parameters<typeof listThreadBindingsBySessionKey>[0],
+): ThreadBindingRecord[] {
+  return resolveBindingIdsForTargetSession(params)
     .map((bindingKey) => BINDINGS_BY_THREAD_ID.get(bindingKey))
     .filter((entry): entry is ThreadBindingRecord => Boolean(entry));
 }
 
 export async function autoBindSpawnedDiscordSubagent(params: {
-  cfg?: OpenClawConfig;
+  cfg: OpenClawConfig;
   accountId?: string;
   channel?: string;
   to?: string;
@@ -152,7 +108,7 @@ export async function autoBindSpawnedDiscordSubagent(params: {
   label?: string;
   boundBy?: string;
 }): Promise<ThreadBindingRecord | null> {
-  const channel = params.channel?.trim().toLowerCase();
+  const channel = normalizeOptionalLowercaseString(params.channel);
   if (channel !== "discord") {
     return null;
   }
@@ -161,25 +117,26 @@ export async function autoBindSpawnedDiscordSubagent(params: {
     return null;
   }
   const managerToken = getThreadBindingToken(manager.accountId);
+  const resolveChannel = (threadId: string) =>
+    resolveChannelIdForBinding({
+      cfg: params.cfg,
+      accountId: manager.accountId,
+      token: managerToken,
+      threadId,
+    });
 
-  const requesterThreadId = normalizeThreadId(params.threadId);
+  const requesterThreadId = normalizeOptionalStringifiedId(params.threadId);
   let channelId = "";
   if (requesterThreadId) {
     const existing = manager.getByThreadId(requesterThreadId);
     if (existing?.channelId?.trim()) {
       channelId = existing.channelId.trim();
     } else {
-      channelId =
-        (await resolveChannelIdForBinding({
-          cfg: params.cfg,
-          accountId: manager.accountId,
-          token: managerToken,
-          threadId: requesterThreadId,
-        })) ?? "";
+      channelId = (await resolveChannel(requesterThreadId)) ?? "";
     }
   }
   if (!channelId) {
-    const to = params.to?.trim() || "";
+    const to = normalizeOptionalString(params.to) ?? "";
     if (!to) {
       return null;
     }
@@ -188,13 +145,7 @@ export async function autoBindSpawnedDiscordSubagent(params: {
       if (!target || target.kind !== "channel") {
         return null;
       }
-      channelId =
-        (await resolveChannelIdForBinding({
-          cfg: params.cfg,
-          accountId: manager.accountId,
-          token: managerToken,
-          threadId: target.id,
-        })) ?? "";
+      channelId = (await resolveChannel(target.id)) ?? "";
     } catch {
       return null;
     }
@@ -222,6 +173,7 @@ export async function autoBindSpawnedDiscordSubagent(params: {
   });
 }
 
+/** @deprecated Use unbindThreadBindingsBySessionKeyAsync; compatible through 2026-12-31, removed in the first January 2027 stable. */
 export function unbindThreadBindingsBySessionKey(params: {
   targetSessionKey: string;
   accountId?: string;
@@ -230,11 +182,13 @@ export function unbindThreadBindingsBySessionKey(params: {
   sendFarewell?: boolean;
   farewellText?: string;
 }): ThreadBindingRecord[] {
+  warnPluginSdkDeprecation({
+    family: "conversation-bindings",
+    method: "unbindThreadBindingsBySessionKey",
+    replacement: "unbindThreadBindingsBySessionKeyAsync",
+  });
+  ensureBindingsLoaded();
   const ids = resolveBindingIdsForTargetSession(params);
-  if (ids.length === 0) {
-    return [];
-  }
-
   const removed: ThreadBindingRecord[] = [];
   for (const bindingKey of ids) {
     const record = BINDINGS_BY_THREAD_ID.get(bindingKey);
@@ -242,75 +196,63 @@ export function unbindThreadBindingsBySessionKey(params: {
       continue;
     }
     const manager = MANAGERS_BY_ACCOUNT_ID.get(record.accountId);
-    if (manager) {
-      const unbound = manager.unbindThread({
-        threadId: record.threadId,
-        reason: params.reason,
-        sendFarewell: params.sendFarewell,
-        farewellText: params.farewellText,
-      });
-      if (unbound) {
-        removed.push(unbound);
-      }
-      continue;
+    if (manager?.isStopping()) {
+      throw new Error("Discord thread binding manager is stopping");
     }
-    const unbound = removeBindingRecord(bindingKey);
+    const unbound = removeBindingRecordSync(bindingKey);
     if (unbound) {
-      rememberRecentUnboundWebhookEcho(unbound);
+      if (manager) {
+        manager.notifyUnbound(unbound, params);
+      } else {
+        refreshUnboundThreadWebhookIdentity(unbound);
+      }
       removed.push(unbound);
     }
   }
 
-  if (removed.length > 0 && shouldPersistBindingMutations()) {
-    saveBindingsToDisk({ force: true });
-  }
   return removed;
 }
 
-export function setThreadBindingIdleTimeoutBySessionKey(params: {
-  targetSessionKey: string;
-  accountId?: string;
-  idleTimeoutMs: number;
-}): ThreadBindingRecord[] {
-  const ids = resolveBindingIdsForTargetSession(params);
-  const idleTimeoutMs = normalizeNonNegativeMs(params.idleTimeoutMs);
-  return updateBindingsForTargetSession(ids, (existing, now) => ({
-    ...existing,
-    idleTimeoutMs,
-    lastActivityAt: now,
-  }));
+export async function unbindThreadBindingsBySessionKeyAsync(
+  input: Parameters<typeof unbindThreadBindingsBySessionKey>[0],
+): Promise<ThreadBindingRecord[]> {
+  const params = { ...input };
+  return mutateBindingsForTargetSession(
+    params,
+    () => null,
+    (record, manager) => {
+      if (manager) {
+        manager.notifyUnbound(record, params);
+      } else {
+        refreshUnboundThreadWebhookIdentity(record);
+      }
+    },
+  );
 }
 
-export function setThreadBindingMaxAgeBySessionKey(params: {
-  targetSessionKey: string;
-  accountId?: string;
-  maxAgeMs: number;
-}): ThreadBindingRecord[] {
-  const ids = resolveBindingIdsForTargetSession(params);
-  const maxAgeMs = normalizeNonNegativeMs(params.maxAgeMs);
-  return updateBindingsForTargetSession(ids, (existing, now) => ({
-    ...existing,
-    maxAgeMs,
-    boundAt: now,
-    lastActivityAt: now,
-  }));
-}
-
-function resolveStoredAcpBindingHealth(params: {
-  session: AcpSessionStoreEntry;
-}): AcpThreadBindingHealthStatus {
-  if (!params.session.acp) {
-    return "stale";
-  }
-  return "healthy";
-}
-
-export async function reconcileAcpThreadBindingsOnStartup(params: {
+type AcpThreadBindingReconciliationParams = {
   cfg: OpenClawConfig;
   accountId?: string;
   sendFarewell?: boolean;
   healthProbe?: AcpThreadBindingHealthProbe;
-}): Promise<AcpThreadBindingReconciliationResult> {
+  prepareSession?: AcpSessionEntryPreparer;
+};
+
+export async function reconcileAcpThreadBindingsOnStartup(
+  params: AcpThreadBindingReconciliationParams,
+): Promise<AcpThreadBindingReconciliationResult> {
+  const preparations = new Map<ThreadBindingRecord, PreparedAcpSessionEntryRead>();
+  try {
+    return await reconcileAcpThreadBindings(params, preparations);
+  } finally {
+    preparations.forEach((prepared) => prepared.release());
+  }
+}
+
+async function reconcileAcpThreadBindings(
+  params: AcpThreadBindingReconciliationParams,
+  preparations: Map<ThreadBindingRecord, PreparedAcpSessionEntryRead>,
+): Promise<AcpThreadBindingReconciliationResult> {
   const manager = getThreadBindingManager(params.accountId);
   if (!manager) {
     return {
@@ -339,20 +281,24 @@ export async function reconcileAcpThreadBindingsOnStartup(params: {
       staleBindings.push(binding);
       continue;
     }
-    const session = readAcpSessionEntry({
+    const input = {
       cfg: params.cfg,
       sessionKey,
-    });
-    if (!session) {
-      staleBindings.push(binding);
-      continue;
+      agentId: binding.agentId,
+    };
+    const preparation = (params.prepareSession ?? prepareAcpSessionEntryRead)(input);
+    const prepared = preparation ? await preparation : undefined;
+    if (prepared) {
+      preparations.set(binding, prepared);
+      prepared.assertCurrent();
     }
+    const session = prepared ? prepared.session : await readAcpSessionEntryAsync(input);
     // Session store read failures are transient; never auto-unbind on uncertain reads.
-    if (session.storeReadFailed) {
+    if (session?.storeReadFailed) {
       continue;
     }
 
-    if (resolveStoredAcpBindingHealth({ session }) === "stale") {
+    if (!session?.acp) {
       staleBindings.push(binding);
       continue;
     }
@@ -364,10 +310,8 @@ export async function reconcileAcpThreadBindingsOnStartup(params: {
   }
 
   if (params.healthProbe && probeTargets.length > 0) {
-    const probeResults = await mapWithConcurrency({
-      items: probeTargets,
-      limit: ACP_STARTUP_HEALTH_PROBE_CONCURRENCY_LIMIT,
-      worker: async ({ binding, sessionKey, session }) => {
+    const { results: probeResults } = await runTasksWithConcurrency({
+      tasks: probeTargets.map(({ binding, sessionKey, session }) => async () => {
         try {
           const result = await params.healthProbe?.({
             cfg: params.cfg,
@@ -376,52 +320,63 @@ export async function reconcileAcpThreadBindingsOnStartup(params: {
             binding,
             session,
           });
-          return {
-            binding,
-            status: result?.status ?? ("uncertain" satisfies AcpThreadBindingHealthStatus),
-          };
-        } catch {
+          return result?.status === "stale" ? binding : undefined;
+        } catch (error) {
+          rethrowIncognitoSessionError(error);
           // Treat probe failures as uncertain and keep the binding.
-          return {
-            binding,
-            status: "uncertain" satisfies AcpThreadBindingHealthStatus,
-          };
+          return undefined;
         }
-      },
+      }),
+      limit: ACP_STARTUP_HEALTH_PROBE_CONCURRENCY_LIMIT,
+      errorMode: "stop",
+      throwOnError: true,
     });
 
-    for (const probeResult of probeResults) {
-      if (probeResult.status === "stale") {
-        staleBindings.push(probeResult.binding);
+    for (const binding of probeResults) {
+      if (binding) {
+        staleBindings.push(binding);
       }
     }
-  }
-
-  if (staleBindings.length === 0) {
-    return {
-      checked: acpBindings.length,
-      removed: 0,
-      staleSessionKeys: [],
-    };
   }
 
   const staleSessionKeys: string[] = [];
   let removed = 0;
   for (const binding of staleBindings) {
     staleSessionKeys.push(binding.targetSessionKey);
-    const unbound = manager.unbindThread({
-      threadId: binding.threadId,
-      reason: "stale-session",
-      sendFarewell: params.sendFarewell ?? false,
-    });
-    if (unbound) {
-      removed += 1;
+    if (
+      getThreadBindingManager(manager.accountId) !== manager ||
+      manager.getByThreadId(binding.threadId) !== binding
+    ) {
+      continue;
+    }
+    let sourceFailure: unknown;
+    try {
+      const unbound = await manager.unbindThread({
+        threadId: binding.threadId,
+        expected: binding,
+        assertCurrent() {
+          try {
+            preparations.get(binding)?.assertCurrent();
+          } catch (error) {
+            sourceFailure = error;
+            throw error;
+          }
+        },
+        reason: "stale-session",
+        sendFarewell: params.sendFarewell ?? false,
+      });
+      if (unbound) {
+        removed += 1;
+      }
+    } finally {
+      // Persistence may acknowledge removal before later source revalidation fails.
+      rethrowIncognitoSessionError(sourceFailure);
     }
   }
 
   return {
     checked: acpBindings.length,
     removed,
-    staleSessionKeys: [...new Set(staleSessionKeys)],
+    staleSessionKeys: uniqueStrings(staleSessionKeys),
   };
 }

@@ -1,90 +1,78 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
+import {
+  initializeGlobalHookRunner,
+  resetGlobalHookRunner,
+} from "../plugins/hook-runner-global.js";
+import { createMockPluginRegistry } from "../plugins/hooks.test-fixtures.js";
 import { issuePairingChallenge } from "./pairing-challenge.js";
 
-describe("issuePairingChallenge", () => {
-  it("creates and sends a pairing reply when request is newly created", async () => {
-    const sent: string[] = [];
-
-    const result = await issuePairingChallenge({
-      channel: "telegram",
-      senderId: "123",
-      senderIdLine: "Your Telegram user id: 123",
-      upsertPairingRequest: async () => ({ code: "ABCD", created: true }),
-      sendPairingReply: async (text) => {
-        sent.push(text);
-      },
-    });
-
-    expect(result).toEqual({ created: true, code: "ABCD" });
-    expect(sent).toHaveLength(1);
-    expect(sent[0]).toContain("ABCD");
+async function issue(
+  code: string,
+  overrides: Partial<Parameters<typeof issuePairingChallenge>[0]> = {},
+  created = true,
+) {
+  const result = await issuePairingChallenge({
+    channel: "forum",
+    senderId: "123",
+    senderIdLine: "Your forum user id: 123",
+    upsertPairingRequest: async () => ({ code, created }),
+    sendPairingReply: async () => {},
+    ...overrides,
   });
+  expect(result).toEqual(created ? { created: true, code } : { created: false });
+}
+function hooks(...entries: Parameters<typeof createMockPluginRegistry>[0]) {
+  initializeGlobalHookRunner(createMockPluginRegistry(entries));
+}
 
-  it("does not send a reply when request already exists", async () => {
-    const sendPairingReply = vi.fn(async () => {});
+afterEach(resetGlobalHookRunner);
 
-    const result = await issuePairingChallenge({
-      channel: "telegram",
-      senderId: "123",
-      senderIdLine: "Your Telegram user id: 123",
-      upsertPairingRequest: async () => ({ code: "ABCD", created: false }),
-      sendPairingReply,
-    });
-
-    expect(result).toEqual({ created: false });
-    expect(sendPairingReply).not.toHaveBeenCalled();
+it("notifies and replies only when creating a request, preserving metadata and context", async () => {
+  const handler = vi.fn(async () => {});
+  hooks({ hookName: "channel_pairing_requested", handler });
+  const meta = { name: "alice" };
+  const sendPairingReply = vi.fn(async (_text: string) => {});
+  const onCreated = vi.fn();
+  const upsertPairingRequest = vi.fn(async () => ({ code: "1111", created: true }));
+  const options = { accountId: "alerts", meta, onCreated, sendPairingReply };
+  await issue("1111", {
+    ...options,
+    upsertPairingRequest,
+    buildReplyText: ({ code }) => `custom ${code}`,
   });
+  await issue("EXISTS12", options, false);
+  expect(upsertPairingRequest).toHaveBeenCalledWith({ id: "123", meta });
+  expect(onCreated).toHaveBeenCalledExactlyOnceWith({ code: "1111" });
+  expect(sendPairingReply.mock.calls).toEqual([["custom 1111"]]);
+  expect(handler).toHaveBeenCalledExactlyOnceWith(
+    { channel: "forum", accountId: "alerts", senderId: "123", code: "1111", metadata: meta },
+    { channelId: "forum", accountId: "alerts", senderId: "123" },
+  );
+});
 
-  it("supports custom reply text builder", async () => {
-    const sent: string[] = [];
-
-    await issuePairingChallenge({
-      channel: "line",
-      senderId: "u1",
-      senderIdLine: "Your line id: u1",
-      upsertPairingRequest: async () => ({ code: "ZXCV", created: true }),
-      buildReplyText: ({ code }) => `custom ${code}`,
-      sendPairingReply: async (text) => {
-        sent.push(text);
-      },
-    });
-
-    expect(sent).toEqual(["custom ZXCV"]);
+it("captures reply errors through onReplyError", async () => {
+  const error = new Error("send failed");
+  const onReplyError = vi.fn();
+  await issue("9999", {
+    onReplyError,
+    sendPairingReply: () => Promise.reject(error),
   });
+  expect(onReplyError).toHaveBeenCalledExactlyOnceWith(error);
+});
 
-  it("calls onCreated and forwards meta to upsert", async () => {
-    const onCreated = vi.fn();
-    const upsert = vi.fn(async () => ({ code: "1111", created: true }));
-
-    await issuePairingChallenge({
-      channel: "discord",
-      senderId: "42",
-      senderIdLine: "Your Discord user id: 42",
-      meta: { name: "alice" },
-      upsertPairingRequest: upsert,
-      onCreated,
-      sendPairingReply: async () => {},
-    });
-
-    expect(upsert).toHaveBeenCalledWith({ id: "42", meta: { name: "alice" } });
-    expect(onCreated).toHaveBeenCalledWith({ code: "1111" });
+it("does not block pairing replies when pairing-request hooks fail or stall", async () => {
+  const throwingHook = vi.fn(() => {
+    throw new Error("notification failed");
   });
+  const stallingHook = vi.fn(() => new Promise<void>(() => {}));
+  hooks(
+    { hookName: "channel_pairing_requested", handler: throwingHook, pluginId: "throwing" },
+    { hookName: "channel_pairing_requested", handler: stallingHook, pluginId: "stalling" },
+  );
+  const sendPairingReply = vi.fn(async () => {});
 
-  it("captures reply errors through onReplyError", async () => {
-    const onReplyError = vi.fn();
-
-    const result = await issuePairingChallenge({
-      channel: "signal",
-      senderId: "+1555",
-      senderIdLine: "Your Signal sender id: +1555",
-      upsertPairingRequest: async () => ({ code: "9999", created: true }),
-      sendPairingReply: async () => {
-        throw new Error("send failed");
-      },
-      onReplyError,
-    });
-
-    expect(result).toEqual({ created: true, code: "9999" });
-    expect(onReplyError).toHaveBeenCalledTimes(1);
-  });
+  await issue("FAST1234", { sendPairingReply });
+  expect(throwingHook).toHaveBeenCalledTimes(1);
+  expect(stallingHook).toHaveBeenCalledTimes(1);
+  expect(sendPairingReply).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("FAST1234"));
 });

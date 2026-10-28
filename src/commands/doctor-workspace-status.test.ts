@@ -1,231 +1,256 @@
+// Doctor workspace status tests cover workspace inspection and status output.
 import { describe, expect, it, vi } from "vitest";
-import * as noteModule from "../terminal/note.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import type { PluginMetadataSnapshotScopeRunner } from "../plugins/current-plugin-metadata-snapshot.js";
+import { createPluginLoadResult, createPluginRecord } from "../plugins/status.test-fixtures.js";
+import { collectWorkspaceStatusHealthFindings } from "./doctor-workspace-status.js";
 
-const resolveAgentWorkspaceDirMock = vi.fn();
-const resolveDefaultAgentIdMock = vi.fn();
-const buildWorkspaceSkillStatusMock = vi.fn();
-const loadOpenClawPluginsMock = vi.fn();
-
-vi.mock("../agents/agent-scope.js", () => ({
-  resolveAgentWorkspaceDir: (...args: unknown[]) => resolveAgentWorkspaceDirMock(...args),
-  resolveDefaultAgentId: (...args: unknown[]) => resolveDefaultAgentIdMock(...args),
+const mocks = vi.hoisted(() => ({
+  listAgentIds: vi.fn<(_cfg: OpenClawConfig) => string[]>(() => ["default"]),
+  resolveAgentWorkspaceDir: vi.fn(),
+  buildPluginRegistrySnapshotReport: vi.fn(),
+  buildPluginCompatibilityWarnings: vi.fn(),
 }));
 
-vi.mock("../agents/skills-status.js", () => ({
-  buildWorkspaceSkillStatus: (...args: unknown[]) => buildWorkspaceSkillStatusMock(...args),
+vi.mock("../agents/agent-scope.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../agents/agent-scope.js")>()),
+  listAgentIds: (cfg: OpenClawConfig) => mocks.listAgentIds(cfg),
+  resolveAgentWorkspaceDir: (...args: unknown[]) => mocks.resolveAgentWorkspaceDir(...args),
 }));
 
-vi.mock("../plugins/loader.js", () => ({
-  loadOpenClawPlugins: (...args: unknown[]) => loadOpenClawPluginsMock(...args),
+vi.mock("../plugins/status.js", () => ({
+  buildPluginRegistrySnapshotReport: (...args: unknown[]) =>
+    mocks.buildPluginRegistrySnapshotReport(...args),
+  buildPluginCompatibilityWarnings: (...args: unknown[]) =>
+    mocks.buildPluginCompatibilityWarnings(...args),
 }));
 
-describe("noteWorkspaceStatus", () => {
-  it("warns when plugins use legacy compatibility paths", async () => {
-    resolveDefaultAgentIdMock.mockReturnValue("default");
-    resolveAgentWorkspaceDirMock.mockReturnValue("/workspace");
-    buildWorkspaceSkillStatusMock.mockReturnValue({
-      skills: [],
+describe("collectWorkspaceStatusHealthFindings", () => {
+  it("shares scoped workspace inspection while reporting identical registrar failures once", () => {
+    const diagnostic = {
+      level: "error" as const,
+      pluginId: "broken-fixture",
+      source: "/plugins/broken-fixture/index.js",
+      message: "board widget registration has invalid kind",
+    };
+    mocks.listAgentIds.mockReturnValue(["alpha", "beta"]);
+    mocks.resolveAgentWorkspaceDir.mockImplementation((_cfg, agentId) => `/workspace/${agentId}`);
+    let activeWorkspace: string | undefined;
+    const runWithPluginMetadataSnapshot: PluginMetadataSnapshotScopeRunner = (scope, run) => {
+      activeWorkspace = scope.workspaceDir;
+      try {
+        return run();
+      } finally {
+        activeWorkspace = undefined;
+      }
+    };
+    mocks.buildPluginRegistrySnapshotReport.mockImplementation(({ workspaceDir }) => {
+      expect(activeWorkspace).toBe(workspaceDir);
+      return {
+        workspaceDir,
+        ...createPluginLoadResult({ plugins: [], diagnostics: [diagnostic] }),
+      };
     });
-    loadOpenClawPluginsMock.mockReturnValue({
-      plugins: [
-        {
-          id: "legacy-plugin",
-          name: "Legacy Plugin",
-          source: "/tmp/legacy-plugin/index.ts",
-          origin: "workspace",
-          enabled: true,
-          status: "loaded",
-          toolNames: [],
-          hookNames: [],
-          channelIds: [],
-          providerIds: [],
-          speechProviderIds: [],
-          mediaUnderstandingProviderIds: [],
-          imageGenerationProviderIds: [],
-          webSearchProviderIds: [],
-          gatewayMethods: [],
-          cliCommands: [],
-          services: [],
-          commands: [],
-          httpRoutes: 0,
-          hookCount: 1,
-          configSchema: false,
-        },
-      ],
-      diagnostics: [],
-      channels: [],
-      channelSetups: [],
-      providers: [],
-      speechProviders: [],
-      mediaUnderstandingProviders: [],
-      imageGenerationProviders: [],
-      webSearchProviders: [],
-      tools: [],
-      hooks: [],
-      typedHooks: [
-        {
-          pluginId: "legacy-plugin",
-          hookName: "before_agent_start",
-          handler: () => undefined,
-          source: "/tmp/legacy-plugin/index.ts",
-        },
-      ],
-      httpRoutes: [],
-      gatewayHandlers: {},
-      cliRegistrars: [],
-      services: [],
-      commands: [],
-      conversationBindingResolvedHandlers: [],
+    mocks.buildPluginCompatibilityWarnings.mockImplementation(({ workspaceDir }) => {
+      expect(activeWorkspace).toBe(workspaceDir);
+      return ["legacy-plugin is hook-only"];
     });
 
-    const noteSpy = vi.spyOn(noteModule, "note").mockImplementation(() => {});
-    try {
-      const { noteWorkspaceStatus } = await import("./doctor-workspace-status.js");
-      noteWorkspaceStatus({});
-
-      const compatibilityCalls = noteSpy.mock.calls.filter(
-        ([, title]) => title === "Plugin compatibility",
-      );
-      expect(compatibilityCalls).toHaveLength(1);
-      expect(String(compatibilityCalls[0]?.[0])).toContain(
-        "legacy-plugin still uses legacy before_agent_start",
-      );
-      expect(String(compatibilityCalls[0]?.[0])).toContain(
-        "legacy-plugin is hook-only. This remains a supported compatibility path",
-      );
-    } finally {
-      noteSpy.mockRestore();
-    }
+    const findings = collectWorkspaceStatusHealthFindings({}, { runWithPluginMetadataSnapshot });
+    expect(findings.map((finding) => finding.message)).toEqual([
+      'Agent "alpha": legacy-plugin is hook-only',
+      'Agent "alpha": board widget registration has invalid kind',
+      'Agent "beta": legacy-plugin is hook-only',
+    ]);
+    expect(findings.filter((finding) => finding.target === "broken-fixture")).toHaveLength(1);
+    expect(activeWorkspace).toBeUndefined();
   });
 
-  it("surfaces bundle plugin capabilities in the plugins note", async () => {
-    resolveDefaultAgentIdMock.mockReturnValue("default");
-    resolveAgentWorkspaceDirMock.mockReturnValue("/workspace");
-    buildWorkspaceSkillStatusMock.mockReturnValue({
-      skills: [],
+  it("omits healthy plugins but gives errored metadata records an actionable finding", () => {
+    mocks.listAgentIds.mockReturnValue(["default"]);
+    mocks.resolveAgentWorkspaceDir.mockReturnValue("/workspace");
+    mocks.buildPluginRegistrySnapshotReport.mockReturnValue({
+      workspaceDir: "/workspace",
+      ...createPluginLoadResult({
+        plugins: [
+          createPluginRecord({ id: "healthy" }),
+          createPluginRecord({ id: "broken", status: "error", error: "manifest invalid" }),
+        ],
+      }),
     });
-    loadOpenClawPluginsMock.mockReturnValue({
-      plugins: [
-        {
-          id: "claude-bundle",
-          name: "Claude Bundle",
-          source: "/tmp/claude-bundle",
-          origin: "workspace",
-          enabled: true,
-          status: "loaded",
-          format: "bundle",
-          bundleFormat: "claude",
-          bundleCapabilities: ["skills", "commands", "agents"],
-          toolNames: [],
-          hookNames: [],
-          channelIds: [],
-          providerIds: [],
-          speechProviderIds: [],
-          mediaUnderstandingProviderIds: [],
-          imageGenerationProviderIds: [],
-          webSearchProviderIds: [],
-          gatewayMethods: [],
-          cliCommands: [],
-          services: [],
-          commands: [],
-          httpRoutes: 0,
-          hookCount: 0,
-          configSchema: false,
-        },
-      ],
-      diagnostics: [],
-      channels: [],
-      channelSetups: [],
-      providers: [],
-      speechProviders: [],
-      mediaUnderstandingProviders: [],
-      imageGenerationProviders: [],
-      webSearchProviders: [],
-      tools: [],
-      hooks: [],
-      typedHooks: [],
-      httpRoutes: [],
-      gatewayHandlers: {},
-      cliRegistrars: [],
-      services: [],
-      commands: [],
-      conversationBindingResolvedHandlers: [],
-    });
-
-    const noteSpy = vi.spyOn(noteModule, "note").mockImplementation(() => {});
-    try {
-      const { noteWorkspaceStatus } = await import("./doctor-workspace-status.js");
-      noteWorkspaceStatus({});
-
-      const pluginCalls = noteSpy.mock.calls.filter(([, title]) => title === "Plugins");
-      expect(pluginCalls).toHaveLength(1);
-      const body = String(pluginCalls[0]?.[0]);
-      expect(body).toContain("Bundle plugins: 1");
-      expect(body).toContain("agents, commands, skills");
-    } finally {
-      noteSpy.mockRestore();
-    }
+    mocks.buildPluginCompatibilityWarnings.mockReturnValue([]);
+    expect(collectWorkspaceStatusHealthFindings({})).toEqual([
+      expect.objectContaining({
+        target: "broken",
+        category: "fix-now",
+        fixHint: expect.stringContaining("openclaw plugins inspect broken --runtime"),
+      }),
+    ]);
   });
 
-  it("omits plugin compatibility note when no legacy compatibility paths are present", async () => {
-    resolveDefaultAgentIdMock.mockReturnValue("default");
-    resolveAgentWorkspaceDirMock.mockReturnValue("/workspace");
-    buildWorkspaceSkillStatusMock.mockReturnValue({
-      skills: [],
+  it("collects plugin version drift as structured findings", async () => {
+    mocks.resolveAgentWorkspaceDir.mockReturnValue("/workspace");
+    mocks.buildPluginRegistrySnapshotReport.mockReturnValue({
+      workspaceDir: "/workspace",
+      ...createPluginLoadResult({ plugins: [] }),
     });
-    loadOpenClawPluginsMock.mockReturnValue({
-      plugins: [
-        {
-          id: "modern-plugin",
-          name: "Modern Plugin",
-          source: "/tmp/modern-plugin/index.ts",
-          origin: "workspace",
-          enabled: true,
-          status: "loaded",
-          toolNames: [],
-          hookNames: [],
-          channelIds: [],
-          providerIds: ["modern"],
-          speechProviderIds: [],
-          mediaUnderstandingProviderIds: [],
-          imageGenerationProviderIds: [],
-          webSearchProviderIds: [],
-          gatewayMethods: [],
-          cliCommands: [],
-          services: [],
-          commands: [],
-          httpRoutes: 0,
-          hookCount: 0,
-          configSchema: false,
+    mocks.buildPluginCompatibilityWarnings.mockReturnValue([]);
+
+    const findings = collectWorkspaceStatusHealthFindings(
+      {
+        plugins: { entries: { codex: { enabled: true } } },
+      },
+      {
+        pluginVersionReadiness: {
+          status: "resolved",
+          report: {
+            gatewayVersion: "2026.6.1",
+            drifts: [
+              {
+                pluginId: "codex",
+                installedVersion: "2026.5.30-beta.1",
+                gatewayVersion: "2026.6.1",
+                source: "npm",
+              },
+            ],
+          },
         },
-      ],
-      diagnostics: [],
-      channels: [],
-      channelSetups: [],
-      providers: [],
-      speechProviders: [],
-      mediaUnderstandingProviders: [],
-      imageGenerationProviders: [],
-      webSearchProviders: [],
-      tools: [],
-      hooks: [],
-      typedHooks: [],
-      httpRoutes: [],
-      gatewayHandlers: {},
-      cliRegistrars: [],
-      services: [],
-      commands: [],
-      conversationBindingResolvedHandlers: [],
+      },
+    );
+
+    expect(findings).toEqual([
+      expect.objectContaining({
+        checkId: "core/doctor/workspace-status",
+        severity: "warning",
+        path: "plugins.entries.codex",
+        target: "codex",
+        requirement: "plugin-version-drift",
+        message: expect.stringContaining("2026.5.30-beta.1"),
+        fixHint: expect.stringContaining("openclaw plugins update codex"),
+      }),
+    ]);
+  });
+
+  it("reports npm target lookup failure without an uninstallable fix hint", () => {
+    mocks.resolveAgentWorkspaceDir.mockReturnValue("/workspace");
+    mocks.buildPluginRegistrySnapshotReport.mockReturnValue({
+      workspaceDir: "/workspace",
+      ...createPluginLoadResult({ plugins: [] }),
     });
+    mocks.buildPluginCompatibilityWarnings.mockReturnValue([]);
 
-    const noteSpy = vi.spyOn(noteModule, "note").mockImplementation(() => {});
-    try {
-      const { noteWorkspaceStatus } = await import("./doctor-workspace-status.js");
-      noteWorkspaceStatus({});
+    const findings = collectWorkspaceStatusHealthFindings(
+      { plugins: { entries: { brave: { enabled: true } } } },
+      {
+        pluginVersionReadiness: {
+          status: "resolved",
+          report: {
+            gatewayVersion: "2026.7.1-2",
+            drifts: [
+              {
+                pluginId: "brave",
+                installedVersion: "2026.7.1-beta.2",
+                gatewayVersion: "2026.7.1-2",
+                source: "npm",
+                packageName: "@openclaw/brave-plugin",
+                spec: "@openclaw/brave-plugin@2026.7.1-beta.2",
+                targetResolution: {
+                  status: "unresolved",
+                  packageName: "@openclaw/brave-plugin",
+                  requestedTarget: "2026.7.1",
+                  error: "npm registry did not resolve @openclaw/brave-plugin@2026.7.1: HTTP 404",
+                },
+              },
+            ],
+          },
+        },
+      },
+    );
 
-      expect(noteSpy.mock.calls.some(([, title]) => title === "Plugin compatibility")).toBe(false);
-    } finally {
-      noteSpy.mockRestore();
-    }
+    expect(findings).toEqual([
+      expect.objectContaining({
+        severity: "warning",
+        message: expect.stringContaining("Repair target resolution failed"),
+        fixHint: expect.stringContaining("No install command generated"),
+      }),
+    ]);
+    expect(findings[0]?.fixHint).not.toContain("openclaw plugins update");
+    expect(findings[0]?.fixHint).not.toContain("openclaw gateway restart");
+  });
+
+  it("collects compatibility warnings and plugin diagnostics", async () => {
+    mocks.resolveAgentWorkspaceDir.mockReturnValue("/workspace");
+    mocks.buildPluginRegistrySnapshotReport.mockReturnValue({
+      workspaceDir: "/workspace",
+      ...createPluginLoadResult({
+        plugins: [],
+        diagnostics: [
+          {
+            level: "error",
+            pluginId: "broken-plugin",
+            message: "channel setup failed",
+            source: "/tmp/plugin.json",
+            code: "channel-setup-failure",
+          },
+          { level: "info", pluginId: "selected", message: "explicit plugin source selected" },
+        ],
+      }),
+    });
+    mocks.buildPluginCompatibilityWarnings.mockReturnValue(["legacy-plugin is hook-only"]);
+    const findings = collectWorkspaceStatusHealthFindings({});
+
+    expect(findings).toEqual([
+      expect.objectContaining({
+        checkId: "core/doctor/workspace-status",
+        severity: "warning",
+        path: "plugins",
+        requirement: "plugin-compatibility",
+        category: "recommended",
+        message: "legacy-plugin is hook-only",
+      }),
+      expect.objectContaining({
+        checkId: "core/doctor/workspace-status",
+        severity: "error",
+        path: "plugins.entries.broken-plugin",
+        target: "broken-plugin",
+        requirement: "channel-setup-failure",
+        category: "fix-now",
+        fixHint: expect.stringContaining("openclaw plugins inspect broken-plugin --runtime"),
+        source: "/tmp/plugin.json",
+        message: "channel setup failed",
+      }),
+      expect.objectContaining({
+        severity: "info",
+        target: "selected",
+        message: "explicit plugin source selected",
+      }),
+    ]);
+  });
+
+  it("labels workspace diagnostics for the affected secondary agent", () => {
+    mocks.buildPluginRegistrySnapshotReport.mockClear();
+    mocks.listAgentIds.mockReturnValue(["default", "secondary"]);
+    mocks.resolveAgentWorkspaceDir.mockImplementation((_cfg, agentId) => `/${agentId}`);
+    mocks.buildPluginRegistrySnapshotReport.mockImplementation(({ workspaceDir }) => ({
+      workspaceDir,
+      ...createPluginLoadResult({
+        plugins: [],
+        diagnostics:
+          workspaceDir === "/secondary"
+            ? [{ level: "error", pluginId: "broken", message: "load failed" }]
+            : [],
+      }),
+    }));
+    mocks.buildPluginCompatibilityWarnings.mockReturnValue([]);
+
+    const findings = collectWorkspaceStatusHealthFindings({});
+
+    expect(mocks.buildPluginRegistrySnapshotReport).toHaveBeenCalledTimes(2);
+    expect(findings).toEqual([
+      expect.objectContaining({
+        message: 'Agent "secondary": load failed',
+        path: "plugins.entries.broken",
+      }),
+    ]);
   });
 });

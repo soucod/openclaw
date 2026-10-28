@@ -5,9 +5,9 @@ import { parseByteSize } from "../cli/parse-bytes.js";
  * Accepts non-negative numbers or strings like "2mb".
  */
 export function parseNonNegativeByteSize(value: unknown): number | null {
-  if (typeof value === "number" && Number.isFinite(value)) {
+  if (typeof value === "number") {
     const int = Math.floor(value);
-    return int >= 0 ? int : null;
+    return Number.isSafeInteger(int) && int >= 0 ? int : null;
   }
   if (typeof value === "string") {
     const trimmed = value.trim();
@@ -15,7 +15,8 @@ export function parseNonNegativeByteSize(value: unknown): number | null {
       return null;
     }
     try {
-      const bytes = parseByteSize(trimmed, { defaultUnit: "b" });
+      // Bare numbers in config strings are bytes, matching numeric config values.
+      const bytes = parseByteSize(trimmed);
       return bytes >= 0 ? bytes : null;
     } catch {
       return null;
@@ -24,6 +25,7 @@ export function parseNonNegativeByteSize(value: unknown): number | null {
   return null;
 }
 
+/** Validates byte-size strings accepted by agent default byte-threshold config. */
 export function isValidNonNegativeByteSizeString(value: string): boolean {
   return parseNonNegativeByteSize(value) !== null;
 }

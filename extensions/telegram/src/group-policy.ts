@@ -1,70 +1,63 @@
 import type { ChannelGroupContext } from "openclaw/plugin-sdk/channel-contract";
 import {
+  buildChannelGroupsScopeTree,
   resolveChannelGroupRequireMention,
-  resolveChannelGroupToolsPolicy,
+  resolveScopeRequireMention,
+  resolveScopeToolsPolicy,
   type GroupToolPolicyConfig,
+  type ScopeTree,
 } from "openclaw/plugin-sdk/channel-policy";
+import { resolveTelegramAccountConfig } from "./account-config.js";
 
 function parseTelegramGroupId(value?: string | null) {
   const raw = value?.trim() ?? "";
   if (!raw) {
     return { chatId: undefined, topicId: undefined };
   }
-  const parts = raw.split(":").filter(Boolean);
+  const [chatId, second, third] = raw.split(":").filter(Boolean);
+  const topicId = second === "topic" ? third : second;
   if (
-    parts.length >= 3 &&
-    parts[1] === "topic" &&
-    /^-?\d+$/.test(parts[0]) &&
-    /^\d+$/.test(parts[2])
+    chatId !== undefined &&
+    /^-?\d+$/.test(chatId) &&
+    topicId !== undefined &&
+    /^\d+$/.test(topicId)
   ) {
-    return { chatId: parts[0], topicId: parts[2] };
-  }
-  if (parts.length >= 2 && /^-?\d+$/.test(parts[0]) && /^\d+$/.test(parts[1])) {
-    return { chatId: parts[0], topicId: parts[1] };
+    return { chatId, topicId };
   }
   return { chatId: raw, topicId: undefined };
-}
-
-function resolveTelegramRequireMention(params: {
-  cfg: ChannelGroupContext["cfg"];
-  chatId?: string;
-  topicId?: string;
-}): boolean | undefined {
-  const { cfg, chatId, topicId } = params;
-  if (!chatId) {
-    return undefined;
-  }
-  const groupConfig = cfg.channels?.telegram?.groups?.[chatId];
-  const groupDefault = cfg.channels?.telegram?.groups?.["*"];
-  const topicConfig = topicId && groupConfig?.topics ? groupConfig.topics[topicId] : undefined;
-  const defaultTopicConfig =
-    topicId && groupDefault?.topics ? groupDefault.topics[topicId] : undefined;
-  if (typeof topicConfig?.requireMention === "boolean") {
-    return topicConfig.requireMention;
-  }
-  if (typeof defaultTopicConfig?.requireMention === "boolean") {
-    return defaultTopicConfig.requireMention;
-  }
-  if (typeof groupConfig?.requireMention === "boolean") {
-    return groupConfig.requireMention;
-  }
-  if (typeof groupDefault?.requireMention === "boolean") {
-    return groupDefault.requireMention;
-  }
-  return undefined;
 }
 
 export function resolveTelegramGroupRequireMention(
   params: ChannelGroupContext,
 ): boolean | undefined {
   const { chatId, topicId } = parseTelegramGroupId(params.groupId);
-  const requireMention = resolveTelegramRequireMention({
-    cfg: params.cfg,
-    chatId,
-    topicId,
-  });
-  if (typeof requireMention === "boolean") {
-    return requireMention;
+  if (chatId) {
+    const groups =
+      (params.accountId
+        ? resolveTelegramAccountConfig(params.cfg, params.accountId)?.groups
+        : undefined) ?? params.cfg.channels?.telegram?.groups;
+    const groupConfig = groups?.[chatId];
+    const groupDefault = groups?.["*"];
+    const entries = [groupDefault, groupConfig];
+    if (topicId) {
+      // Broad to narrow; wildcard-group topics outrank exact-group scalar policy.
+      entries.push(
+        groupDefault?.topics?.["*"],
+        groupDefault?.topics?.[topicId],
+        groupConfig?.topics?.["*"],
+        groupConfig?.topics?.[topicId],
+      );
+    }
+    const scopes: ScopeTree["scopes"] = {};
+    for (const [index, entry] of entries.entries()) {
+      if (entry) {
+        scopes[index] = { requireMention: entry.requireMention };
+      }
+    }
+    const path = Object.keys(scopes);
+    if (path.some((key) => typeof scopes[key]?.requireMention === "boolean")) {
+      return resolveScopeRequireMention({ tree: { scopes }, path });
+    }
   }
   return resolveChannelGroupRequireMention({
     cfg: params.cfg,
@@ -78,14 +71,15 @@ export function resolveTelegramGroupToolPolicy(
   params: ChannelGroupContext,
 ): GroupToolPolicyConfig | undefined {
   const { chatId } = parseTelegramGroupId(params.groupId);
-  return resolveChannelGroupToolsPolicy({
-    cfg: params.cfg,
-    channel: "telegram",
-    groupId: chatId ?? params.groupId,
-    accountId: params.accountId,
+  const groupId = chatId ?? params.groupId?.trim();
+  return resolveScopeToolsPolicy({
+    tree: buildChannelGroupsScopeTree(params.cfg, "telegram", params.accountId),
+    path: groupId ? [groupId] : [],
+    senderPolicyMode: params.senderPolicyMode,
     senderId: params.senderId,
     senderName: params.senderName,
     senderUsername: params.senderUsername,
     senderE164: params.senderE164,
+    messageProvider: "telegram",
   });
 }

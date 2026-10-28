@@ -1,127 +1,152 @@
+import { normalizeAgentId } from "@openclaw/normalization-core/agent-id";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { z } from "zod";
+import { isBlockedObjectKey } from "../infra/prototype-keys.js";
 import { AgentDefaultsSchema } from "./zod-schema.agent-defaults.js";
 import { AgentEntrySchema } from "./zod-schema.agent-runtime.js";
-import { TranscribeAudioSchema } from "./zod-schema.core.js";
+
+export { BroadcastSchema } from "./zod-schema.messages.js";
+
+const AgentEntryConfigSchema = z.preprocess(
+  (value, ctx) => {
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      for (const key of Object.getOwnPropertyNames(value)) {
+        if (!isBlockedObjectKey(key)) {
+          continue;
+        }
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [key],
+          message: "agent entries must not contain blocked object keys",
+        });
+        return z.NEVER;
+      }
+    }
+    return value;
+  },
+  AgentEntrySchema.omit({ id: true }).extend({ default: z.boolean().optional() }),
+);
 
 export const AgentsSchema = z
-  .object({
+  .strictObject({
+    ownership: z.literal("explicit").optional(),
     defaults: z.lazy(() => AgentDefaultsSchema).optional(),
-    list: z.array(AgentEntrySchema).optional(),
+    entries: z
+      .record(
+        z.string().regex(/^[a-z0-9_][a-z0-9_-]{0,63}$/i, "Invalid agent id"),
+        AgentEntryConfigSchema,
+      )
+      .optional(),
   })
-  .strict()
+  .superRefine((value, ctx) => {
+    const entries = Object.entries(value.entries ?? {});
+    if (entries.length === 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["entries"],
+        message: "agents.entries must contain at least one configured agent",
+      });
+    }
+    const firstKeyByAgentId = new Map<string, string>();
+    for (const [key] of entries) {
+      const agentId = normalizeAgentId(key);
+      const firstKey = firstKeyByAgentId.get(agentId);
+      if (!firstKey) {
+        firstKeyByAgentId.set(agentId, key);
+        continue;
+      }
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["entries", key],
+        message: `agents.entries keys "${firstKey}" and "${key}" resolve to the same agent id "${agentId}"; rename one key so each agent has a unique id`,
+      });
+    }
+    const marked = entries.filter(([, entry]) => entry.default === true);
+    if (marked.length > 1) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["entries"],
+        message: `agents.entries must contain at most one default=true entry (found ${marked.length})`,
+      });
+    }
+    if (value.ownership === "explicit" && marked.length > 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["ownership"],
+        message: "agents.ownership=explicit cannot be combined with a legacy default=true marker",
+      });
+    }
+    if (entries.length > 1 && marked.length === 0 && value.ownership !== "explicit") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["ownership"],
+        message:
+          'multi-agent rosters require agents.ownership="explicit" or one legacy default=true marker; add agents.ownership="explicit" or run openclaw doctor',
+      });
+    }
+  })
   .optional();
 
-const BindingMatchSchema = z
-  .object({
-    channel: z.string(),
-    accountId: z.string().optional(),
-    peer: z
-      .object({
-        kind: z.union([
-          z.literal("direct"),
-          z.literal("group"),
-          z.literal("channel"),
-          /** @deprecated Use `direct` instead. Kept for backward compatibility. */
-          z.literal("dm"),
-        ]),
-        id: z.string(),
-      })
-      .strict()
-      .optional(),
-    guildId: z.string().optional(),
-    teamId: z.string().optional(),
-    roles: z.array(z.string()).optional(),
-  })
-  .strict();
+const BindingMatchSchema = z.strictObject({
+  channel: z.string(),
+  /**
+   * Channel account to match.
+   * - Omitted/empty: matches only the channel default account.
+   * - "*": matches every account on the channel.
+   * - Any other string: matches that specific account id.
+   */
+  accountId: z.string().optional(),
+  peer: z
+    .strictObject({
+      kind: z.union([z.literal("direct"), z.literal("group"), z.literal("channel")]),
+      id: z.string(),
+    })
+    .optional(),
+  guildId: z.string().optional(),
+  teamId: z.string().optional(),
+  /** Discord role IDs used for role-based routing. */
+  roles: z.array(z.string()).optional(),
+});
 
-const RouteBindingSchema = z
-  .object({
-    type: z.literal("route").optional(),
-    agentId: z.string(),
-    comment: z.string().optional(),
-    match: BindingMatchSchema,
-  })
-  .strict();
+const BindingSessionSchema = z.strictObject({
+  /** Optional session scoping override for conversations matched by this binding. */
+  dmScope: z.enum(["main", "per-peer", "per-channel-peer", "per-account-channel-peer"]).optional(),
+  groupScope: z.enum(["main", "per-group"]).optional(),
+});
+
+const RouteBindingSchema = z.strictObject({
+  /** Missing type is interpreted as route for backward compatibility. */
+  type: z.literal("route").optional(),
+  agentId: z.string(),
+  comment: z.string().optional(),
+  match: BindingMatchSchema,
+  session: BindingSessionSchema.optional(),
+});
 
 const AcpBindingSchema = z
-  .object({
+  .strictObject({
     type: z.literal("acp"),
     agentId: z.string(),
     comment: z.string().optional(),
     match: BindingMatchSchema,
     acp: z
-      .object({
+      .strictObject({
         mode: z.enum(["persistent", "oneshot"]).optional(),
         label: z.string().optional(),
         cwd: z.string().optional(),
         backend: z.string().optional(),
       })
-      .strict()
       .optional(),
   })
-  .strict()
   .superRefine((value, ctx) => {
-    const peerId = value.match.peer?.id?.trim() ?? "";
+    const peerId = normalizeOptionalString(value.match.peer?.id) ?? "";
     if (!peerId) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ["match", "peer"],
         message: "ACP bindings require match.peer.id to target a concrete conversation.",
       });
-      return;
-    }
-    const channel = value.match.channel.trim().toLowerCase();
-    if (channel !== "discord" && channel !== "telegram" && channel !== "feishu") {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["match", "channel"],
-        message:
-          'ACP bindings currently support only "discord", "telegram", and "feishu" channels.',
-      });
-      return;
-    }
-    if (channel === "telegram" && !/^-\d+:topic:\d+$/.test(peerId)) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["match", "peer", "id"],
-        message:
-          "Telegram ACP bindings require canonical topic IDs in the form -1001234567890:topic:42.",
-      });
-    }
-    if (channel === "feishu") {
-      const peerKind = value.match.peer?.kind;
-      const isDirectId =
-        (peerKind === "direct" || peerKind === "dm") &&
-        /^[^:]+$/.test(peerId) &&
-        !peerId.startsWith("oc_") &&
-        !peerId.startsWith("on_");
-      const isTopicId =
-        peerKind === "group" && /^oc_[^:]+:topic:[^:]+(?::sender:ou_[^:]+)?$/.test(peerId);
-      if (!isDirectId && !isTopicId) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: ["match", "peer", "id"],
-          message:
-            "Feishu ACP bindings require direct peer IDs for DMs or topic IDs in the form oc_group:topic:om_root[:sender:ou_xxx].",
-        });
-      }
     }
   });
 
 export const BindingsSchema = z.array(z.union([RouteBindingSchema, AcpBindingSchema])).optional();
-
-export const BroadcastStrategySchema = z.enum(["parallel", "sequential"]);
-
-export const BroadcastSchema = z
-  .object({
-    strategy: BroadcastStrategySchema.optional(),
-  })
-  .catchall(z.array(z.string()))
-  .optional();
-
-export const AudioSchema = z
-  .object({
-    transcription: TranscribeAudioSchema,
-  })
-  .strict()
-  .optional();

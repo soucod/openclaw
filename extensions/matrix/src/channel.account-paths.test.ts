@@ -1,34 +1,18 @@
+import { PAIRING_APPROVED_MESSAGE } from "openclaw/plugin-sdk/channel-status";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { matrixPlugin } from "./channel.js";
 
 const sendMessageMatrixMock = vi.hoisted(() => vi.fn());
 const probeMatrixMock = vi.hoisted(() => vi.fn());
 const resolveMatrixAuthMock = vi.hoisted(() => vi.fn());
 
-vi.mock("./matrix/send.js", async () => {
-  const actual = await vi.importActual<typeof import("./matrix/send.js")>("./matrix/send.js");
-  return {
-    ...actual,
-    sendMessageMatrix: (...args: unknown[]) => sendMessageMatrixMock(...args),
-  };
-});
-
-vi.mock("./matrix/probe.js", async () => {
-  const actual = await vi.importActual<typeof import("./matrix/probe.js")>("./matrix/probe.js");
-  return {
-    ...actual,
-    probeMatrix: (...args: unknown[]) => probeMatrixMock(...args),
-  };
-});
-
-vi.mock("./matrix/client.js", async () => {
-  const actual = await vi.importActual<typeof import("./matrix/client.js")>("./matrix/client.js");
-  return {
-    ...actual,
-    resolveMatrixAuth: (...args: unknown[]) => resolveMatrixAuthMock(...args),
-  };
-});
-
-const { matrixPlugin } = await import("./channel.js");
+vi.mock("./channel.runtime.js", () => ({
+  matrixChannelRuntime: {
+    sendMessageMatrix: sendMessageMatrixMock,
+    probeMatrix: probeMatrixMock,
+    resolveMatrixAuth: resolveMatrixAuthMock,
+  },
+}));
 
 describe("matrix account path propagation", () => {
   beforeEach(() => {
@@ -49,11 +33,16 @@ describe("matrix account path propagation", () => {
       homeserver: "https://matrix.example.org",
       userId: "@poe:example.org",
       accessToken: "poe-token",
+      deviceId: "POEDEVICE",
     });
   });
 
   it("forwards accountId when notifying pairing approval", async () => {
-    await matrixPlugin.pairing!.notifyApproval?.({
+    expect(matrixPlugin.pairing?.normalizeAllowEntry?.("  matrix:@user:example.org  ")).toBe(
+      "@user:example.org",
+    );
+
+    await matrixPlugin.pairing!.notifyApproval!({
       cfg: {},
       id: "@user:example.org",
       accountId: "poe",
@@ -61,18 +50,21 @@ describe("matrix account path propagation", () => {
 
     expect(sendMessageMatrixMock).toHaveBeenCalledWith(
       "user:@user:example.org",
-      expect.any(String),
-      { accountId: "poe" },
+      PAIRING_APPROVED_MESSAGE,
+      { cfg: {}, accountId: "poe" },
     );
   });
 
-  it("forwards accountId to matrix probes", async () => {
-    await matrixPlugin.status!.probeAccount?.({
-      cfg: {} as never,
+  it("forwards accountId and deviceId to matrix probes", async () => {
+    await matrixPlugin.status!.probeAccount!({
+      cfg: {},
       timeoutMs: 500,
       account: {
         accountId: "poe",
-      } as never,
+        enabled: true,
+        configured: true,
+        config: {},
+      },
     });
 
     expect(resolveMatrixAuthMock).toHaveBeenCalledWith({
@@ -83,6 +75,7 @@ describe("matrix account path propagation", () => {
       homeserver: "https://matrix.example.org",
       accessToken: "poe-token",
       userId: "@poe:example.org",
+      deviceId: "POEDEVICE",
       timeoutMs: 500,
       accountId: "poe",
     });

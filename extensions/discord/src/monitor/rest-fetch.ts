@@ -1,27 +1,76 @@
-import { wrapFetchWithAbortSignal } from "openclaw/plugin-sdk/infra-runtime";
+import { randomUUID } from "node:crypto";
+import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
+import {
+  createHttp1Agent,
+  createHttp1EnvHttpProxyAgent,
+  createHttp1ProxyAgent,
+  resolveEnvHttpProxyAgentOptions,
+  wrapFetchWithAbortSignal,
+} from "openclaw/plugin-sdk/fetch-runtime";
+import {
+  captureHttpExchangeAsync,
+  resolveEffectiveDebugProxyUrl,
+} from "openclaw/plugin-sdk/proxy-capture";
+import { resolveRequestUrl } from "openclaw/plugin-sdk/request-url";
 import { danger } from "openclaw/plugin-sdk/runtime-env";
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
-import { ProxyAgent, fetch as undiciFetch } from "undici";
+import { fetchWithRuntimeDispatcher } from "openclaw/plugin-sdk/runtime-fetch";
+import type { Dispatcher } from "undici";
+import { createDiscordDnsLookup } from "../network-config.js";
+import { withValidatedDiscordProxy } from "../proxy-fetch.js";
+
+const discordDnsLookup = createDiscordDnsLookup();
+
+function createDiscordRestFetchWithDispatcher(dispatcher: Dispatcher): typeof fetch {
+  return wrapFetchWithAbortSignal(((input: RequestInfo | URL, init?: RequestInit) =>
+    fetchWithRuntimeDispatcher(input, { ...init, dispatcher }).then((response) => {
+      // Finalization retains capture failures; observe the Promise returned by the SDK view.
+      void captureHttpExchangeAsync({
+        url: resolveRequestUrl(input),
+        method: init?.method ?? "GET",
+        requestHeaders: init?.headers as Headers | Record<string, string> | undefined,
+        requestBody: (init as RequestInit & { body?: BodyInit | null })?.body ?? null,
+        response,
+        flowId: randomUUID(),
+        meta: { subsystem: "discord-rest" },
+      }).catch(() => {});
+      return response;
+    })) as typeof fetch);
+}
 
 export function resolveDiscordRestFetch(
   proxyUrl: string | undefined,
   runtime: RuntimeEnv,
 ): typeof fetch {
-  const proxy = proxyUrl?.trim();
-  if (!proxy) {
-    return fetch;
-  }
-  try {
-    const agent = new ProxyAgent(proxy);
-    const fetcher = ((input: RequestInfo | URL, init?: RequestInit) =>
-      undiciFetch(input as string | URL, {
-        ...(init as Record<string, unknown>),
-        dispatcher: agent,
-      }) as unknown as Promise<Response>) as typeof fetch;
+  const effectiveProxyUrl = resolveEffectiveDebugProxyUrl(proxyUrl);
+  if (effectiveProxyUrl) {
+    const fetcher = withValidatedDiscordProxy(effectiveProxyUrl, runtime, (proxy) =>
+      createDiscordRestFetchWithDispatcher(createHttp1ProxyAgent({ uri: proxy })),
+    );
+    if (!fetcher) {
+      return fetch;
+    }
     runtime.log?.("discord: rest proxy enabled");
-    return wrapFetchWithAbortSignal(fetcher);
-  } catch (err) {
-    runtime.error?.(danger(`discord: invalid rest proxy: ${String(err)}`));
-    return fetch;
+    return fetcher;
   }
+
+  let dispatcher: Dispatcher | undefined;
+  const envProxyOptions = resolveEnvHttpProxyAgentOptions();
+  if (envProxyOptions) {
+    try {
+      dispatcher = createHttp1EnvHttpProxyAgent({
+        ...envProxyOptions,
+        connect: { lookup: discordDnsLookup },
+      });
+    } catch (err) {
+      runtime.error?.(
+        danger(
+          `discord: env proxy unavailable for REST fetch; using direct dispatcher: ${formatErrorMessage(err)}`,
+        ),
+      );
+    }
+  }
+  return createDiscordRestFetchWithDispatcher(
+    dispatcher ?? createHttp1Agent({ connect: { lookup: discordDnsLookup } }),
+  );
 }

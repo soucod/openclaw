@@ -1,115 +1,65 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { PluginCompatibilityNotice } from "../plugins/status.js";
+import { beforeEach, expect, it, vi } from "vitest";
+import { withConsoleLogsRoutedToStderrForJson } from "../cli/json-output-mode.js";
+import { requireValidConfig, requireValidConfigForWrite } from "./config-validation.js";
+import * as fixture from "./test-runtime-config-helpers.js";
 
-const readConfigFileSnapshot = vi.fn();
-const buildPluginCompatibilityNotices = vi.fn<(_params?: unknown) => PluginCompatibilityNotice[]>(
-  () => [],
-);
-
-vi.mock("../config/config.js", () => ({
-  readConfigFileSnapshot,
+const reads = vi.hoisted(() => ({
+  readConfigFileSnapshot: vi.fn(),
+  readConfigFileSnapshotForWrite: vi.fn(),
 }));
 
-vi.mock("../plugins/status.js", () => ({
-  buildPluginCompatibilityNotices,
-  formatPluginCompatibilityNotice: (notice: { pluginId: string; message: string }) =>
-    `${notice.pluginId} ${notice.message}`,
-}));
+// mock-isolation: Validate synthetic config snapshots without reading operator config files.
+vi.mock("../config/config.js", () => reads);
 
-describe("requireValidConfigSnapshot", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
+const writeSnapshot = {
+  snapshot: fixture.baseConfigSnapshot,
+  writeOptions: {
+    expectedConfigPath: fixture.baseConfigSnapshot.path,
+    envSnapshotForRestore: { CONFIG_READ_TOKEN: "at-read" },
+  },
+};
+const runtime = fixture.createTestRuntime();
+beforeEach(() => vi.clearAllMocks());
 
-  it("returns config without emitting compatibility advice by default", async () => {
-    readConfigFileSnapshot.mockResolvedValue({
-      exists: true,
-      valid: true,
-      config: { plugins: {} },
-      issues: [],
-    });
-    buildPluginCompatibilityNotices.mockReturnValue([
-      {
-        pluginId: "legacy-plugin",
-        code: "legacy-before-agent-start",
-        severity: "warn",
-        message:
-          "still uses legacy before_agent_start; keep regression coverage on this plugin, and prefer before_model_resolve/before_prompt_build for new work.",
-      },
-    ]);
-    const runtime = {
-      log: vi.fn(),
-      error: vi.fn(),
-      exit: vi.fn(),
-    };
+it("retains native write ownership after an await in JSON mode", async () => {
+  reads.readConfigFileSnapshotForWrite.mockResolvedValue(writeSnapshot);
+  const result = await withConsoleLogsRoutedToStderrForJson(
+    ["node", "openclaw", "agents", "add", "--json"],
+    () => requireValidConfigForWrite(runtime),
+    { restoreChanges: true },
+  );
+  await Promise.resolve();
+  expect(result).toBe(writeSnapshot);
+  expect(result?.writeOptions.envSnapshotForRestore).toEqual({ CONFIG_READ_TOKEN: "at-read" });
+  expect(runtime.error).not.toHaveBeenCalled();
+  expect(runtime.exit).not.toHaveBeenCalled();
+});
 
-    const { requireValidConfigSnapshot } = await import("./config-validation.js");
-    const config = await requireValidConfigSnapshot(runtime);
+it("forwards config read options", async () => {
+  const options = { skipPluginValidation: true, observe: false };
+  reads.readConfigFileSnapshot.mockResolvedValue(fixture.baseConfigSnapshot);
+  expect(await requireValidConfig(runtime, options)).toBe(fixture.baseConfigSnapshot.config);
+  expect(reads.readConfigFileSnapshot).toHaveBeenCalledWith(options);
+});
 
-    expect(config).toEqual({ plugins: {} });
-    expect(runtime.error).not.toHaveBeenCalled();
-    expect(runtime.exit).not.toHaveBeenCalled();
-    expect(buildPluginCompatibilityNotices).not.toHaveBeenCalled();
-    expect(runtime.log).not.toHaveBeenCalled();
-  });
-
-  it("emits a non-blocking compatibility advisory when explicitly requested", async () => {
-    readConfigFileSnapshot.mockResolvedValue({
-      exists: true,
-      valid: true,
-      config: { plugins: {} },
-      issues: [],
-    });
-    buildPluginCompatibilityNotices.mockReturnValue([
-      {
-        pluginId: "legacy-plugin",
-        code: "legacy-before-agent-start",
-        severity: "warn",
-        message:
-          "still uses legacy before_agent_start; keep regression coverage on this plugin, and prefer before_model_resolve/before_prompt_build for new work.",
-      },
-    ]);
-    const runtime = {
-      log: vi.fn(),
-      error: vi.fn(),
-      exit: vi.fn(),
-    };
-
-    const { requireValidConfigSnapshot } = await import("./config-validation.js");
-    const config = await requireValidConfigSnapshot(runtime, {
-      includeCompatibilityAdvisory: true,
-    });
-
-    expect(config).toEqual({ plugins: {} });
-    expect(runtime.error).not.toHaveBeenCalled();
-    expect(runtime.exit).not.toHaveBeenCalled();
-    expect(String(runtime.log.mock.calls[0]?.[0])).toContain("Plugin compatibility: 1 notice.");
-    expect(String(runtime.log.mock.calls[0]?.[0])).toContain(
-      "legacy-plugin still uses legacy before_agent_start",
-    );
-  });
-
-  it("blocks invalid config before emitting compatibility advice", async () => {
-    readConfigFileSnapshot.mockResolvedValue({
-      exists: true,
-      valid: false,
-      config: {},
-      issues: [{ path: "routing.allowFrom", message: "Legacy key" }],
-    });
-    const runtime = {
-      log: vi.fn(),
-      error: vi.fn(),
-      exit: vi.fn(),
-    };
-
-    const { requireValidConfigSnapshot } = await import("./config-validation.js");
-    const config = await requireValidConfigSnapshot(runtime, {
-      includeCompatibilityAdvisory: true,
-    });
-
-    expect(config).toBeNull();
-    expect(runtime.error).toHaveBeenCalled();
-    expect(runtime.exit).toHaveBeenCalledWith(1);
-    expect(runtime.log).not.toHaveBeenCalled();
-  });
+it.each([
+  [true, "Fix: openclaw doctor --fix"],
+  [
+    false,
+    "Fix: This is a plugin packaging issue, not a local config problem.\nUpdate or reinstall the plugin after the publisher ships compiled JavaScript, or disable/uninstall the plugin until then.",
+  ],
+] as const)("rejects invalid config (write: %s)", async (write, hint) => {
+  const issues = write
+    ? { issues: [{ path: "mode", message: "Invalid" }] }
+    : fixture.createPluginPackagingConfigIssues();
+  const snapshot = { ...fixture.baseConfigSnapshot, sourceConfig: {}, valid: false, ...issues };
+  const read = write ? reads.readConfigFileSnapshotForWrite : reads.readConfigFileSnapshot;
+  read.mockResolvedValue(write ? { ...writeSnapshot, snapshot } : snapshot);
+  expect(await (write ? requireValidConfigForWrite : requireValidConfig)(runtime)).toBeNull();
+  expect(runtime.exit).toHaveBeenCalledWith(1);
+  expect(runtime.error).toHaveBeenCalledWith(expect.stringContaining(issues.issues[0]!.message));
+  const advice = runtime.error.mock.calls.filter(
+    ([line]) => typeof line === "string" && line.startsWith("Fix:"),
+  );
+  expect(advice).toEqual([[hint]]);
 });

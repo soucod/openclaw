@@ -17,11 +17,16 @@ export function formatRuntimeStatusWithDetails({
     fullDetails.push(`pid ${pid}`);
   }
   const normalizedState = state?.trim();
-  if (normalizedState && normalizedState.toLowerCase() !== runtimeStatus.toLowerCase()) {
+  if (
+    normalizedState &&
+    // State often mirrors status from different process managers; suppressing
+    // case-only duplicates keeps restart/status output readable.
+    normalizedState.toLowerCase() !== runtimeStatus.toLowerCase()
+  ) {
     fullDetails.push(`state ${normalizedState}`);
   }
   for (const detail of details) {
-    const normalizedDetail = detail.trim();
+    const normalizedDetail = detail.replace(/\s+/g, " ").trim();
     if (normalizedDetail) {
       fullDetails.push(normalizedDetail);
     }

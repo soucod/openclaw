@@ -1,155 +1,220 @@
-import { beforeAll, describe, expect, it, vi } from "vitest";
+import { Api } from "grammy";
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { asTelegramClientFetch } from "./client-fetch.js";
 
 const mocks = vi.hoisted(() => ({
   sleepWithAbort: vi.fn().mockResolvedValue(undefined),
 }));
 
-// Mock the runtime-exported backoff sleep that the handler actually imports.
-vi.mock("openclaw/plugin-sdk/infra-runtime", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("openclaw/plugin-sdk/infra-runtime")>();
-  return {
-    ...actual,
-    sleepWithAbort: mocks.sleepWithAbort,
-  };
-});
+vi.mock("openclaw/plugin-sdk/runtime-env", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("openclaw/plugin-sdk/runtime-env")>()),
+  computeBackoff: vi.fn((_policy, attempt: number) => attempt * 1000),
+  sleepWithAbort: mocks.sleepWithAbort,
+}));
 
-let createTelegramSendChatActionHandler: typeof import("./sendchataction-401-backoff.js").createTelegramSendChatActionHandler;
+type Handler = import("./sendchataction-401-backoff.js").TelegramSendChatActionHandler;
+let createHandler: typeof import("./sendchataction-401-backoff.js").createTelegramSendChatActionHandler;
 
 describe("createTelegramSendChatActionHandler", () => {
+  let now: number;
+  beforeEach(() => {
+    now = 1000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+  });
+  afterEach(() => vi.restoreAllMocks());
+  const setup = (
+    sendChatActionFn: (...args: Parameters<Handler["sendChatAction"]>) => Promise<true>,
+  ) => {
+    const logger = vi.fn();
+    const handler = createHandler({ logger });
+    return {
+      handler,
+      logger,
+      send: (chatId = 123, threadId?: number) => {
+        const threadParams = threadId === undefined ? undefined : { message_thread_id: threadId };
+        return handler.sendChatAction(chatId, "typing", threadParams, async () => {
+          const api = new Api("123:backoff", {
+            fetch: asTelegramClientFetch(
+              async () => new Response(JSON.stringify({ ok: true, result: true })),
+            ),
+          });
+          api.config.use(async (prev, method, payload, signal) => {
+            await sendChatActionFn(chatId, "typing", threadParams);
+            return prev(method, payload, signal);
+          });
+          api.config.use(handler.apiTransformer);
+          return api.sendChatAction(chatId, "typing", threadParams);
+        });
+      },
+    };
+  };
   beforeAll(async () => {
-    vi.resetModules();
-    ({ createTelegramSendChatActionHandler } = await import("./sendchataction-401-backoff.js"));
+    ({ createTelegramSendChatActionHandler: createHandler } =
+      await import("./sendchataction-401-backoff.js"));
   });
 
   const make401Error = () => new Error("401 Unauthorized");
-  const make500Error = () => new Error("500 Internal Server Error");
+  const makeNetworkError = () =>
+    Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" });
+  const makeTelegramError = (
+    message: string,
+    error_code: number,
+    parameters?: { retry_after?: number },
+  ) => Object.assign(new Error(message), { error_code, parameters });
 
-  it("calls sendChatActionFn on success", async () => {
-    const fn = vi.fn().mockResolvedValue(true);
-    const logger = vi.fn();
-    const handler = createTelegramSendChatActionHandler({
-      sendChatActionFn: fn,
-      logger,
-    });
+  it("coalesces pending actions within topic 1", async () => {
+    const pending = createDeferred<true>();
+    const fn = vi.fn(() => pending.promise);
+    const { send } = setup(fn);
 
-    await handler.sendChatAction(123, "typing");
-    expect(fn).toHaveBeenCalledWith(123, "typing", undefined);
-    expect(handler.isSuspended()).toBe(false);
+    const first = send(-100, 1);
+    await send(-100, 1);
+
+    expect(fn).toHaveBeenCalledTimes(1);
+    expect(fn).toHaveBeenCalledWith(-100, "typing", { message_thread_id: 1 });
+
+    pending.resolve(true);
+    await first;
   });
 
-  it("applies exponential backoff on consecutive 401 errors", async () => {
-    const fn = vi.fn().mockRejectedValue(make401Error());
-    const logger = vi.fn();
-    const handler = createTelegramSendChatActionHandler({
-      sendChatActionFn: fn,
-      logger,
-      maxConsecutive401: 5,
-    });
+  it("keeps root-chat actions independent from another topic", async () => {
+    const pending = createDeferred<true>();
+    const fn = vi.fn().mockReturnValueOnce(pending.promise).mockResolvedValue(true);
+    const { send } = setup(fn);
 
-    // First call fails with 401
-    await expect(handler.sendChatAction(123, "typing")).rejects.toThrow("401");
-    expect(handler.isSuspended()).toBe(false);
+    const first = send(-100);
+    await send(-100, 2);
 
-    // Second call should mention backoff in logs
-    await expect(handler.sendChatAction(123, "typing")).rejects.toThrow("401");
-    expect(logger).toHaveBeenCalledWith(expect.stringContaining("backoff"));
+    expect(fn).toHaveBeenCalledTimes(2);
+    expect(fn).toHaveBeenNthCalledWith(1, -100, "typing", undefined);
+    expect(fn).toHaveBeenNthCalledWith(2, -100, "typing", { message_thread_id: 2 });
+    pending.resolve(true);
+    await first;
+
+    now = 4999;
+    await send(-100);
+    await send(-100, 2);
+    expect(fn).toHaveBeenCalledTimes(2);
+
+    now = 5000;
+    await send(-100);
+    await send(-100, 2);
+    expect(fn).toHaveBeenCalledTimes(4);
   });
 
-  it("suspends after maxConsecutive401 failures", async () => {
-    const fn = vi.fn().mockRejectedValue(make401Error());
-    const logger = vi.fn();
-    const handler = createTelegramSendChatActionHandler({
-      sendChatActionFn: fn,
-      logger,
-      maxConsecutive401: 3,
+  it.each([
+    ["network code", makeNetworkError(), false],
+    ["network snippet", new Error("socket hang up"), false],
+    ["same-chat keepalive", makeTelegramError("Bad Gateway", 502), true],
+  ] as const)(
+    "cools down %s until its retry/coalescing window expires",
+    async (_name, error, sameChat) => {
+      const chatId = sameChat ? -100 : 123;
+      const cooldown = 4000;
+      now = sameChat ? 0 : 10_000;
+      const fn = vi.fn().mockRejectedValueOnce(error).mockResolvedValue(true);
+      const { send, logger } = setup(fn);
+      await expect(send(chatId, sameChat ? undefined : 1)).rejects.toThrow(error.message);
+      expect(logger.mock.calls.at(-1)).toEqual([
+        `sendChatAction transient error (1). Cooling down ${cooldown}ms before retry.`,
+      ]);
+      now += cooldown - 1;
+      await expect(send(chatId, sameChat ? undefined : 2)).rejects.toThrow(
+        "transient cooldown active",
+      );
+      expect(fn).toHaveBeenCalledTimes(1);
+      now += 1;
+      await send(chatId);
+      expect(fn).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it("rechecks account cooldown after an authorization backoff wait", async () => {
+    const older = createDeferred<true>();
+    const backoff = createDeferred<void>();
+    const backoffStarted = createDeferred<void>();
+    const fn = vi
+      .fn()
+      .mockReturnValueOnce(older.promise)
+      .mockRejectedValueOnce(make401Error())
+      .mockResolvedValue(true);
+    const { send } = setup(fn);
+    const inFlight = send(-100, 1);
+    await expect(send(-100, 2)).rejects.toThrow("401");
+    mocks.sleepWithAbort.mockImplementationOnce(() => {
+      backoffStarted.resolve();
+      return backoff.promise;
     });
-
-    await expect(handler.sendChatAction(123, "typing")).rejects.toThrow("401");
-    await expect(handler.sendChatAction(123, "typing")).rejects.toThrow("401");
-    await expect(handler.sendChatAction(123, "typing")).rejects.toThrow("401");
-
-    expect(handler.isSuspended()).toBe(true);
-    expect(logger).toHaveBeenCalledWith(expect.stringContaining("CRITICAL"));
-
-    // Subsequent calls are silently skipped
-    await handler.sendChatAction(123, "typing");
-    expect(fn).toHaveBeenCalledTimes(3); // not called again
+    const waiting = send(-100, 3);
+    await backoffStarted.promise;
+    const floodFailure = expect(inFlight).rejects.toThrow("Too Many Requests");
+    older.reject(makeTelegramError("Too Many Requests", 429, { retry_after: 20 }));
+    await floodFailure;
+    const rejection = expect(waiting).rejects.toThrow("transient cooldown active");
+    backoff.resolve();
+    await rejection;
+    expect(fn).toHaveBeenCalledTimes(2);
   });
 
-  it("resets failure counter on success", async () => {
-    let callCount = 0;
-    const fn = vi.fn().mockImplementation(() => {
-      callCount++;
-      if (callCount <= 2) {
-        throw make401Error();
-      }
-      return Promise.resolve(true);
-    });
-    const logger = vi.fn();
-    const handler = createTelegramSendChatActionHandler({
-      sendChatActionFn: fn,
-      logger,
-      maxConsecutive401: 5,
-    });
+  it("resets transient counters on non-transient errors", async () => {
+    const fn = vi
+      .fn()
+      .mockRejectedValueOnce(makeTelegramError("Bad Gateway", 502))
+      .mockRejectedValueOnce(new Error("400 Bad Request"))
+      .mockRejectedValueOnce(makeTelegramError("Bad Gateway", 502));
+    const { send, logger } = setup(fn);
 
-    await expect(handler.sendChatAction(123, "typing")).rejects.toThrow("401");
-    await expect(handler.sendChatAction(123, "typing")).rejects.toThrow("401");
-    // Third call succeeds
-    await handler.sendChatAction(123, "typing");
+    await expect(send(123)).rejects.toThrow("Bad Gateway");
+    now = 5000;
+    await expect(send(123)).rejects.toThrow("400 Bad Request");
+    now = 9000;
+    await expect(send(123)).rejects.toThrow("Bad Gateway");
 
-    expect(handler.isSuspended()).toBe(false);
-    expect(logger).toHaveBeenCalledWith(expect.stringContaining("recovered"));
-  });
-
-  it("does not count non-401 errors toward suspension", async () => {
-    const fn = vi.fn().mockRejectedValue(make500Error());
-    const logger = vi.fn();
-    const handler = createTelegramSendChatActionHandler({
-      sendChatActionFn: fn,
-      logger,
-      maxConsecutive401: 2,
-    });
-
-    await expect(handler.sendChatAction(123, "typing")).rejects.toThrow("500");
-    await expect(handler.sendChatAction(123, "typing")).rejects.toThrow("500");
-    await expect(handler.sendChatAction(123, "typing")).rejects.toThrow("500");
-
-    expect(handler.isSuspended()).toBe(false);
-  });
-
-  it("reset() clears suspension", async () => {
-    const fn = vi.fn().mockRejectedValue(make401Error());
-    const logger = vi.fn();
-    const handler = createTelegramSendChatActionHandler({
-      sendChatActionFn: fn,
-      logger,
-      maxConsecutive401: 1,
-    });
-
-    await expect(handler.sendChatAction(123, "typing")).rejects.toThrow("401");
-    expect(handler.isSuspended()).toBe(true);
-
-    handler.reset();
-    expect(handler.isSuspended()).toBe(false);
+    expect(
+      logger.mock.calls.filter(([message]) =>
+        String(message).startsWith("sendChatAction transient error"),
+      ),
+    ).toEqual([
+      ["sendChatAction transient error (1). Cooling down 4000ms before retry."],
+      ["sendChatAction transient error (1). Cooling down 4000ms before retry."],
+    ]);
   });
 
   it("is shared across multiple chatIds (global handler)", async () => {
     const fn = vi.fn().mockRejectedValue(make401Error());
-    const logger = vi.fn();
-    const handler = createTelegramSendChatActionHandler({
-      sendChatActionFn: fn,
-      logger,
-      maxConsecutive401: 3,
-    });
+    const { handler, send } = setup(fn);
 
-    // Different chatIds all contribute to the same failure counter
-    await expect(handler.sendChatAction(111, "typing")).rejects.toThrow("401");
-    await expect(handler.sendChatAction(222, "typing")).rejects.toThrow("401");
-    await expect(handler.sendChatAction(333, "typing")).rejects.toThrow("401");
+    await expect(send(111, 1)).rejects.toThrow("401");
+    await expect(send(111, 2)).rejects.toThrow("401");
+    for (let attempt = 2; attempt < 10; attempt += 1) {
+      now += 4000;
+      await expect(send(333)).rejects.toThrow("401");
+    }
 
     expect(handler.isSuspended()).toBe(true);
-    // Suspended for all chats
-    await handler.sendChatAction(444, "typing");
-    expect(fn).toHaveBeenCalledTimes(3);
+    await send(444);
+    expect(fn).toHaveBeenCalledTimes(10);
+  });
+
+  it("treats a structured 429 with retry_after=401 as transient, not as a 401 suspension", async () => {
+    const make429WithRetryAfter401 = () =>
+      Object.assign(
+        new Error("Call to 'sendChatAction' failed! (429: Too Many Requests: retry after 401)"),
+        { error_code: 429, parameters: { retry_after: 401 } },
+      );
+
+    now = 0;
+    const fn = vi.fn().mockRejectedValue(make429WithRetryAfter401());
+    const { handler, send, logger } = setup(fn);
+
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      await expect(send(123)).rejects.toThrow("429");
+      now += 402_000; // Advance past Telegram's 401-second transient cooldown.
+    }
+
+    expect(handler.isSuspended()).toBe(false);
+
+    expect(logger.mock.calls.filter(([msg]) => String(msg).includes("CRITICAL"))).toEqual([]);
   });
 });

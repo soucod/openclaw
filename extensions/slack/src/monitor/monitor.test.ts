@@ -1,174 +1,64 @@
-import type { App } from "@slack/bolt";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import type { OpenClawConfig } from "../../../../src/config/config.js";
-import type { RuntimeEnv } from "../../../../src/runtime.js";
-import type { SlackMessageEvent } from "../types.js";
+import { describe, expect, it, vi } from "vitest";
 import { resolveSlackChannelConfig } from "./channel-config.js";
-import { createSlackMonitorContext, normalizeSlackChannelType } from "./context.js";
-import { resetSlackThreadStarterCacheForTest, resolveSlackThreadStarter } from "./media.js";
-import { createSlackThreadTsResolver } from "./thread-resolution.js";
+import { normalizeSlackChannelType } from "./context.js";
+import { createMonitorTestContext } from "./monitor-context.test-support.js";
 
 describe("resolveSlackChannelConfig", () => {
-  it("uses defaultRequireMention when channels config is empty", () => {
-    const res = resolveSlackChannelConfig({
-      channelId: "C1",
-      channels: {},
-      defaultRequireMention: false,
+  it("does not match a bare channel ID when workspace scope is required", () => {
+    const channels = { C01234567: { enabled: true, requireMention: false } };
+    const params = { teamId: "T11111111", channelId: "C01234567", channels };
+    expect(resolveSlackChannelConfig(params)).toMatchObject({
+      allowed: false,
+      requireMention: true,
     });
-    expect(res).toEqual({ allowed: true, requireMention: false });
-  });
-
-  it("defaults defaultRequireMention to true when not provided", () => {
-    const res = resolveSlackChannelConfig({
-      channelId: "C1",
-      channels: {},
-    });
-    expect(res).toEqual({ allowed: true, requireMention: true });
-  });
-
-  it("prefers explicit channel/fallback requireMention over defaultRequireMention", () => {
-    const res = resolveSlackChannelConfig({
-      channelId: "C1",
-      channels: { "*": { requireMention: true } },
-      defaultRequireMention: false,
-    });
-    expect(res).toMatchObject({ requireMention: true });
-  });
-
-  it("uses wildcard entries when no direct channel config exists", () => {
-    const res = resolveSlackChannelConfig({
-      channelId: "C1",
-      channels: { "*": { allow: true, requireMention: false } },
-      defaultRequireMention: true,
-    });
-    expect(res).toMatchObject({
+    expect(resolveSlackChannelConfig({ ...params, allowUnscoped: true })).toMatchObject({
       allowed: true,
       requireMention: false,
-      matchKey: "*",
-      matchSource: "wildcard",
-    });
-  });
-
-  it("uses direct match metadata when channel config exists", () => {
-    const res = resolveSlackChannelConfig({
-      channelId: "C1",
-      channels: { C1: { allow: true, requireMention: false } },
-      defaultRequireMention: true,
-    });
-    expect(res).toMatchObject({
-      matchKey: "C1",
+      matchKey: "C01234567",
       matchSource: "direct",
     });
   });
 
-  it("matches channel config key stored in lowercase when Slack delivers uppercase channel ID", () => {
-    // Slack always delivers channel IDs in uppercase (e.g. C0ABC12345).
-    // Users commonly copy them in lowercase from docs or older CLI output.
-    const res = resolveSlackChannelConfig({
-      channelId: "C0ABC12345", // pragma: allowlist secret
-      channels: { c0abc12345: { allow: true, requireMention: false } },
-      defaultRequireMention: true,
-    });
-    expect(res).toMatchObject({ allowed: true, requireMention: false });
+  it("preserves org-wide and workspace-qualified per-channel user identities", () => {
+    const users = ["team:T11111111:user:U01234567", "team:T22222222:user:U12345678", "U23456789"];
+    const channels = {
+      "team:T11111111:channel:C01234567": { users },
+      "team:T22222222:channel:C01234567": { users },
+    };
+
+    for (const teamId of ["T11111111", "T22222222"]) {
+      expect(
+        resolveSlackChannelConfig({ teamId, channelId: "C01234567", channels })?.users,
+      ).toEqual(["team:t11111111:user:u01234567", "team:t22222222:user:u12345678", "u23456789"]);
+    }
   });
 
-  it("matches channel config key stored in uppercase when user types lowercase channel ID", () => {
-    // Defensive: also handle the inverse direction.
-    const res = resolveSlackChannelConfig({
-      channelId: "c0abc12345", // pragma: allowlist secret
-      channels: { C0ABC12345: { allow: true, requireMention: false } },
-      defaultRequireMention: true,
-    });
-    expect(res).toMatchObject({ allowed: true, requireMention: false });
-  });
-
-  it("blocks channel-name route matches by default", () => {
-    const res = resolveSlackChannelConfig({
-      channelId: "C1",
-      channelName: "ops-room",
-      channels: { "ops-room": { allow: true, requireMention: false } },
-      defaultRequireMention: true,
-    });
-    expect(res).toMatchObject({ allowed: false, requireMention: true });
-  });
-
-  it("allows channel-name route matches when dangerous name matching is enabled", () => {
-    const res = resolveSlackChannelConfig({
-      channelId: "C1",
-      channelName: "ops-room",
-      channels: { "ops-room": { allow: true, requireMention: false } },
-      defaultRequireMention: true,
-      allowNameMatching: true,
-    });
-    expect(res).toMatchObject({
-      allowed: true,
-      requireMention: false,
-      matchKey: "ops-room",
-      matchSource: "direct",
-    });
-  });
-});
-
-const baseParams = () => ({
-  cfg: {} as OpenClawConfig,
-  accountId: "default",
-  botToken: "token",
-  app: { client: {} } as App,
-  runtime: {} as RuntimeEnv,
-  botUserId: "B1",
-  teamId: "T1",
-  apiAppId: "A1",
-  historyLimit: 0,
-  sessionScope: "per-sender" as const,
-  mainKey: "main",
-  dmEnabled: true,
-  dmPolicy: "open" as const,
-  allowFrom: [],
-  allowNameMatching: false,
-  groupDmEnabled: true,
-  groupDmChannels: [],
-  defaultRequireMention: true,
-  groupPolicy: "open" as const,
-  useAccessGroups: false,
-  reactionMode: "off" as const,
-  reactionAllowlist: [],
-  replyToMode: "off" as const,
-  slashCommand: {
-    enabled: false,
-    name: "openclaw",
-    sessionPrefix: "slack:slash",
-    ephemeral: true,
-  },
-  textLimit: 4000,
-  ackReactionScope: "group-mentions",
-  typingReaction: "",
-  mediaMaxBytes: 1,
-  threadHistoryScope: "thread" as const,
-  threadInheritParent: false,
-  removeAckAfterReply: false,
-});
-
-type ThreadStarterClient = Parameters<typeof resolveSlackThreadStarter>[0]["client"];
-
-function createThreadStarterRepliesClient(
-  response: { messages?: Array<{ text?: string; user?: string; ts?: string }> } = {
-    messages: [{ text: "root message", user: "U1", ts: "1000.1" }],
-  },
-): { replies: ReturnType<typeof vi.fn>; client: ThreadStarterClient } {
-  const replies = vi.fn(async () => response);
-  const client = {
-    conversations: { replies },
-  } as unknown as ThreadStarterClient;
-  return { replies, client };
-}
-
-function createListedChannelsContext(groupPolicy: "open" | "allowlist") {
-  return createSlackMonitorContext({
-    ...baseParams(),
-    groupPolicy,
-    channelsConfig: {
-      C_LISTED: { requireMention: true },
+  it.each([false, true])(
+    "gates channel-name routes on dangerous name matching: %s",
+    (allowNameMatching) => {
+      const res = resolveSlackChannelConfig({
+        channelId: "C1",
+        channelName: "ops-room",
+        channels: { "ops-room": { enabled: true, requireMention: false } },
+        defaultRequireMention: true,
+        allowNameMatching,
+      });
+      expect(res).toMatchObject(
+        allowNameMatching
+          ? { allowed: true, requireMention: false, matchKey: "ops-room", matchSource: "direct" }
+          : { allowed: false, requireMention: true },
+      );
     },
+  );
+});
+
+function createContext(overrides: Parameters<typeof createMonitorTestContext>[0] = {}) {
+  return createMonitorTestContext({
+    cfg: {},
+    teamId: "T1",
+    apiAppId: "A1",
+    groupPolicy: "open",
+    ...overrides,
   });
 }
 
@@ -178,63 +68,19 @@ describe("normalizeSlackChannelType", () => {
     expect(normalizeSlackChannelType(undefined, "D123")).toBe("im");
     expect(normalizeSlackChannelType(undefined, "G123")).toBe("group");
   });
-
-  it("prefers explicit channel_type values", () => {
-    expect(normalizeSlackChannelType("mpim", "C123")).toBe("mpim");
-  });
-
-  it("overrides wrong channel_type for D-prefix DM channels", () => {
-    // Slack DM channel IDs always start with "D" — if the event
-    // reports a wrong channel_type, the D-prefix should win.
-    expect(normalizeSlackChannelType("channel", "D123")).toBe("im");
-    expect(normalizeSlackChannelType("group", "D456")).toBe("im");
-    expect(normalizeSlackChannelType("mpim", "D789")).toBe("im");
-  });
-
-  it("preserves correct channel_type for D-prefix DM channels", () => {
-    expect(normalizeSlackChannelType("im", "D123")).toBe("im");
-  });
-
-  it("does not override G-prefix channel_type (ambiguous prefix)", () => {
-    // G-prefix can be either "group" (private channel) or "mpim" (group DM)
-    // — trust the provided channel_type since the prefix is ambiguous.
-    expect(normalizeSlackChannelType("group", "G123")).toBe("group");
-    expect(normalizeSlackChannelType("mpim", "G456")).toBe("mpim");
-  });
 });
 
-describe("resolveSlackSystemEventSessionKey", () => {
-  it("defaults missing channel_type to channel sessions", () => {
-    const ctx = createSlackMonitorContext(baseParams());
-    expect(ctx.resolveSlackSystemEventSessionKey({ channelId: "C123" })).toBe(
-      "agent:main:slack:channel:c123",
-    );
-  });
-
-  it("routes channel system events through account bindings", () => {
-    const ctx = createSlackMonitorContext({
-      ...baseParams(),
-      accountId: "work",
-      cfg: {
-        bindings: [
-          {
-            agentId: "ops",
-            match: {
-              channel: "slack",
-              accountId: "work",
-            },
-          },
-        ],
-      },
+describe("resolveSlackSystemEventRoute", () => {
+  it("uses the sole configured agent for fallback system-event sessions", async () => {
+    const ctx = createContext({ cfg: { agents: { entries: { ops: {} } } } });
+    expect(await ctx.resolveSlackSystemEventRoute({ channelId: "C123" })).toEqual({
+      agentId: "ops",
+      sessionKey: "agent:ops:slack:channel:c123",
     });
-    expect(
-      ctx.resolveSlackSystemEventSessionKey({ channelId: "C123", channelType: "channel" }),
-    ).toBe("agent:ops:slack:channel:c123");
   });
 
-  it("routes DM system events through direct-peer bindings when sender is known", () => {
-    const ctx = createSlackMonitorContext({
-      ...baseParams(),
+  it("routes DM system events through direct-peer bindings when sender is known", async () => {
+    const ctx = createContext({
       accountId: "work",
       cfg: {
         bindings: [
@@ -250,175 +96,68 @@ describe("resolveSlackSystemEventSessionKey", () => {
       },
     });
     expect(
-      ctx.resolveSlackSystemEventSessionKey({
+      await ctx.resolveSlackSystemEventRoute({
         channelId: "D123",
         channelType: "im",
         senderId: "U123",
       }),
-    ).toBe("agent:ops-dm:main");
+    ).toEqual({ agentId: "ops-dm", sessionKey: "agent:ops-dm:main" });
   });
 });
 
 describe("isChannelAllowed with groupPolicy and channelsConfig", () => {
-  it("allows unlisted channels when groupPolicy is open even with channelsConfig entries", () => {
-    // Bug fix: when groupPolicy="open" and channels has some entries,
-    // unlisted channels should still be allowed (not blocked)
-    const ctx = createListedChannelsContext("open");
-    // Listed channel should be allowed
-    expect(ctx.isChannelAllowed({ channelId: "C_LISTED", channelType: "channel" })).toBe(true);
-    // Unlisted channel should ALSO be allowed when policy is "open"
-    expect(ctx.isChannelAllowed({ channelId: "C_UNLISTED", channelType: "channel" })).toBe(true);
-  });
+  it.each([
+    ["open", "C_DENIED", "direct"],
+    ["allowlist", "*", "wildcard"],
+  ] as const)(
+    "repeats %s disabled-channel warnings on a fixed interval",
+    (groupPolicy, key, source) => {
+      vi.useFakeTimers();
+      try {
+        const ctx = createContext({
+          groupPolicy,
+          channelsConfig: { [key]: { enabled: false } },
+        });
+        const warnSpy = vi.spyOn(ctx.logger, "warn").mockImplementation(() => undefined);
 
-  it("blocks unlisted channels when groupPolicy is allowlist", () => {
-    const ctx = createListedChannelsContext("allowlist");
-    // Listed channel should be allowed
-    expect(ctx.isChannelAllowed({ channelId: "C_LISTED", channelType: "channel" })).toBe(true);
-    // Unlisted channel should be blocked when policy is "allowlist"
-    expect(ctx.isChannelAllowed({ channelId: "C_UNLISTED", channelType: "channel" })).toBe(false);
-  });
+        expect(ctx.isChannelAllowed({ channelId: "C_DENIED", channelType: "channel" })).toBe(false);
+        vi.advanceTimersByTime(4 * 60_000);
+        expect(ctx.isChannelAllowed({ channelId: "C_DENIED", channelType: "channel" })).toBe(false);
+        expect(warnSpy).toHaveBeenCalledExactlyOnceWith(
+          {
+            provider: "slack",
+            accountId: "default",
+            channelId: "C_DENIED",
+            reason: "channel_not_allowed",
+            cause: "channel_disabled",
+            groupPolicy,
+            matchSource: source,
+            matchKey: key,
+          },
+          "Slack channel denied by configuration",
+        );
 
-  it("blocks explicitly denied channels even when groupPolicy is open", () => {
-    const ctx = createSlackMonitorContext({
-      ...baseParams(),
-      groupPolicy: "open",
-      channelsConfig: {
-        C_ALLOWED: { allow: true },
-        C_DENIED: { allow: false },
-      },
-    });
-    // Explicitly allowed channel
-    expect(ctx.isChannelAllowed({ channelId: "C_ALLOWED", channelType: "channel" })).toBe(true);
-    // Explicitly denied channel should be blocked even with open policy
+        vi.advanceTimersByTime(60_000);
+        expect(ctx.isChannelAllowed({ channelId: "C_DENIED", channelType: "channel" })).toBe(false);
+        expect(warnSpy).toHaveBeenCalledTimes(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it.each([
+    ["allowlist", { C_LISTED: { requireMention: true } }],
+    ["disabled", { C_DENIED: { enabled: false } }],
+  ] as const)("does not warn for a %s policy denial", (groupPolicy, channelsConfig) => {
+    const ctx = createContext({ groupPolicy, channelsConfig });
+    const warn = vi.spyOn(ctx.logger, "warn").mockImplementation(() => undefined);
     expect(ctx.isChannelAllowed({ channelId: "C_DENIED", channelType: "channel" })).toBe(false);
-    // Unlisted channel should be allowed with open policy
-    expect(ctx.isChannelAllowed({ channelId: "C_UNLISTED", channelType: "channel" })).toBe(true);
+    expect(warn).not.toHaveBeenCalled();
   });
 
   it("allows all channels when groupPolicy is open and channelsConfig is empty", () => {
-    const ctx = createSlackMonitorContext({
-      ...baseParams(),
-      groupPolicy: "open",
-      channelsConfig: undefined,
-    });
+    const ctx = createContext();
     expect(ctx.isChannelAllowed({ channelId: "C_ANY", channelType: "channel" })).toBe(true);
-  });
-});
-
-describe("resolveSlackThreadStarter cache", () => {
-  afterEach(() => {
-    resetSlackThreadStarterCacheForTest();
-    vi.useRealTimers();
-  });
-
-  it("returns cached thread starter without refetching within ttl", async () => {
-    const { replies, client } = createThreadStarterRepliesClient();
-
-    const first = await resolveSlackThreadStarter({
-      channelId: "C1",
-      threadTs: "1000.1",
-      client,
-    });
-    const second = await resolveSlackThreadStarter({
-      channelId: "C1",
-      threadTs: "1000.1",
-      client,
-    });
-
-    expect(first).toEqual(second);
-    expect(replies).toHaveBeenCalledTimes(1);
-  });
-
-  it("expires stale cache entries and refetches after ttl", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
-
-    const { replies, client } = createThreadStarterRepliesClient();
-
-    await resolveSlackThreadStarter({
-      channelId: "C1",
-      threadTs: "1000.1",
-      client,
-    });
-
-    vi.setSystemTime(new Date("2026-01-01T07:00:00.000Z"));
-    await resolveSlackThreadStarter({
-      channelId: "C1",
-      threadTs: "1000.1",
-      client,
-    });
-
-    expect(replies).toHaveBeenCalledTimes(2);
-  });
-
-  it("does not cache empty starter text", async () => {
-    const { replies, client } = createThreadStarterRepliesClient({
-      messages: [{ text: "   ", user: "U1", ts: "1000.1" }],
-    });
-
-    const first = await resolveSlackThreadStarter({
-      channelId: "C1",
-      threadTs: "1000.1",
-      client,
-    });
-    const second = await resolveSlackThreadStarter({
-      channelId: "C1",
-      threadTs: "1000.1",
-      client,
-    });
-
-    expect(first).toBeNull();
-    expect(second).toBeNull();
-    expect(replies).toHaveBeenCalledTimes(2);
-  });
-
-  it("evicts oldest entries once cache exceeds bounded size", async () => {
-    const { replies, client } = createThreadStarterRepliesClient();
-
-    // Cache cap is 2000; add enough distinct keys to force eviction of earliest keys.
-    for (let i = 0; i <= 2000; i += 1) {
-      await resolveSlackThreadStarter({
-        channelId: "C1",
-        threadTs: `1000.${i}`,
-        client,
-      });
-    }
-    const callsAfterFill = replies.mock.calls.length;
-
-    // Oldest key should be evicted and require fetch again.
-    await resolveSlackThreadStarter({
-      channelId: "C1",
-      threadTs: "1000.0",
-      client,
-    });
-
-    expect(replies.mock.calls.length).toBe(callsAfterFill + 1);
-  });
-});
-
-describe("createSlackThreadTsResolver", () => {
-  it("caches resolved thread_ts lookups", async () => {
-    const historyMock = vi.fn().mockResolvedValue({
-      messages: [{ ts: "1", thread_ts: "9" }],
-    });
-    const resolver = createSlackThreadTsResolver({
-      // oxlint-disable-next-line typescript/no-explicit-any
-      client: { conversations: { history: historyMock } } as any,
-      cacheTtlMs: 60_000,
-      maxSize: 5,
-    });
-
-    const message = {
-      channel: "C1",
-      parent_user_id: "U2",
-      ts: "1",
-    } as SlackMessageEvent;
-
-    const first = await resolver.resolve({ message, source: "message" });
-    const second = await resolver.resolve({ message, source: "message" });
-
-    expect(first.thread_ts).toBe("9");
-    expect(second.thread_ts).toBe("9");
-    expect(historyMock).toHaveBeenCalledTimes(1);
   });
 });

@@ -5,162 +5,783 @@ read_when:
   - Understanding the plugin capability model or ownership boundaries
   - Working on the plugin load pipeline or registry
   - Implementing provider runtime hooks or channel plugins
-title: "Plugin Internals"
-sidebarTitle: "Internals"
+title: "Plugin internals"
+sidebarTitle: "Architecture"
 ---
 
-# Plugin Internals
+This is the **deep architecture reference** for the OpenClaw plugin system. For practical guides, start with one of the focused pages below.
 
-<Info>
-  This is the **deep architecture reference**. For practical guides, see:
-  - [Install and use plugins](/tools/plugin) — user guide
-  - [Getting Started](/plugins/building-plugins) — first plugin tutorial
-  - [Channel Plugins](/plugins/sdk-channel-plugins) — build a messaging channel
-  - [Provider Plugins](/plugins/sdk-provider-plugins) — build a model provider
-  - [SDK Overview](/plugins/sdk-overview) — import map and registration API
-</Info>
-
-This page covers the internal architecture of the OpenClaw plugin system.
+<CardGroup cols={2}>
+  <Card title="Install and use plugins" icon="plug" href="/tools/plugin">
+    End-user guide for adding, enabling, and troubleshooting plugins.
+  </Card>
+  <Card title="Building plugins" icon="rocket" href="/plugins/building-plugins">
+    First-plugin tutorial with the smallest working manifest.
+  </Card>
+  <Card title="Channel plugins" icon="comments" href="/plugins/sdk-channel-plugins">
+    Build a messaging channel plugin.
+  </Card>
+  <Card title="Provider plugins" icon="microchip" href="/plugins/sdk-provider-plugins">
+    Build a model provider plugin.
+  </Card>
+  <Card title="SDK overview" icon="book" href="/plugins/sdk-overview">
+    Import map and registration API reference.
+  </Card>
+</CardGroup>
 
 ## Public capability model
 
-Capabilities are the public **native plugin** model inside OpenClaw. Every
-native OpenClaw plugin registers against one or more capability types:
+Capabilities are the public **native plugin** model inside OpenClaw. Native plugins can register one or more capability types:
 
-| Capability          | Registration method                           | Example plugins           |
-| ------------------- | --------------------------------------------- | ------------------------- |
-| Text inference      | `api.registerProvider(...)`                   | `openai`, `anthropic`     |
-| Speech              | `api.registerSpeechProvider(...)`             | `elevenlabs`, `microsoft` |
-| Media understanding | `api.registerMediaUnderstandingProvider(...)` | `openai`, `google`        |
-| Image generation    | `api.registerImageGenerationProvider(...)`    | `openai`, `google`        |
-| Web search          | `api.registerWebSearchProvider(...)`          | `google`                  |
-| Channel / messaging | `api.registerChannel(...)`                    | `msteams`, `matrix`       |
+| Capability             | Registration method                              | Example plugins                                             |
+| ---------------------- | ------------------------------------------------ | ----------------------------------------------------------- |
+| Text inference         | `api.registerProvider(...)`                      | `anthropic`, `openai`                                       |
+| CLI inference backend  | `api.registerCliBackend(...)`                    | `anthropic`, `openai`                                       |
+| Embeddings             | `api.registerEmbeddingProvider(...)`             | Provider-owned vector plugins                               |
+| Speech                 | `api.registerSpeechProvider(...)`                | `elevenlabs`, `microsoft`                                   |
+| Realtime transcription | `api.registerRealtimeTranscriptionProvider(...)` | `openai`                                                    |
+| Realtime voice         | `api.registerRealtimeVoiceProvider(...)`         | `google`, `openai`                                          |
+| Media understanding    | `api.registerMediaUnderstandingProvider(...)`    | `google`, `openai`                                          |
+| Transcripts source     | `api.registerTranscriptSourceProvider(...)`      | `discord`, `google-meet`, `teams-meetings`, `zoom-meetings` |
+| Image generation       | `api.registerImageGenerationProvider(...)`       | `fal`, `google`, `openai`                                   |
+| Music generation       | `api.registerMusicGenerationProvider(...)`       | `fal`, `google`, `minimax`                                  |
+| Video generation       | `api.registerVideoGenerationProvider(...)`       | `fal`, `google`, `qwen`                                     |
+| Web fetch              | `api.registerWebFetchProvider(...)`              | `firecrawl`                                                 |
+| Web search             | `api.registerWebSearchProvider(...)`             | `brave`, `firecrawl`, `google`                              |
+| Channel / messaging    | `api.registerChannel(...)`                       | `matrix`, `msteams`                                         |
+| Gateway discovery      | `api.registerGatewayDiscoveryService(...)`       | `bonjour`                                                   |
+| Migration              | `api.registerMigrationProvider(...)`             | `migrate-claude`, `migrate-hermes`                          |
 
-A plugin that registers zero capabilities but provides hooks, tools, or
-services is a **legacy hook-only** plugin. That pattern is still fully supported.
+<Note>
+A plugin that registers only hooks is **hook-only**. Plugins with tools, commands, background services, or routes but no capabilities are **non-capability** plugins. Both patterns remain supported; gateway discovery is an explicit capability listed above.
+</Note>
 
 ### External compatibility stance
 
-The capability model is landed in core and used by bundled/native plugins
-today, but external plugin compatibility still needs a tighter bar than "it is
-exported, therefore it is frozen."
+The capability model is landed in core and used by bundled/native plugins today, but external plugin compatibility still needs a tighter bar than "it is exported, therefore it is frozen."
 
-Current guidance:
+| Plugin situation                                  | Guidance                                                                                         |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| Existing external plugins                         | Keep hook-based integrations working; this is the compatibility baseline.                        |
+| New bundled/native plugins                        | Prefer explicit capability registration over vendor-specific reach-ins or new hook-only designs. |
+| External plugins adopting capability registration | Allowed, but treat capability-specific helper surfaces as evolving unless docs mark them stable. |
 
-- **existing external plugins:** keep hook-based integrations working; treat
-  this as the compatibility baseline
-- **new bundled/native plugins:** prefer explicit capability registration over
-  vendor-specific reach-ins or new hook-only designs
-- **external plugins adopting capability registration:** allowed, but treat the
-  capability-specific helper surfaces as evolving unless docs explicitly mark a
-  contract as stable
-
-Practical rule:
-
-- capability registration APIs are the intended direction
-- legacy hooks remain the safest no-breakage path for external plugins during
-  the transition
-- exported helper subpaths are not all equal; prefer the narrow documented
-  contract, not incidental helper exports
+Capability registration is the intended direction. Legacy hooks remain the safest no-breakage path for external plugins during the transition. Exported helper subpaths are not all equal — prefer narrow documented contracts over incidental helper exports.
 
 ### Plugin shapes
 
-OpenClaw classifies every loaded plugin into a shape based on its actual
-registration behavior (not just static metadata):
+OpenClaw classifies every loaded plugin into a shape based on its actual registration behavior (not just static metadata):
 
-- **plain-capability** -- registers exactly one capability type (for example a
-  provider-only plugin like `mistral`)
-- **hybrid-capability** -- registers multiple capability types (for example
-  `openai` owns text inference, speech, media understanding, and image
-  generation)
-- **hook-only** -- registers only hooks (typed or custom), no capabilities,
-  tools, commands, or services
-- **non-capability** -- registers tools, commands, services, or routes but no
-  capabilities
+<AccordionGroup>
+  <Accordion title="plain-capability">
+    Registers exactly one capability type (for example a provider-only plugin like `arcee` or `chutes`).
+  </Accordion>
+  <Accordion title="hybrid-capability">
+    Registers multiple capability types (for example `openai` owns text inference, speech, media understanding, and image generation).
+  </Accordion>
+  <Accordion title="hook-only">
+    Registers only hooks (typed or custom), no capabilities, tools, commands, or services.
+  </Accordion>
+  <Accordion title="non-capability">
+    Registers tools, commands, services, or routes but no capabilities.
+  </Accordion>
+</AccordionGroup>
 
-Use `openclaw plugins inspect <id>` to see a plugin's shape and capability
-breakdown. See [CLI reference](/cli/plugins#inspect) for details.
-
-### Legacy hooks
-
-The `before_agent_start` hook remains supported as a compatibility path for
-hook-only plugins. Legacy real-world plugins still depend on it.
-
-Direction:
-
-- keep it working
-- document it as legacy
-- prefer `before_model_resolve` for model/provider override work
-- prefer `before_prompt_build` for prompt mutation work
-- remove only after real usage drops and fixture coverage proves migration safety
+Use `openclaw plugins inspect <id>` to see a plugin's shape and capability breakdown. See [CLI reference](/cli/plugins#inspect) for details.
 
 ### Compatibility signals
 
-When you run `openclaw doctor` or `openclaw plugins inspect <id>`, you may see
-one of these labels:
+`openclaw doctor`, `openclaw plugins inspect <id>`, `openclaw status --all`, and `openclaw plugins doctor` surface these compatibility notices:
 
-| Signal                     | Meaning                                                      |
-| -------------------------- | ------------------------------------------------------------ |
-| **config valid**           | Config parses fine and plugins resolve                       |
-| **compatibility advisory** | Plugin uses a supported-but-older pattern (e.g. `hook-only`) |
-| **legacy warning**         | Plugin uses `before_agent_start`, which is deprecated        |
-| **hard error**             | Config is invalid or plugin failed to load                   |
+| Signal                                     | Meaning                                                                                                       |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------- |
+| **config valid**                           | Config parses fine and plugins resolve                                                                        |
+| **hook-only** (info)                       | Plugin registers only hooks; a supported path, but not migrated to capability registration yet                |
+| **deprecated memory-embedding API** (warn) | Non-bundled plugin uses the old memory-specific embedding provider API instead of `registerEmbeddingProvider` |
+| **hard error**                             | Config is invalid or plugin failed to load                                                                    |
 
-Neither `hook-only` nor `before_agent_start` will break your plugin today --
-`hook-only` is advisory, and `before_agent_start` only triggers a warning. These
-signals also appear in `openclaw status --all` and `openclaw plugins doctor`.
+None of the advisory/warn signals break your plugin today. These signals also appear in `openclaw status --all` and `openclaw plugins doctor`.
 
 ## Architecture overview
 
 OpenClaw's plugin system has four layers:
 
-1. **Manifest + discovery**
-   OpenClaw finds candidate plugins from configured paths, workspace roots,
-   global extension roots, and bundled extensions. Discovery reads native
-   `openclaw.plugin.json` manifests plus supported bundle manifests first.
-2. **Enablement + validation**
-   Core decides whether a discovered plugin is enabled, disabled, blocked, or
-   selected for an exclusive slot such as memory.
-3. **Runtime loading**
-   Native OpenClaw plugins are loaded in-process via jiti and register
-   capabilities into a central registry. Compatible bundles are normalized into
-   registry records without importing runtime code.
-4. **Surface consumption**
-   The rest of OpenClaw reads the registry to expose tools, channels, provider
-   setup, hooks, HTTP routes, CLI commands, and services.
+<Steps>
+  <Step title="Manifest + discovery">
+    OpenClaw finds candidate plugins from configured paths, workspace roots, global plugin roots, and bundled plugins. Discovery reads native `openclaw.plugin.json` manifests plus supported bundle manifests first.
+  </Step>
+  <Step title="Enablement + validation">
+    Core decides whether a discovered plugin is enabled, disabled, blocked, or selected for an exclusive slot such as memory.
+  </Step>
+  <Step title="Runtime loading">
+    Native OpenClaw plugins are loaded in-process and register capabilities into a central registry. Managed instances load JavaScript through Node and compile TypeScript source when needed. Compatible bundles are normalized into registry records without importing runtime code.
+  </Step>
+  <Step title="Surface consumption">
+    The rest of OpenClaw reads the registry to expose tools, channels, provider setup, hooks, HTTP routes, CLI commands, and services.
+  </Step>
+</Steps>
+
+For plugin CLI specifically, root command discovery is split in two phases:
+
+- parse-time metadata comes from `registerCli(..., { descriptors: [...] })`
+- the real plugin CLI module can stay lazy and register on first invocation
+
+That keeps plugin-owned CLI code inside the plugin while still letting OpenClaw reserve root command names before parsing.
 
 The important design boundary:
 
-- discovery + config validation should work from **manifest/schema metadata**
-  without executing plugin code
-- native runtime behavior comes from the plugin module's `register(api)` path
+- manifest/config validation should work from **manifest/schema metadata** without executing plugin code
+- native capability discovery may load trusted plugin entry code to build a non-activating registry snapshot
+- native runtime behavior comes from the plugin module's `register(api)` path with `api.registrationMode === "full"`
 
-That split lets OpenClaw validate config, explain missing/disabled plugins, and
-build UI/schema hints before the full runtime is active.
+That split lets OpenClaw validate config, explain missing/disabled plugins, and build UI/schema hints before the full runtime is active.
+
+Failed registrations remain visible in plugin diagnostics after their contributions are rolled back. Those records do not enter execution scopes or block healthy plugins and core context-engine admission; the loader still owns their cleanup.
+
+Runtime preparation checks pending data migrations through the shared-state read worker before registering plugins. Once checked, the process reuses that ledger result across plugin generations until a committed deferred-migration write invalidates it. Unrelated state writes do not repeat the check. Explicit artifact-preserving inspection keeps its isolated snapshot, and plugins with pending data migrations remain blocked until Doctor completes them.
+
+Gateway startup and reload yield to the event loop between plugin registrations so health probes and existing requests can run. Registration order is unchanged, and the Gateway publishes the registry only after the complete generation is ready. Each plugin's module evaluation and `register()` remain synchronous; plugins should defer expensive work to their asynchronous service lifecycle or load execution-only modules on first asynchronous use. Register callable hooks before readiness, even when their implementations load lazily.
+
+The llama.cpp plugin follows this split for setup, server management, embeddings, image descriptions, and streaming. Registration exposes its capabilities and embedding index identities immediately; the corresponding asynchronous operation loads its implementation on first use.
+
+Web-provider discovery honors exact prepared generations, including empty selections. It reuses an ordinary request-owned registry when it covers the selected providers; otherwise an empty result requires a complete inspected manifest inventory. Partial capability callbacks retain discovery of undeclared providers. Prepared cron runs and Doctor tool construction do not register the same plugins again merely to check whether web search is configured. Doctor keeps provider-specific schema normalization outside its selected tool generation.
+
+### Plugin metadata snapshot and lookup table
+
+One `PluginCache` starts on the first plugin metadata access, including CLI preflight before Gateway startup, and fills progressively as metadata and artifacts are needed. Gateway startup retains that owner and builds its immutable `PluginMetadataSnapshot`. The snapshot includes plugin metadata from all configured agent workspaces, including disabled plugins, with source precedence and workspace provenance preserved. It stores the installed plugin index, manifest registry, manifest diagnostics, owner maps, and a plugin id normalizer. Package contents and lazily loaded module exports belong to other typed views of the same cache, not the snapshot itself.
+
+Plugin-aware config validation, startup auto-enable, and Gateway plugin bootstrap consume that snapshot instead of rebuilding manifest/index metadata independently. `PluginLookUpTable` is derived from the same snapshot and adds the startup plugin plan for the current runtime config.
+
+On POSIX, successful checked entry opens also publish their canonical paths to the metadata cache. For ordinary metadata paths, discovery resolves each parent directory once and reuses it for non-symlink children. These path facts last until the owner invalidates metadata; symlinks retain filesystem resolution, and actual file opens retain their descriptor-bound security checks. Windows keeps separate path resolution because admission can return a trusted root alias rather than the native spelling.
+
+Async config validation requests metadata when a rule or default needs it. Core-only settings do not load the plugin inventory; successful `config get` uses core redaction hints outside plugin, channel, and agent configuration, building the JSON schema only for missing-path diagnostics. Agent configuration keeps provider model-parameter schemas from plugins. Native-catalog privacy preferences still receive their plugin schema checks.
+
+When metadata is needed, preparation reads the machine-owned bundled-discovery policy and installed index together through the shared-state read worker. Metadata and ownership-lease reads load only their handlers; the general command registry stays deferred. Later reads reuse the plugin cache until its owner refreshes it. Private inspection snapshots keep their own policy facts without replacing the live process cache.
+
+Cold promise-only metadata preparation retains one read-only child for snapshot allocation, copying, and retirement. A shared-state worker inside that child admits the source and reads the private bytes. It exits before the child retires its snapshot, keeping SQL off the CLI thread without loading a separate reader into the CLI process. Source files remain unchanged. Existing prepared snapshots, live native readers, and schema-maintenance scopes retain their existing read and ownership paths. Readers that need synchronous servicing retain their transport and cleanup contract.
+
+Channel setup catalogs retain the requested workspace and load-path scope, including raw plugin shadows, so trust filtering can select the appropriate installed alternative.
+
+After startup, runtime readers reuse that inventory without filesystem discovery, manifest rereads, or freshness checks. Narrow plugin selections are in-memory views of the same inventory. Changing an account or an agent's run workspace does not invalidate it. Explicit plugin lifecycle operations prepare a new inventory for installs, updates, removals, source or manifest edits, and discovery-root changes before publishing it to the running Gateway.
+
+Plugin enablement readers can pass `rootConfig` to `resolveEffectiveEnableState` without constructing a normalized `config` copy. The policy owner reuses the published runtime configuration's prepared policy and refreshes it on publication; an explicitly supplied normalized `config` still takes precedence. Public normalization helpers continue to return caller-owned mutable copies.
+
+Plugin inventory responses share prepared enablement and package-ownership facts between install-health diagnostics and catalog presentation. Those facts belong to one synchronous response preparation, after hosted catalog loading and before optional category loading; maintenance operations still prepare their own current ownership checks.
+
+Bundled official catalog identities are admitted and indexed once per process. Inventory reads reuse those static entries instead of rescanning the bundled catalog for each installed plugin. Hosted catalog refresh and installed-package provenance checks keep their own lifecycles.
+
+Runs outside the agent's resolved workspace reuse the agent's prepared plugin generation instead of loading the plugins again. Rooted background runs, including skill workshop reviews and isolated cron jobs, qualify when their bootstrap workspace resolves to that agent's resolved workspace. In a Gateway, every other run workspace also qualifies because it resolves to the same boot inventory. Their execution directory and filesystem confinement remain at the task root, including during compaction. Hosts without that shared inventory, such as direct CLI runs in another workspace, retain their own workspace-scoped generation.
+
+Tool resolution treats plugins that the prepared generation recorded as disabled or failed (for example, a memory plugin outside the selected memory slot) as settled outcomes and does not load them again for each turn.
+
+Completed plugin generations reuse their registration grouping and manifest-owner lookup across turns. These facts belong to the registry publication and metadata snapshot; registration in progress stays uncached. Tool factories still receive fresh turn contexts, and returned tools retain that turn's authority, delivery, memory, and sandbox bindings rather than borrowing a later turn's permissions.
+
+Plugin reload reconciles config watcher events after asynchronous metadata preparation. An unchanged source event does not cancel the operation; newer writes or changed config, install records, or source ownership still supersede it.
+
+Ordinary plugin source captures use independent files, including copies reached through aliases. On filesystems with copy-on-write support, these captures can share storage without sharing file identity, reducing data writes for large plugins. File containment and receipt validation run during capture; later source edits take effect on the next reload rather than invalidating the existing snapshot.
+
+Source capture preserves referenced URL assets, including directory URLs that the plugin uses. Unused standalone URL calculations do not cause the surrounding directory to be copied into the plugin generation.
+
+Asynchronous host loading prepares selected non-bundled plugin sources and bundled state-operation import closures in a shared worker before evaluating or registering plugin code. Bundled operation captures preserve the same immutable bytes and recovery ownership without retaining the source transpiler in the Gateway main thread. Selection, trust checks, and entry-path validation happen first; the host checks inventory retirement and the expected source digest before installing the prepared capture. Each artifact keeps its own source, admission facts, callbacks, and recovery custody inside that worker. Synchronous source resolution services sibling callbacks and completed tasks, so a sibling's pending host publication does not hold the worker slot. Existing registry and plugin-instance caching provide reuse; the worker retires after its last artifact and recovery snapshot are disposed. A failed acquisition records that plugin's load error without discarding successfully prepared siblings. Unexpected worker exit invalidates its captures and queued preparation; subsequent preparation starts a new worker. Synchronous CLI loading and loading inside an existing compute worker retain their inline acquisition path. Plugin evaluation and registration still run in their original owner; moving source preparation does not make arbitrary plugin initialization nonblocking.
+
+Legacy session-key migration selects plugins that declare that capability before checking channel presence. Owners already eligible under migration policy do not need a channel-presence check. Scoped selections check persisted credentials only for their channel owners, so unrelated authentication modules stay unloaded during Doctor repairs. This credential scope does not limit environment-based presence signals: configured channels with missing plugins still produce installation and recovery hints.
+
+Provider-reference ownership is indexed once per immutable manifest registry, including runtime auth/catalog aliases and CLI backend fallbacks. Lookups share frozen owner lists; a refreshed or narrowed registry gets its own index while retained generations keep their original ownership facts.
+
+Model-id normalization policies are prepared with each snapshot or narrowed view. Model selection, catalogs, and runtime normalization carry that view forward instead of rebuilding policies from its plugin list. Config mutations acquire those policies only for authored provider catalog model IDs; generic agent model references do not need the plugin inventory. An empty view remains authoritative and cannot inherit policies from a broader process snapshot.
+
+Fleet model-runtime preparation captures one immutable config and authored-source view per build. Plugin argument handling, activation fingerprints, and agent lookups reuse those captured facts across agents. Dynamic model hooks still receive each agent's directory, workspace, and model registry. Preparation yields to the event loop between agents so Gateway requests can run during a large fleet build; config refresh creates a new capture. Existing installations need no configuration changes or migration.
+
+The snapshot and lookup table keep repeated startup decisions on the fast path:
+
+- channel ownership
+- startup plugin planning
+- startup plugin ids
+- provider and CLI backend ownership
+- setup provider, command alias, model catalog provider, and manifest contract ownership
+- plugin config schema and channel config schema validation
+- startup auto-enable decisions
+
+Startup and hot replacement share one prepared registry publisher and the same inventory across all configured agent workspaces. Reload preserves workspace provenance so an unchanged linked plugin is not replaced when another plugin changes. Replacement retains unchanged plugin instances and validates candidate metadata before draining affected services and channels. A retained instance keeps its original registration and `api` object; it is not registered again. Plugin-wide runtime capabilities such as `api.runtime.llm.complete` select the committed plugin inventory when each call starts, so a retained context engine can still start new completions after another plugin is replaced, including from work that restores an earlier turn's context. Reordering object keys in equivalent metadata or settings does not replace a registration; changed values, ordered lists, and explicit reload requests still do. It stops and disposes the previous registration before registering its replacement, then publishes runtime methods and metadata together. Connected clients refresh their plugin capabilities after publication. If replacement fails before publication and cleanup succeeds, recovery registers captured previous code and configuration with fresh resource ownership. A failure after publication reports the committed generation. Plugin runtime imports remain lazy; retaining metadata does not activate every discovered plugin.
+
+Config-only service reloads keep a pending restart when cleanup exceeds the five-second observation deadline. The Gateway logs the deferred restart, retains the original cleanup work, and automatically starts the replacement after cleanup succeeds. Newer config reloads and registry handoffs supply the replacement configuration; shutdown cancels the pending restart. Rejected cleanup remains a visible service failure and never permits a replacement to acquire its resources.
+
+Durable final channel replies can use the admitting Gateway's current registry after an unrelated reload only when their exact channel registration is retained. The handoff also requires unchanged channel settings, shared channel defaults, and owning-plugin settings. Channels may add sender preparation for credentials that can change outside config: Telegram checks its resolved bot credential and pins it for the final send, so changed token-file contents, environment tokens, and SecretRef values cannot select another bot. Channels without sender preparation deliver with the unchanged successor config. New or replaced channel registrations, changed settings, and closing Gateways remain blocked. This never falls back to another Gateway or retries a send that may already have reached the provider.
+
+The prepared-model replacement gate holds new runs while already admitted runs finish using their original callbacks. Ordinary quiescence closes plugin admission before resource replacement; there is no separate reservation fence on retained work. Detailed readiness and logs report the retained-work count and drain deadline; the final RPC receipt reports application and any drain notices. Reload from the instance's own active callback or a live turn borrowing that same instance fails during preparation to avoid waiting on itself. Idle prepared publications and closed turn scopes do not block replacement. Nested static model acquisition that matches a still-open turn lease borrows that turn’s original generation before checking the replacement gate, so the turn can finish while an external reload drains it. Borrowing cannot change the agent, workspace, configuration, or selected plugin owners. Explicit live catalog discovery still follows ordinary admission and refresh. Callbacks and consumers without a matching turn lease still cannot wait on their own reload, including an external `--wait` request. Arbitrary nested cross-plugin dependency chains are best effort; cancel `--wait` or restart if such a chain cannot settle.
+
+Reply model preparation uses the configured agent’s inventory workspace across session execution directories. A nested run with matching agent and configuration can reuse its still-open parent lease’s inventory workspace, including a launch override, while tools keep the requested execution directory. Different selections and closed leases still pass through the prepared-runtime admission owner.
+
+A delivery-enabled requester continuation refused at its initial runtime acquisition finishes as failed and uses ordinary final delivery for a failure notice. Check the conversation and logs before retrying after the reload. Cancelled or revoked work cannot send this notice; a refusal after earlier execution keeps its existing error path.
+
+While admitted work drains, ordinary model catalog, auth-status, and chat metadata reads continue using the active publication. Catalog refresh work, downloaded catalog adoption, and new execution still wait. Published facts retire when resource replacement begins; an admitted-work timeout keeps those facts available without rebuilding them. An unfinished startup publication still follows its existing cancellation and recovery path.
+
+Session lists wait for replacement provider policy when the previous runtime has retired. Disconnecting a reader cancels only that reader’s wait; other readers and the reload continue. Lists resume with the published replacement catalog and never invoke retired provider callbacks.
+
+Retained work and in-flight calls share a 60-second pre-stop budget. Retained runs finish before ordinary call admission closes. Existing calls then settle while published metadata remains readable. Sidecars release their capability consumers before the remaining finite consumers drain; memory teardown retains cleanup authority for its exact retiring provider instances until the raw cleanup settles. Replacement stops services and channels only after that handoff. Idle service and channel custody stops later with its owners. If work does not finish, the reload fails once, resumes admission, and clears the reload status; the previous plugin generation keeps serving. The deadline does not cancel agent runs or permit disposal of unfinished writes. Retry `openclaw plugins reload <id>` after that work finishes, or explicitly select `--wait` for a shared ten-minute pre-stop drain budget, matching the plugin lifecycle wait budget. Both modes hold new agent runs behind the replacement gate until completion or rollback; `status` exposes the pending reload and its drain deadline in JSON. The extended wait also expires with the previous generation serving. The explicit wait belongs to its requesting connection: Ctrl+C or disconnect cancels the pre-publication wait and runs the same rollback. Cancellation never disposes admitted work, bypasses cleanup, or reverses a committed publication. Service shutdown and recovery retain their bounded deadlines. Successful publication logs the applied replacement and emits `plugins.changed`.
+
+Automatic config reloads treat an admitted-work timeout with successful rollback as deferred. The previous generation resumes serving, and the config watcher retries the latest saved configuration after that generation's work and cleanup settle. A waiting config-write receipt still reports that the bounded attempt did not apply: keeping it open could prevent the writing turn itself from releasing the old generation. Check `config.get` after the work settles to confirm the active revision. The retry observation does not keep plugin admission closed or extend the drain budget. Explicit plugin reload requests still report their bounded drain failure; cleanup failures and failures after publication remain errors.
+
+A provider or harness plugin load failure remains recorded in its runtime generation. It makes that plugin unavailable without superseding the generation or blocking models that use healthy plugins. Inspect the failing owner with `openclaw plugins inspect <id> --runtime --json`. Use `openclaw doctor --fix` for supported installation repairs, or fix the reported problem in plugin code, then request `plugins.reload` through the admin Gateway API to load the repaired plugin.
+
+Read-only model validation, effective tool inventory, and isolated model checks acquire their own registrations when they need executable provider or harness hooks. Concurrent callers share the prepared generation, and its lifecycle disposers run after the final borrower and any unfinished preparation or catalog work settle. Cancellation does not close a registration while its callback is still running. Process shutdown revokes these registry views before joining their remaining work and disposal. Catalog reads that need only metadata do not acquire these executable registrations. Effective tool inventory prepares only configured and session-selected model facts, including captured catalogs from enabled providers; it does not refresh the full model catalog. Session selections do not change the configured model picker.
+
+Cold inspections within a Gateway inventory reuse native ESM code from unchanged npm installations across their separate registrations. Reuse is bounded by that inventory's installed execution entries, configured workspaces, and SDK selection. Inventory retirement releases retained source captures and preparation workers after the final inspection borrower finishes. Editable installations and inspections outside the prepared inventory keep independent captures. Node retains already evaluated ESM modules until process exit; this reuse prevents another graph from being evaluated on every cold inspection, rather than unloading old graphs after a plugin replacement.
+
+Each plugin service startup attempt owns one cleanup operation, including failed starts. Hot replacement observes candidate startup and service cleanup with five-second deadlines. Candidate startup failure rejects the replacement. Replacing a loaded plugin requires successful cleanup before another registration can acquire its resources; pending cleanup or a cleanup error can therefore reject replacement and prevent automatic recovery. A pending startup retains its resources until it finishes and its one stop operation settles. Plugin removal can report deferred cleanup; Gateway shutdown joins that work before releasing the plugin's resources. Disposal stops new registered calls while physical cleanup finishes. Service cleanup is not invoked a second time merely because an observer timed out. If a command catalog refresh also stopped unchanged channels, failed replacement resumes those healthy registrations while the failed plugin remains fenced.
+
+A replacement that fails before publication automatically tries to restore the previous code and configuration. If its channels have already stopped, recovery observes pending service cleanup and admitted work once, for up to 60 seconds. Its observation has an independent Gateway-owned cancellation signal, so a disconnected reload requester cannot interrupt recovery. Only service-stop observer timeouts qualify for this wait; channel-stop failures, rejected service cleanup, and failed candidate cleanup still prevent recovery. The wait joins the original service stop promises, including services whose shared stop deadline was already exhausted. After cleanup and work settle successfully, recovery disposes the old registration, registers its captured code with fresh resource ownership, and restarts its channels. Manually stopped accounts stay stopped. A timeout never grants another registration ownership of an unfinished write's resources, and retries do not repeat service stop or resource disposal. Uncommitted failures also attempt to republish the prepared model runtime against the previous config, even when plugin recovery fails or cannot safely run, unless the Gateway is shutting down.
+
+For plugin-only replacements that fail after publication, the Gateway attempts to republish model catalogs and reply dispatch against the committed configuration and plugin generation. The original plugin failure remains visible, including failed channel readiness. If model publication also fails, the operation reports both failures and asks the operator to retry the plugin reload or restart the Gateway. Shutdown or Gateway replacement cancels this recovery; mixed config changes with unfinished runtime work retain their existing restart recovery.
+
+When recovery cannot safely finish, the operation settles as failed and releases its channel reload pauses. Channel health reads retain captured account facts without invoking unavailable plugin code; healthy registrations can restart normally. Detailed readiness reports `failing: ["plugin-reload"]` with the affected plugin IDs and an actionable recovery reason, instead of leaving an indefinite "reloading" state. Retry `openclaw plugins reload <id>` after admitted work and pending cleanup settle, or restart the Gateway. Permanent cleanup failures still prevent another registration from acquiring those resources.
+
+A later reload can retry after pending cleanup completes successfully, without capturing code from the disposed instance again. If draining fails after services or channels stop but before disposal starts, the quiesced registration retains its original loader for the next reload's recovery capture; ordinary plugin calls remain closed when recovery fails. Rejected replacements and failed recovery registrations retain the same cleanup barrier. Recovery preserves existing error records as diagnostics without executing their code. It never substitutes current package files for an already retired registration whose captured source has been released.
+
+Missing captured source files produce a replacement warning instead of preventing a fresh plugin load. Recovery snapshots must contain every previously captured input, including companion files. If replacement then fails, recovery restores only plugins with available captured code; it does not substitute changed installed files for a missing snapshot. Existing call-drain and resource-cleanup requirements still apply.
+
+At the end of a reload, the Gateway awaits disposal of unused recovery snapshots without blocking the event loop on their preparation workers. Cleanup attempts every snapshot before reporting failures, so one failed disposal does not strand unrelated captured source.
+
+Gateway shutdown also joins actual harness, MCP, LSP, embedding, and media cleanup after their initial grace periods. When clearing the active registry, plugin host cleanup can advance to later hooks after a timeout, but registry resets and shared database closure wait for its actual completion. These waits preserve resources for cleanup; they do not restore a retired plugin's runtime authority.
+
+Shutdown closes admission before waiting for config reloads to settle. Those reloads can still defer cleanup held by existing consumers. Final Gateway close releases those consumers, joins retained cleanup, and reports its failures before another Gateway can start.
+
+Gateway config reload and startup metadata persistence use process-bound plugin lifecycle leases. After a forced stop, the next process can reclaim a lease whose recorded same-host process identity is proven dead. Package installation leases retain their expiry protection because installer subprocesses can outlive their parent. A contended lease logs its holder and observed expiry while waiting; older leases without process identity must still expire before startup can safely refresh the plugin index. This uses the existing state schema and requires no update migration.
+
+Executable CLI cleanup reports each disposer that exceeds five seconds and proceeds with later cleanup without canceling the pending work. On macOS with Node's system CA support enabled, automatic exit after command completion waits for this pending cleanup to finish. Explicit command exit requests and the update exit watchdog retain their bounded behavior.
+
+Standalone plugin and Codex supervision MCP stdio services retain their discovered registrations through accepted tool work, harness cleanup, and nested SDK provider lookups. Terminal shutdown cancels and joins handlers before releasing these registrations and awaiting their resource disposers. Transport-close and registration-disposal failures reach the serving caller. Programmatic servers created from supplied tools leave those resources with the caller; closing and reconnecting the same server does not dispose them.
+
+Hot registry publication does not wait for retired host cleanup; terminal shutdown also joins cleanup already started by earlier registry replacements before resetting shared state. Activation and rollback apply only to their captured registry version. An activation superseded by a lifecycle callback reports an error.
+
+The cache rule is documented in [Plugin architecture internals](/plugins/architecture-internals#plugin-cache-boundary): Gateway retains one cache generation, while explicit management operations use isolated generations of the same cache. There are no wall-clock TTLs for Gateway metadata.
+
+Gateway `plugins.list` serves installed metadata without waiting for hosted catalog or category enrichment. While the generation's shared enrichment is pending, the response uses bundled presentation metadata and includes a pending diagnostic; refresh the list to read the completed facts. Unavailable category enrichment remains recorded until an explicit catalog refresh or metadata generation change. Config validation, enablement, and runtime service health still use current local facts on each read.
+
+Install, update, registry refresh, and doctor flows may read fresh package metadata to validate their changes. A management snapshot or installed-index write alone does not replace the running Gateway's inventory: the Gateway lifecycle owner must prepare and publish it. Runtime flows use their selected snapshot or lookup table instead of falling back to cold management paths.
+
+### Runtime instance and source lifetime
+
+Inference verification fingerprints the artifact selected by the runtime's
+source/build preference, including explicit bundled source overrides. Loading an
+unchanged plugin preserves that proof; changing its selected runtime files
+invalidates it. For bundled modules embedded in a standalone executable, the
+fingerprint combines the image's build identity, compilation mode, and build
+flavor with the retained plugin sidecar files. Embedded JavaScript does not need
+a second copy on disk.
+
+A managed runtime instance owns its module results, registered callables, and
+runtime-store slots. Non-bundled instances also own a captured source artifact.
+Package plugins capture their package inputs when the instance is created.
+Standalone files capture their entry and statically known inputs
+without copying the surrounding workspace. Bundled runtime and setup modules,
+including TypeScript source entries, share the host's code identity; each inventory
+owns its registered callbacks and cleanup. Explicit bundled reload refreshes those
+registrations and reports `restartRequired: true`. Restart the Gateway to load
+updated bundled, host, or SDK code, and
+rebuild first when the installation loads compiled output. Embedded executable code
+changes require a newly built executable. External on-disk plugins continue to
+capture updated source and dependencies on explicit reload.
+
+WebAssembly libraries remain ordinary captured assets even when they use a `.so`
+filename. Directory asset references reuse an active capture walk; filesystem
+directory cycles still fail capture.
+
+Source preparation workers wake synchronous host readers after posting results,
+callback requests, and consumption acknowledgements. The shared sequence is a
+progress hint only: the host still services the transport and checks the actual
+task receipt and deadline. Readers retain bounded polling for worker failures.
+
+Doctor retains an unexecuted source snapshot across its maintenance phases.
+Each phase admits fresh callback instances with private module files and settles
+their cleanup before releasing its lifecycle lease. The snapshot is reused for
+the whole operation; edit plugin sources between Doctor runs, not between phases.
+The next invocation captures current files and dependencies. Retained source custody
+ends when Doctor finishes, including before a diagnostic process exit. This does
+not change the running Gateway's inventory or require an installation migration.
+
+Conditional package aliases retain their package metadata, and native
+Node conditions, including `module-sync`, select the target from that captured metadata.
+Source inspection uses the same synchronous-module condition without evaluating plugin code.
+Captured source retains the difference between authored imports and require calls, so Bun's
+compiler resolution previews do not acquire a deferred dependency before its first call.
+Missing selected targets remain absent for that captured generation. Legacy packages
+without an exports map also admit their existing main or index entry without
+executing unselected code. Native entries reuse the recorded admission below.
+The selected package's remaining body is captured before execution.
+Dependency links retain existing nested installation locations. Dependencies installed
+beside a package remain siblings in the capture, including optional platform packages
+whose native assets are read through relative filesystem paths. Other ancestor
+dependencies link at the captured package root. Capture does not add `node_modules` beside
+individual source files, so native-addon loaders can still locate their package
+root and its build assets.
+
+Native artifacts are admitted with their owning package directory, preserving
+the binary's package-relative path and declared companion library dependencies.
+Artifacts without an admitted package root retain their containing directory.
+Installer-owned directories use same-filesystem hardlinks or an existing
+retained-directory reference; capture onto another filesystem copies the native
+package and its companions. Files inspected by plugin
+safety checks keep independent copies. Mutable source trees retain one private
+directory snapshot per admitted identity, preserving old binary and companion
+bytes through in-place edits. Files in this namespace are prepared at admission;
+module execution remains on demand. Registrations share admission facts without
+sharing their runtime authority.
+Managed npm plugins support capture storage on another filesystem, including a
+`tmpfs` mount, and npm roots reached through symlinks. Retained native
+directories validate the admitting plugin's OpenClaw peer against the selected
+host's resolved package root. A hoisted native dependency does not need its own
+host link, but any host it resolves must match. A mismatch names the peer path,
+resolved target, and selected host; run `openclaw doctor --fix` with that host,
+then reload the affected plugin. The loader records the failure for that plugin
+and continues loading unrelated plugins.
+Private Doctor inspections keep their native admission facts separate from the
+operator's state. Temporary captures copy native packages and their companions,
+so inspecting an update rehearsal never adds hardlinks to its private data.
+Their temporary captures never become deferred writes to the
+installed index after inspection ends; ordinary deferred writes retain their
+original state directory.
+When native packages share a dependency, admission reconciles identities only for
+its own hardlinks, even when the filesystem's ctime has not advanced. Recorded
+digests are checked against installed bytes before promotion, including companions
+previously captured as independent copies. Unchanged companions remain valid during
+Doctor and reload; source content checks still reject edits.
+When file symlinks are unavailable, a generation can use hardlinks only if its
+directory preserves every captured companion and the selected host SDK. Otherwise
+that plugin reports a load error asking for file symlink support; the update
+continues with the existing plugin-failure warning behavior.
+Within a capture, admission checks each immutable namespace and companion-directory
+mapping once, resolving each member once even when parent and child native directories
+overlap at the same placement. Preparing more modules reuses those facts and checks newly admitted
+placements. Replacement captures, host selection, and recovery copies validate again,
+so Doctor and Gateway preparation avoid repeated walks without reusing another
+capture's verdict.
+The existing installed-index SQLite payload records directory membership, device,
+inode, mode, size, mtime, and ctime identities, SHA-256 digests, and the initial
+generation receipt. Unchanged warm startup reuses those facts. Added, removed, or
+changed companions require admission again. If a recorded capture directory is
+missing, fresh admission reads the installed package without promoting the missing
+capture's identities. This also applies to post-update Doctor with older updaters.
+Ctime-only uncertainty is resolved
+with a bounded rehash, including ordinary companion files whose inodes another
+capture retains or releases. First-read metadata stamps from Windows security
+software do not invalidate otherwise unchanged native companions. Mutable source
+copies are compared with their source bytes before accepting ctime-only drift,
+and completed companion digests retain the observed file identity. Legacy reload receipts keep their framed raw-byte value,
+so a changed receipt still requires streaming its native payloads.
+Read-only inspection never publishes its native admissions during later settlement.
+Deferred publication retains the original database authority and state directory.
+Gateway startup uses the admitted in-memory receipts without waiting for their
+advisory persistence. Model workers receive those same admitted facts, and cache
+retirement joins pending receipt writes before releasing native captures.
+Doctor's private checks keep captured code in profile-qualified temporary storage,
+so removing their database snapshots cannot remove an image still loaded in the process.
+An entirely missing retired capture can be rebuilt from its installed source;
+missing files in a retained or partially present namespace remain load errors.
+Identity reuse cannot detect an edit that preserves every recorded identity field.
+Source code outside an admitted native namespace is captured and verified separately.
+Published native captures survive ordinary scratch cleanup. Doctor maintenance
+removes unreferenced captures while preserving installed-index references, warm
+generations, and live owners. System-temp fallback captures are scoped to their
+state directory; captures with unknown ownership are preserved.
+
+Gateway idle cleanup runs after startup and repeats hourly after each completed
+pass, deferring while the Gateway is busy and stopping during shutdown. It
+checks capture directories and npm retention markers before
+acquiring the plugin lifecycle lease. An empty scan makes no shared-state writes
+and leaves the Gateway's metadata caches intact. When candidates exist, cleanup
+uses a private operation-scoped cache and one fresh installed-index payload for
+install records and native receipt protection. Invalid receipts still preserve
+captures, and every deletion retains its live lease and custody checks. The
+private cache is disposed before the lease is released. These best-effort scans
+do not freeze the filesystem: artifacts created or retired after inspection
+remain for a later cleanup attempt.
+
+Each captured generation links the selected host `openclaw` package so Workers
+and child processes started from its modules can resolve the host SDK. This link
+does not depend on the main thread's module hooks and is recreated during recovery.
+Imports of resolved SDK file URLs and absolute paths keep the same host identity;
+they do not create a selective copy of the host package or its runtime chunks.
+Deferred SDK imports and `import.meta.resolve()` retain the generation's selected
+source or built host even after the active plugin cache changes.
+Snapshot cleanup and update source inspection do not descend through these links
+into the host package.
+
+After the existing runtime, setup, or executable-discovery checks admit an entry,
+its instance captures imported shared files and dependency modules on demand.
+Relative, absolute, and file-URL imports use captured files; TypeScript dependency
+entries compile in their own package scope. Metadata and install inspection remain
+confined and do not acquire executable shared inputs.
+
+Executable loading can follow a shared-module link by capturing its selected
+module separately. Cold source snapshots still reject links outside the plugin
+root, so deferred install batches and install-digest settlement require those
+inputs to be packaged as dependencies. Linked non-module resources outside the
+plugin root are not captured by this module-loading path.
+
+A first-demand `import()` or `require()` can observe later source edits; captured
+metadata and entry bytes remain unchanged. The initial source digest covers the
+creation-time capture; later inputs extend explicit source-current checks without
+changing that digest. Invalid optional package metadata fails only when selected.
+Module acquisition uses the instance's current admission, and disposal closes
+further capture.
+Runtime and setup retirement use the existing five-second instance shutdown budget.
+If calls, retained consumers, or cleanup exceed that budget, logical retirement
+returns a forced-retirement diagnostic with the still-running call and consumer
+counts. Ordinary invocation authority closes and late successful results are
+refused. Physical cleanup continues asynchronously: captured files and module
+resolvers remain until calls, consumers, and cleanup tails actually settle.
+An explicitly retained consumer keeps its admitted turn and cleanup authority until
+its host closes or releases it. Its callbacks and late results are refused after release.
+Shared writable state stays owned until its cleanup finishes; late cleanup
+failures remain failures of the resource handoff. Web provider
+descriptors keep their registration identity; runtime projections bind their
+factories and returned tools to the selected plugin instance. Synchronous source
+inspection and failed capture still clean up before returning.
+
+Default source captures live under
+`<stateDir>/tmp/plugin-captures/<instanceId>/captures/`, with a random instance ID
+and one `owner.sqlite` token holding its native lifetime lease. Gateway
+metadata and its source captures retain the same process-local instance; a
+concurrent CLI process owns a separate instance. Releasing one capture cannot
+retire another capture or a still-running metadata owner.
+During updates with an explicit `TMPDIR`, source captures use that temporary volume
+instead. Their native custody and invocation cleanup remain unchanged.
+Gateway metadata supplies its scheduler for hourly cleanup; executable CLI
+commands own maintenance through their invocation scope. Capturing source alone
+does not create a timer. Cleanup does not retain the first command's invocation context.
+The managed `tmp/plugin-captures` subtree is excluded from source snapshots when
+the state directory is inside a plugin's source directory. Recovery can still
+load a preserved source package from within that subtree.
+
+Executable CLI commands retire their plugin inventory through the existing invocation
+resource scope on success and failure. Inventory adopted by Gateway publication
+remains with Gateway metadata retirement. At process exit, the capture owner
+synchronously retires any remaining instance that holds this process's
+custody, including explicit exits and CLI-handled signals. Forced termination
+still relies on startup reclamation. Plugin cleanup owns this capture subtree;
+reclamation removes captured payload before retiring the token so a partial deletion
+remains retryable. The token closes before its directory is removed, including on Windows.
+
+A native library mapped in the current process retains its capture and token
+through process exit, even after its JavaScript module cache entry is removed.
+Cleanup records `retained-by-loaded-module` once for that capture lifetime instead
+of trying to unlink a loaded Windows image. Unchanged native package identities
+continue to share the retained payload across reloads. Native-load attempts also
+retain their capture when initialization throws: the native image can remain
+mapped after the initialization error.
+
+Before runtime plugin loading, startup attempts receipt-aware cleanup under
+exclusive maintenance ownership. It can reclaim a retired, unlocked instance
+immediately, including unpublished native payloads retained until the previous
+process exited. Published native payloads still referenced by the installed index
+remain available. If another process holds state ownership, this opportunistic
+cleanup silently skips without asking the operator to stop a healthy Gateway.
+Other maintenance or cleanup failures produce a warning and startup continues;
+observational reads leave captures untouched.
+
+Hourly cleanup also inspects this owned subtree. An instance becomes eligible
+after one hour. Age alone never authorizes removal: for token-bearing instances, cleanup must
+also acquire the existing token's exclusive native lease to prove released custody.
+This works after process termination or reboot without PID or boot-namespace records
+and preserves the same cleanup contract for shipped `owner.sqlite` markers.
+Cleanup rechecks directory and token identity before removal. Live leases,
+unreadable entries, symlinks, and invalid tokens preserve files. An aged instance
+left without a token by interrupted allocation or older partial cleanup is
+reclaimed directly on all platforms if it has no native payload and is not
+retained by the current process. The plugin source capture directory owner
+rechecks its directory identity and, where available, the current UID before removal.
+Recent tokenless roots and roots containing native payloads are preserved.
+Allocation creates the token before creating payload, and disposal removes
+payload before its token.
+The token belongs to its capture instance; captures do not create a global
+coordination database.
+Removal remains asynchronous and advisory. This subtree is excluded from state
+backups because its captured package bytes are reconstructible.
+
+Metadata retention does not create directories until a source capture is needed.
+If the state directory cannot accept captures, loading falls back to an isolated
+system-temporary instance and reports a warning. Normal disposal still removes
+that instance; automatic cleanup does not scan unrelated system-temporary roots.
+There is no total disk quota, and an active instance may legitimately exceed the
+one-hour cleanup grace period.
+If its payload directory is removed while the instance still holds custody, the
+next capture recreates that directory under the same lease. This does not restore
+previously deleted captured files or recreate a missing ownership directory.
+
+Hourly cleanup also reclaims tokenless `openclaw-plugin-build-*` and
+`openclaw-model-catalog-*` roots in the selected state's temporary directory and
+the current system temporary directory. Roots must be older than one hour and
+have no custody token or native payload. The same directory identity, current-process
+retention, and UID checks apply on all platforms; no process or open-file census
+is required. Legacy producers that outlive the grace period receive best-effort
+cleanup. Inspection or removal failures are reported once per sweep and retried
+later without interrupting loading or updates. Managed instances with custody
+tokens continue to use their native lease on all platforms.
+
+Older `openclaw-plugin-build-*` directories in the system temporary directory
+have no owner record proving whether their producer is still alive. Doctor reports
+tokenless `openclaw-plugin-build-*` and `openclaw-model-catalog-*` roots under the
+state temporary directory, `~/.openclaw/tmp` even when another state directory is
+selected, the current system temporary directory, `/tmp` on
+POSIX hosts, and recorded managed-service `TMPDIR` locations. It deduplicates
+directory aliases and reports each capture's path and regular-file size without
+following links inside captures. Catalog roots include all nested
+`openclaw-plugin-build-*` trees in their reported size and removal receipt.
+
+`openclaw doctor --fix` reclaims these legacy roots only while Doctor holds Gateway
+maintenance and a complete host process census finds no other OpenClaw producer.
+The rule rechecks both conditions before each removal and prints a receipt listing
+the paths removed and their sizes. A live sibling, unavailable census, or missing
+maintenance authority leaves the captures in place with an explanatory message.
+Captures created or changed during the current process and token-bearing captures
+remain untouched. Linux and macOS preserve native argument boundaries when
+inspecting processes. macOS can also identify native system services
+under another user by their kernel executable path and valid Apple platform signature; unavailable arguments for
+other live processes keep cleanup blocked with a reason.
+On hosts without a complete process census (including
+Windows and recognized container environments), Doctor reports legacy
+captures but skips their removal. For a container sharing the host's temporary
+directory, run maintenance on the host after stopping its OpenClaw containers.
+Doctor's maintenance repair remains separate from runtime reclamation: its
+broader inventory includes old service temporary locations the current runtime
+does not use. Modern captures retain their custody-token cleanup.
+
+Configured Gateway agents share one model-catalog worker per plugin-inventory
+lifetime. Agent and authentication facts belong to each task; plugin registrations
+and captured source remain with the shared inventory. Standalone hosts that supply
+their own environment retain an isolated catalog worker for that environment.
+Provider-discovery entries use the exact selected runtime instance's captured
+source when it is already loaded, so discovery does not create a second copy of
+the same plugin package. Standalone discovery keeps its own setup lifetime.
+Public API sidecars follow the loader-selected setup or runtime artifact and its
+plugin root. A built Gateway uses the selected JavaScript sidecars even when
+discovery metadata still points at the source checkout; source-based instances
+keep their TypeScript sidecars and captured-source membership.
+The loader records its scoped registration inputs with their metadata inventory,
+so catalog workers reuse those facts instead of rerunning setup activation.
+Each worker retains the current plugin registration context for each loader
+workspace, shared by agents with matching configuration, environment, and plugin
+inventory. Alternating unchanged workspaces reuse their captured source; replacing
+one workspace does not evict another. Within that worker, an unchanged installed
+native ESM entry keeps one module evaluation and capture URL per workspace across
+configuration revisions. Its capture and compiled TypeScript helpers remain
+available for lazy imports after the originating generation is released. Each
+generation still owns its registrations and resolution hooks; released generations
+cannot use a replacement generation's API to register providers.
+Different workspaces keep separate modules. Node retains each native module until
+worker retirement, so new installed paths or workspaces still add resident modules.
+Installed source replacements are picked up when the worker restarts; explicit
+recovery keeps its separate source custody. CommonJS capture and disposal are
+unchanged. Agent
+credentials and configured model facts travel with each request; catalog jobs do
+not rebuild the agent workspace. Discovery reuses the registrations already
+acquired by that context. The first catalog request prepares registrations for the
+agent's known configured and credential providers together; only the requested
+providers run catalog hooks. Newly observed owners extend that context without
+discarding earlier owners. Replacement releases them after admitted work settles.
+Native admission runs outside the 180-second catalog refresh deadline, so a slow
+filesystem does not repeatedly discard and recapture the same package. Each verified
+native namespace member advances a counter, forwarded through the existing worker
+task channel at most once per second unless the active plugin changes. The parent allows admission
+to continue while that counter advances. After 180 seconds without progress, it
+records a failure naming the plugin and native reference verification stage and
+closes the worker without automatically recapturing that inventory. Reload the
+plugin or restart the Gateway to retry. Parent probes and queued requests remain
+bounded; provider discovery starts its own 180-second deadline after admission.
+Inventory retirement and shutdown still close the worker.
+After successful physical cleanup, retired plugin instances release their registry
+references while preserving revocation. Native module exports no longer retain the
+disposed registry through instance ownership, and stale calls remain rejected. Pending or failed
+cleanup retains its custody.
+Successfully disposed registrations leave their plugin caches.
+Failed model-runtime refresh diagnostics retain the error message, name, code, and
+materialized stack, not the failed build or its cause graph. Active publication
+settlement still uses the original failure for lifecycle recovery.
+
+Catalog observation is passive. Inventory requests can ask the catalog owner to
+renew expired providers while returning its accepted rows. Chat metadata and
+session projections only observe publication, so a refresh cannot schedule itself
+through its own notifications. Selected native-model discovery has an independent
+acquisition owner and does not wait for provider inventory renewal. Both owners
+merge their results with the latest accepted counterpart before publication.
+Catalog workers use a 512 MiB V8 old-generation limit rather than inheriting the
+Gateway's heap budget. Startup clears V8's process-wide heap overrides after the
+main isolate is initialized, so explicit heap flags still size the Gateway while
+worker limits remain effective. Explicit V8 flag-freezing or contradictory-flag
+checks prevent this reset and emit a warning. Native and external allocations
+are outside the worker limit. When a Gateway catalog
+worker fails, the Gateway logs a warning with the reason and counts the failure in
+`status` as `workerPools.modelCatalog.workerFailures`. Other than stalled native
+admission, failures republish the affected agent catalogs on a new worker.
+
+Catalog and authentication refresh tasks carry the host's prepared Claw consent
+provenance. Worker config reconstruction and provider imports consume these facts
+without opening or copying the shared state database. Host config publication and
+Doctor retain their existing provenance refresh and artifact-preserving inspection
+paths; stored data, schemas, and update/rollback behavior are unchanged.
+
+Credential persistence publishes fresh shared-store ownership before credential
+discovery. Login and explicit auth refresh join the credential owner's publication
+instead of creating another catalog generation for the same change.
+
+Model-catalog workers keep their captured plugin files in a worker-owned directory
+under the same managed capture instance, with custody retained by their producer.
+The parent removes any remaining captures after that worker exits,
+including cancellation and crashes. Files remain available while the worker is
+running, and retiring one worker does not remove another generation's captures.
+If the whole Gateway is killed, the existing hourly cleanup reclaims the abandoned
+instance only when it can acquire the existing token's exclusive native lease.
+The same rule covers shipped SQLite markers and works after a reboot.
+Age alone never releases captures.
+Cancellation releases compute capacity after the worker exits; terminal shutdown
+also waits for file cleanup. Failed file removal is reported as a cleanup warning.
+
+Loading metadata alone does not execute every plugin, and registration remains
+synchronous. Synchronously loaded TypeScript entries and their synchronous
+TypeScript imports retain Jiti's CommonJS compilation behavior, including `.mts`
+and `.mtsx` entries. Node evaluates the captured output. Keep top-level await out
+of synchronous entrypoints; start asynchronous work through lifecycle callbacks
+or a later dynamic import.
+
+Dynamic TypeScript imports preserve asynchronous CommonJS execution, including
+top-level await and `module.exports`, while source loaded from native JavaScript
+follows Node's module format. The first evaluation fixes that mode for the
+instance; resolving a module alone does not evaluate it. Compiler outputs are
+allocated on first resolution, not for every captured TypeScript file. A
+resolve-only call returns a stable existing path without compiling the module.
+Jiti-backed modules use Jiti's transformed runtime bindings for loader helpers,
+without a separate TypeScript analysis pass. Source
+`import.meta.resolve` retains Jiti's optional parent URL and resolution options,
+including custom conditions and `try`. The one-argument resolver uses the
+source's directory and package scope.
+Preparing a package module defers its capture resolver until an import or source
+inspection needs it. Explicit `JITI_TSCONFIG_PATHS` configuration still initializes
+the resolver at module preparation so later tsconfig edits cannot change the
+selected mapping. Preparation workers retain separate artifact isolation.
+Captures reuse resolution state for local TypeScript imports such as `./helper.js`
+when only `helper.ts` exists, avoiding repeated resolver setup and exception-based
+file probing. Existing JavaScript and Jiti's alternative filename precedence remain
+unchanged. Resolver state is released with its capture; new captures select
+current source inputs independently. Captured package manifests and sorted
+dependency declarations are reused for that capture's lifetime; new imports
+still resolve and validate dependency links. Native directory freshness checks
+continue to inspect current source metadata.
+Entries loaded from captured source retain evaluation failures for their instance
+instead of retrying through another loader. Core-shipped JavaScript and libraries
+loaded outside a captured plugin instance keep their existing native/Jiti loading
+behavior.
+
+The host Plugin SDK always stays on the host's native module graph, including
+when Jiti compiles a plugin entry. SDK aliases use resolved filesystem paths so
+symlinked checkouts cannot create another host owner. The running host selects
+source or built SDK modules; a plugin's file extension does not select a second
+SDK graph. Source hosts need a native TypeScript loader such as the repository's
+tooling preload. An SDK that cannot load natively fails instead of being evaluated
+again by the plugin transformer. Plugin reloads may create new instances of the
+plugin's private code, while existing and replacement plugins share host SDK
+identity and authority.
+
+Captured packages also retain a link to the selected host installation so child
+workers and processes can import its public SDK. These separate isolates use the
+installation's normal package exports; they do not inherit the parent's source
+aliases or authority. Capture disposal removes the link, never the host package.
+
+Managed TypeScript filename metadata (`import.meta.url`, `import.meta.filename`,
+`import.meta.dirname`, `__filename`, and `__dirname`) identifies the captured
+source so relative asset reads stay within that generation. Node executes compiled
+JavaScript from a separate directory; its module URLs and CommonJS cache keys can
+differ from the source filenames.
+
+Node owns plugin resolution through `Module.registerHooks`; Bun keeps its native/Jiti loader and `Bun.plugin` resolver even when `Module.registerHooks` exists.
+
+Bun uses its native/Jiti loader with a separate captured source artifact for
+each managed instance. Reload prepares fresh TypeScript entries and helpers while
+existing consumers retain their old instance. Disposal removes that instance's
+captured cache records and files without evicting its replacement or the host SDK.
+Native imports and Jiti imports retain their respective package conditions.
+
+Bun needs local package import/export targets to exist before native resolution.
+Selective captures therefore acquire existing files matched by those declarations,
+including conditional branches and wildcard targets, before evaluation. Unselected
+source remains raw bytes; its code and TypeScript configuration are not evaluated.
+This can read more files at startup than Node's demand-driven capture. Other
+deferred imports still acquire source on first use through the instance's current
+admission; already prepared modules need no new acquisition.
+Package imports that select a dependency promote its retained files together,
+including physical aliases of a prefetched entry. Compiler previews of deferred
+`require` calls do not acquire nested dependency bodies before the call executes.
+Bun keeps ownership of built-in package-import targets and their native validation.
+
+When using Jiti's TypeScript path settings, keep the original tsconfig files and
+configuration dependencies available while the plugin is active. Loaded modules
+retain their selected path mappings; previously unvisited modules may read those
+configuration files on first use. Newly loaded instances select the current
+path settings. On Windows, explicit and relative tsconfig paths still resolve
+managed imports from the instance's captured source, including lazy imports
+after source files are edited.
+
+Registry retirement revokes managed execution separately from physical resource
+release. An acquired inspection can release its execution authority while a
+borrower still holds the underlying registration resources; the last physical
+claim owns their disposal, including a cleanup work scope that remains usable
+after the releasing request has ended. Bare SDK provider results retain their own instance
+consumer, so their callbacks remain usable until the owning SDK host closes.
+That host joins admitted callback work before releasing consumers and resources;
+releasing the inspection still prevents new borrows. Gateway shutdown keeps shared dependencies
+until the owners that still need them have joined. These ownership rules do not
+make native plugins a sandbox or automatically close plugin-created resources.
+
+After admitted calls and plugin cleanup finish, captured-source membership retires
+before module resources begin asynchronous release. Unrelated public-surface
+lookups cannot re-enter a retiring capture worker; the registration and cleanup
+scope remain retained until resource release finishes.
+
+See [Plugin lifecycle and cleanup](/plugins/sdk-runtime#plugin-lifecycle-and-cleanup)
+for the plugin author's cleanup contract.
+
+An admitted agent turn keeps its original context engine through accepted commit
+and engine disposal. Reload can report deferred cleanup while that turn finishes.
+Starting engine disposal closes its normal callbacks immediately; the engine's
+cleanup remains owned until it settles.
+
+### Activation planning
+
+Activation planning is part of the control plane. Callers can ask which plugins are relevant to a concrete command, provider, channel, route, agent harness, or capability before loading broader runtime registries.
+
+The planner keeps current manifest behavior compatible:
+
+- `activation.*` fields are explicit planner hints
+- `providers`, `channels`, `commandAliases`, `setup.providers`, `contracts.tools`, and hooks remain manifest ownership fallback
+- the ids-only planner API stays available for existing callers
+- the plan API reports reason labels so diagnostics can distinguish explicit hints from ownership fallback
+
+<Warning>
+Do not treat `activation` as a lifecycle hook or a replacement for `register(...)`. It is metadata used to narrow loading. Prefer ownership fields when they already describe the relationship; use `activation` only for extra planner hints.
+</Warning>
 
 ### Channel plugins and the shared message tool
 
-Channel plugins do not need to register a separate send/edit/react tool for
-normal chat actions. OpenClaw keeps one shared `message` tool in core, and
-channel plugins own the channel-specific discovery and execution behind it.
+Channel plugins do not need to register a separate send/edit/react tool for normal chat actions. OpenClaw keeps one shared `message` tool in core, and channel plugins own the channel-specific discovery and execution behind it.
 
 The current boundary is:
 
-- core owns the shared `message` tool host, prompt wiring, session/thread
-  bookkeeping, and execution dispatch
-- channel plugins own scoped action discovery, capability discovery, and any
-  channel-specific schema fragments
+- core owns the shared `message` tool host, prompt wiring, session/thread bookkeeping, and execution dispatch
+- channel plugins own scoped action discovery, capability discovery, and any channel-specific schema fragments
+- channel plugins own provider-specific session conversation grammar, such as how conversation ids encode thread ids or inherit from parent conversations
 - channel plugins execute the final action through their action adapter
 
-For channel plugins, the SDK surface is
-`ChannelMessageActionAdapter.describeMessageTool(...)`. That unified discovery
-call lets a plugin return its visible actions, capabilities, and schema
-contributions together so those pieces do not drift apart.
+For channel plugins, the SDK surface is `ChannelMessageActionAdapter.describeMessageTool(...)`. That unified discovery call lets a plugin return its visible actions, capabilities, and schema contributions together so those pieces do not drift apart.
+
+Message action names use a deliberately closed, core-owned vocabulary so every transport can render every action. Plugins add action names through a core PR; runtime registration is intentionally unsupported.
+
+When a channel-specific message-tool param carries a media source such as a local path or remote media URL, the plugin should also return `mediaSourceParams` from `describeMessageTool(...)`. Core uses that explicit list to apply sandbox path normalization and outbound media-access hints without hardcoding plugin-owned param names. Prefer action-scoped maps there, not one channel-wide flat list, so a profile-only media param does not get normalized on unrelated actions like `send`.
 
 Core passes runtime scope into that discovery step. Important fields include:
 
 - `accountId`
 - `currentChannelId`
+- `chatType` (`direct`, `group`, or `channel` when the inbound route establishes it)
 - `currentThreadTs`
 - `currentMessageId`
 - `sessionKey`
@@ -168,284 +789,269 @@ Core passes runtime scope into that discovery step. Important fields include:
 - `agentId`
 - trusted inbound `requesterSenderId`
 
-That matters for context-sensitive plugins. A channel can hide or expose
-message actions based on the active account, current room/thread/message, or
-trusted requester identity without hardcoding channel-specific branches in the
-core `message` tool.
+That matters for context-sensitive plugins. A channel can hide or expose message actions based on the active account, current room/thread/message, authoritative conversation type, or trusted requester identity without hardcoding channel-specific branches in the core `message` tool. Treat `chatType` as discovery scope supplied by the current inbound route, not something to infer again from an opaque channel id; it is absent when that route did not establish the conversation type.
 
-This is why embedded-runner routing changes are still plugin work: the runner is
-responsible for forwarding the current chat/session identity into the plugin
-discovery boundary so the shared `message` tool exposes the right channel-owned
-surface for the current turn.
+This is why embedded-runner routing changes are still plugin work: the runner is responsible for forwarding the current chat/session identity into the plugin discovery boundary so the shared `message` tool exposes the right channel-owned surface for the current turn.
 
-For channel-owned execution helpers, bundled plugins should keep the execution
-runtime inside their own extension modules. Core no longer owns the Discord,
-Slack, Telegram, or WhatsApp message-action runtimes under `src/agents/tools`.
-We do not publish separate `plugin-sdk/*-action-runtime` subpaths, and bundled
-plugins should import their own local runtime code directly from their
-extension-owned modules.
+For channel-owned execution helpers, channel plugins should keep the execution runtime inside their own plugin modules. Core no longer owns the Discord, Slack, Telegram, or WhatsApp message-action runtimes under `src/agents/tools`. We do not publish separate `plugin-sdk/*-action-runtime` subpaths, and those plugins should import their own local runtime code directly from their plugin-owned modules.
+
+The same boundary applies to provider-named SDK interfaces in general: core should not import channel-specific convenience barrels for Discord, Signal, Slack, WhatsApp, or similar plugins. If core needs a behavior, either consume the bundled plugin's own `api.ts` / `runtime-api.ts` barrel or promote the need into a narrow generic capability in the shared SDK.
+
+Bundled plugins follow the same rule. A bundled plugin's `runtime-api.ts` should not re-export its own branded `openclaw/plugin-sdk/<plugin-id>` facade. Those branded facades remain compatibility shims for external plugins and older consumers, but bundled plugins should use local exports plus narrow generic SDK subpaths such as `openclaw/plugin-sdk/channel-policy`, `openclaw/plugin-sdk/runtime-store`, or `openclaw/plugin-sdk/webhook-ingress`. New code should not add plugin-id-specific SDK facades unless the compatibility boundary for existing external integrations requires it.
 
 For polls specifically, there are two execution paths:
 
-- `outbound.sendPoll` is the shared baseline for channels that fit the common
-  poll model
-- `actions.handleAction("poll")` is the preferred path for channel-specific
-  poll semantics or extra poll parameters
+- `outbound.sendPoll` is the shared baseline for channels that fit the common poll model
+- `actions.handleAction("poll")` is the preferred path for channel-specific poll semantics or extra poll parameters
 
-Core now defers shared poll parsing until after plugin poll dispatch declines
-the action, so plugin-owned poll handlers can accept channel-specific poll
-fields without being blocked by the generic poll parser first.
+Core now defers shared poll parsing until after plugin poll dispatch declines the action, so plugin-owned poll handlers can accept channel-specific poll fields without being blocked by the generic poll parser first.
 
-See [Load pipeline](#load-pipeline) for the full startup sequence.
+See [Plugin architecture internals](/plugins/architecture-internals) for the full startup sequence.
 
 ## Capability ownership model
 
-OpenClaw treats a native plugin as the ownership boundary for a **company** or a
-**feature**, not as a grab bag of unrelated integrations.
+OpenClaw treats a native plugin as the ownership boundary for a **company** or a **feature**, not as a grab bag of unrelated integrations.
 
 That means:
 
-- a company plugin should usually own all of that company's OpenClaw-facing
-  surfaces
+- a company plugin should usually own all of that company's OpenClaw-facing surfaces
 - a feature plugin should usually own the full feature surface it introduces
-- channels should consume shared core capabilities instead of re-implementing
-  provider behavior ad hoc
+- channels should consume shared core capabilities instead of re-implementing provider behavior ad hoc
 
-Examples:
-
-- the bundled `openai` plugin owns OpenAI model-provider behavior and OpenAI
-  speech + media-understanding + image-generation behavior
-- the bundled `elevenlabs` plugin owns ElevenLabs speech behavior
-- the bundled `microsoft` plugin owns Microsoft speech behavior
-- the bundled `google` plugin owns Google model-provider behavior plus Google
-  media-understanding + image-generation + web-search behavior
-- the bundled `minimax`, `mistral`, `moonshot`, and `zai` plugins own their
-  media-understanding backends
-- the `voice-call` plugin is a feature plugin: it owns call transport, tools,
-  CLI, routes, and runtime, but it consumes core TTS/STT capability instead of
-  inventing a second speech stack
+<AccordionGroup>
+  <Accordion title="Vendor multi-capability">
+    `google` owns text inference, CLI backend, embeddings, speech, realtime voice, media understanding, image/music/video generation, and web search. `openai` owns text inference, embeddings, speech, realtime transcription, realtime voice, media understanding, image generation. `minimax` owns text inference plus media understanding, speech, image/music/video generation, and web search.
+  </Accordion>
+  <Accordion title="Vendor single-capability">
+    `arcee` and `chutes` own text inference only; `microsoft` owns speech only. A vendor plugin can stay this narrow until it needs to cover more of that vendor's surface.
+  </Accordion>
+  <Accordion title="Feature plugin">
+    `voice-call` owns call transport, tools, CLI, routes, and Twilio media-stream bridging, but consumes shared speech, realtime transcription, and realtime voice capabilities instead of importing vendor plugins directly.
+  </Accordion>
+</AccordionGroup>
 
 The intended end state is:
 
-- OpenAI lives in one plugin even if it spans text models, speech, images, and
-  future video
-- another vendor can do the same for its own surface area
-- channels do not care which vendor plugin owns the provider; they consume the
-  shared capability contract exposed by core
+- a vendor's OpenClaw-facing surface lives in one plugin even if it spans text models, speech, images, and video
+- other vendors can do the same for their own features
+- channels do not care which vendor plugin owns the provider; they consume the shared capability contract exposed by core
 
 This is the key distinction:
 
 - **plugin** = ownership boundary
 - **capability** = core contract that multiple plugins can implement or consume
 
-So if OpenClaw adds a new domain such as video, the first question is not
-"which provider should hardcode video handling?" The first question is "what is
-the core video capability contract?" Once that contract exists, vendor plugins
-can register against it and channel/feature plugins can consume it.
+So if OpenClaw adds a new domain such as video, the first question is not "which provider should hardcode video handling?" The first question is "what is the core video capability contract?" Once that contract exists, vendor plugins can register against it and channel/feature plugins can consume it.
 
 If the capability does not exist yet, the right move is usually:
 
-1. define the missing capability in core
-2. expose it through the plugin API/runtime in a typed way
-3. wire channels/features against that capability
-4. let vendor plugins register implementations
+<Steps>
+  <Step title="Define the capability">
+    Define the missing capability in core.
+  </Step>
+  <Step title="Expose through the SDK">
+    Expose it through the plugin API/runtime in a typed way.
+  </Step>
+  <Step title="Wire consumers">
+    Wire channels/features against that capability.
+  </Step>
+  <Step title="Vendor implementations">
+    Let vendor plugins register implementations.
+  </Step>
+</Steps>
 
-This keeps ownership explicit while avoiding core behavior that depends on a
-single vendor or a one-off plugin-specific code path.
+This keeps ownership explicit while avoiding core behavior that depends on a single vendor or a one-off plugin-specific code path.
 
 ### Capability layering
 
 Use this mental model when deciding where code belongs:
 
-- **core capability layer**: shared orchestration, policy, fallback, config
-  merge rules, delivery semantics, and typed contracts
-- **vendor plugin layer**: vendor-specific APIs, auth, model catalogs, speech
-  synthesis, image generation, future video backends, usage endpoints
-- **channel/feature plugin layer**: Slack/Discord/voice-call/etc. integration
-  that consumes core capabilities and presents them on a surface
+<Tabs>
+  <Tab title="Core capability layer">
+    Shared orchestration, policy, fallback, config merge rules, delivery semantics, and typed contracts.
+  </Tab>
+  <Tab title="Vendor plugin layer">
+    Vendor-specific APIs, auth, model catalogs, speech synthesis, image generation, video backends, usage endpoints.
+  </Tab>
+  <Tab title="Channel/feature plugin layer">
+    Discord/Slack/voice-call/etc. integration that consumes core capabilities and presents them on a surface.
+  </Tab>
+</Tabs>
 
 For example, TTS follows this shape:
 
 - core owns reply-time TTS policy, fallback order, prefs, and channel delivery
-- `openai`, `elevenlabs`, and `microsoft` own synthesis implementations
+- `elevenlabs`, `google`, `microsoft`, and `openai` own synthesis implementations
 - `voice-call` consumes the telephony TTS runtime helper
 
 That same pattern should be preferred for future capabilities.
 
 ### Multi-capability company plugin example
 
-A company plugin should feel cohesive from the outside. If OpenClaw has shared
-contracts for models, speech, media understanding, and web search, a vendor can
-own all of its surfaces in one place:
+A company plugin should feel cohesive from the outside. If OpenClaw has shared contracts for models, speech, realtime transcription, realtime voice, media understanding, image generation, video generation, web fetch, and web search, a vendor can own all of its surfaces in one place:
 
 ```ts
-import type { OpenClawPluginDefinition } from "openclaw/plugin-sdk";
-import {
-  buildOpenAISpeechProvider,
-  createPluginBackedWebSearchProvider,
-  describeImageWithModel,
-  transcribeOpenAiCompatibleAudio,
-} from "openclaw/plugin-sdk";
+import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
+import { exampleAiMedia } from "./exampleai-media.js";
 
-const plugin: OpenClawPluginDefinition = {
+export default definePluginEntry({
   id: "exampleai",
   name: "ExampleAI",
+  description: "ExampleAI models and media capabilities.",
   register(api) {
     api.registerProvider({
       id: "exampleai",
       // auth/model catalog/runtime hooks
     });
 
-    api.registerSpeechProvider(
-      buildOpenAISpeechProvider({
-        id: "exampleai",
-        // vendor speech config
-      }),
-    );
+    api.registerSpeechProvider({
+      id: "exampleai",
+      // vendor speech config — implement the SpeechProviderPlugin interface directly
+    });
 
     api.registerMediaUnderstandingProvider({
       id: "exampleai",
       capabilities: ["image", "audio", "video"],
-      async describeImage(req) {
-        return describeImageWithModel({
-          provider: "exampleai",
-          model: req.model,
-          input: req.input,
-        });
-      },
-      async transcribeAudio(req) {
-        return transcribeOpenAiCompatibleAudio({
-          provider: "exampleai",
-          model: req.model,
-          input: req.input,
-        });
-      },
+      describeImage: (req) => exampleAiMedia.describeImage(req),
+      transcribeAudio: (req) => exampleAiMedia.transcribeAudio(req),
+      describeVideo: (req) => exampleAiMedia.describeVideo(req),
     });
 
-    api.registerWebSearchProvider(
-      createPluginBackedWebSearchProvider({
-        id: "exampleai-search",
-        // credential + fetch logic
-      }),
-    );
+    api.registerWebSearchProvider({
+      id: "exampleai-search",
+      createTool() {
+        // Return the vendor-owned web search tool.
+      },
+    });
   },
-};
-
-export default plugin;
+});
 ```
 
 What matters is not the exact helper names. The shape matters:
 
 - one plugin owns the vendor surface
 - core still owns the capability contracts
+- provider request translation and HTTP helpers stay in the vendor plugin
 - channels and feature plugins consume `api.runtime.*` helpers, not vendor code
-- contract tests can assert that the plugin registered the capabilities it
-  claims to own
+- contract tests can assert that the plugin registered the capabilities it claims to own
 
 ### Capability example: video understanding
 
-OpenClaw already treats image/audio/video understanding as one shared
-capability. The same ownership model applies there:
+OpenClaw already treats image/audio/video understanding as one shared capability. The same ownership model applies there:
 
-1. core defines the media-understanding contract
-2. vendor plugins register `describeImage`, `transcribeAudio`, and
-   `describeVideo` as applicable
-3. channels and feature plugins consume the shared core behavior instead of
-   wiring directly to vendor code
+<Steps>
+  <Step title="Core defines the contract">
+    Core defines the media-understanding contract.
+  </Step>
+  <Step title="Vendor plugins register">
+    Vendor plugins register `describeImage`, `transcribeAudio`, and `describeVideo` as applicable.
+  </Step>
+  <Step title="Consumers use the shared behavior">
+    Channels and feature plugins consume the shared core behavior instead of wiring directly to vendor code.
+  </Step>
+</Steps>
 
-That avoids baking one provider's video assumptions into core. The plugin owns
-the vendor surface; core owns the capability contract and fallback behavior.
+That avoids baking one provider's video assumptions into core. The plugin owns the vendor surface; core owns the capability contract and fallback behavior.
 
-If OpenClaw adds a new domain later, such as video generation, use the same
-sequence again: define the core capability first, then let vendor plugins
-register implementations against it.
+Video generation already uses that same sequence: core owns the typed capability contract and runtime helper, and vendor plugins register `api.registerVideoGenerationProvider(...)` implementations against it.
 
-Need a concrete rollout checklist? See
-[Capability Cookbook](/tools/capability-cookbook).
+Need a concrete rollout checklist? See [Adding capabilities](/plugins/adding-capabilities).
 
 ## Contracts and enforcement
 
-The plugin API surface is intentionally typed and centralized in
-`OpenClawPluginApi`. That contract defines the supported registration points and
-the runtime helpers a plugin may rely on.
+The plugin API surface is intentionally typed and centralized in `OpenClawPluginApi`. That contract defines the supported registration points and the runtime helpers a plugin may rely on.
 
 Why this matters:
 
 - plugin authors get one stable internal standard
-- core can reject duplicate ownership such as two plugins registering the same
-  provider id
+- core can reject duplicate ownership such as two plugins registering the same provider id
 - startup can surface actionable diagnostics for malformed registration
 - contract tests can enforce bundled-plugin ownership and prevent silent drift
 
 There are two layers of enforcement:
 
-1. **runtime registration enforcement**
-   The plugin registry validates registrations as plugins load. Examples:
-   duplicate provider ids, duplicate speech provider ids, and malformed
-   registrations produce plugin diagnostics instead of undefined behavior.
-2. **contract tests**
-   Bundled plugins are captured in contract registries during test runs so
-   OpenClaw can assert ownership explicitly. Today this is used for model
-   providers, speech providers, web search providers, and bundled registration
-   ownership.
+<AccordionGroup>
+  <Accordion title="Runtime registration enforcement">
+    The plugin registry validates registrations as plugins load. Examples: duplicate provider ids, duplicate speech provider ids, and malformed registrations produce plugin diagnostics instead of undefined behavior.
+  </Accordion>
+  <Accordion title="Contract tests">
+    Bundled plugins are captured in contract registries during test runs so OpenClaw can assert ownership explicitly. Today this is used for model providers, speech providers, web search providers, and bundled registration ownership.
+  </Accordion>
+</AccordionGroup>
 
-The practical effect is that OpenClaw knows, up front, which plugin owns which
-surface. That lets core and channels compose seamlessly because ownership is
-declared, typed, and testable rather than implicit.
+The practical effect is that OpenClaw knows, up front, which plugin owns which surface. That lets core and channels work together because ownership is declared, typed, and testable rather than implicit.
 
 ### What belongs in a contract
 
-Good plugin contracts are:
+<Tabs>
+  <Tab title="Good contracts">
+    - typed
+    - small
+    - capability-specific
+    - owned by core
+    - reusable by multiple plugins
+    - consumable by channels/features without vendor knowledge
 
-- typed
-- small
-- capability-specific
-- owned by core
-- reusable by multiple plugins
-- consumable by channels/features without vendor knowledge
+  </Tab>
+  <Tab title="Bad contracts">
+    - vendor-specific policy hidden in core
+    - one-off plugin escape hatches that bypass the registry
+    - channel code reaching straight into a vendor implementation
+    - ad hoc runtime objects that are not part of `OpenClawPluginApi` or `api.runtime`
 
-Bad plugin contracts are:
+  </Tab>
+</Tabs>
 
-- vendor-specific policy hidden in core
-- one-off plugin escape hatches that bypass the registry
-- channel code reaching straight into a vendor implementation
-- ad hoc runtime objects that are not part of `OpenClawPluginApi` or
-  `api.runtime`
+When in doubt, raise the abstraction level: define the capability first, then let plugins plug into it.
 
-When in doubt, raise the abstraction level: define the capability first, then
-let plugins plug into it.
+## Skill previews
+
+The Control UI previews a declared plugin skill without installing or executing it.
+Opening a preview reads its file inventory and only the entry `SKILL.md` body.
+Selecting another file reads that body on demand; navigation never prefetches
+sibling contents. The file tree remains available while a selected file loads,
+and failed reads can be retried in place.
+
+Catalog reads stay pinned to the selected package version and validate the
+inventory’s paths, sizes, and SHA-256 hashes. Installed reads stay inside the
+resolved plugin root, reject unsafe links, and reject a changed plugin version.
+Both paths retain the file-count, tree-depth, per-file, and aggregate bundle
+limits. The aggregate limit applies to the inventory, not selection order.
+
+Loaded bodies and pending reads belong to one open preview and Gateway connection.
+Closing, reopening, navigating away, or reconnecting retires that cache. A late
+file response can populate its own cache entry but cannot change the selected
+file. New selected-file requests revalidate the inventory; only already loaded
+bodies are reused. Installed files edited in place become visible on reopening.
 
 ## Execution model
 
-Native OpenClaw plugins run **in-process** with the Gateway. They are not
-sandboxed. A loaded native plugin has the same process-level trust boundary as
-core code.
+Native OpenClaw plugins run **in-process** with the Gateway. They are not sandboxed. A loaded native plugin has the same process-level trust boundary as core code.
 
-Implications:
+<Warning>
+Native plugin implications: a plugin can register tools, network handlers, hooks, and services; a plugin bug can crash or destabilize the gateway; and a malicious native plugin is equivalent to arbitrary code execution inside the OpenClaw process.
+</Warning>
 
-- a native plugin can register tools, network handlers, hooks, and services
-- a native plugin bug can crash or destabilize the gateway
-- a malicious native plugin is equivalent to arbitrary code execution inside
-  the OpenClaw process
+Plugin authors must handle asynchronous errors from their own clients and sockets;
+see [Handle native client errors](/plugins/sdk-runtime#handle-native-client-errors).
 
-Compatible bundles are safer by default because OpenClaw currently treats them
-as metadata/content packs. In current releases, that mostly means bundled
-skills.
+Compatible bundles are safer by default because OpenClaw currently treats them as metadata/content packs. In current releases, that mostly means bundled skills.
 
-Use allowlists and explicit install/load paths for non-bundled plugins. Treat
-workspace plugins as development-time code, not production defaults.
+Use allowlists and explicit install/load paths for non-bundled plugins. Treat workspace plugins as development-time code, not production defaults.
 
-For bundled workspace package names, keep the plugin id anchored in the npm
-name: `@openclaw/<id>` by default, or an approved typed suffix such as
-`-provider`, `-plugin`, `-speech`, `-sandbox`, or `-media-understanding` when
-the package intentionally exposes a narrower plugin role.
+For bundled workspace package names, keep the plugin id anchored in the npm name: `@openclaw/<id>` by default, or an approved typed suffix such as `-provider`, `-plugin`, `-speech`, `-sandbox`, or `-media-understanding` when the package intentionally exposes a narrower plugin role.
 
-Important trust note:
+<Note>
+**Trust note:** `plugins.allow` permits **plugin ids** to load; it does not verify source provenance or choose which same-id copy loads. An auto-discovered workspace plugin does not shadow a bundled plugin merely because that id is enabled or allowlisted.
 
-- `plugins.allow` trusts **plugin ids**, not source provenance.
-- A workspace plugin with the same id as a bundled plugin intentionally shadows
-  the bundled copy when that workspace plugin is enabled/allowlisted.
-- This is normal and useful for local development, patch testing, and hotfixes.
+An unverified-source warning logs once per plugin while its source and recorded provenance stay unchanged, including across registry rebuilds and config reloads. A changed source or provenance, or a Gateway restart, allows another warning. Each registry still retains the diagnostic for inspection with `openclaw plugins inspect <id>`.
+
+For intentional local overrides, use `plugins.load.paths` to select the plugin path. Tracked global installs can also override ordinary bundled copies. On source installs, plugins built with the host retain priority over tracked globals, including when `OPENCLAW_DEV_SOURCE_ROOT` is unset. Matching package versions alone do not prove that a registry plugin matches a source build's SDK. See [Discovery precedence](/plugins/manifest/package-json#discovery-precedence-duplicate-plugin-ids) for the full order.
+
+A configured path or install record pointing to the host’s own bundled plugin tree retains bundled provenance, including source and compiled entries; a different local copy does not inherit trust from its name or allowlist entry. Checkout runners supply the development selector automatically, including for compiled plugins. See [development debugging](</help/debugging#dev-profile-%2B-dev-gateway-(--dev)>).
+
+Bundled-plugin trust is resolved from the source snapshot — the manifest and code on disk at load time — rather than from install metadata. A corrupted or substituted install record cannot silently widen a bundled plugin's trust surface beyond what the actual source claims.
+</Note>
 
 ## Export boundary
 
@@ -458,914 +1064,16 @@ Keep capability registration public. Trim non-contract helper exports:
 - vendor-specific convenience helpers
 - setup/onboarding helpers that are implementation details
 
-## Load pipeline
+Reserved bundled-plugin helper subpaths have been retired from the generated SDK export map. Keep owner-specific helpers inside the owning plugin package; promote only reusable host behavior to generic SDK contracts such as `plugin-sdk/gateway-runtime`, `plugin-sdk/security-runtime`, and injected plugin API capabilities.
 
-At startup, OpenClaw does roughly this:
+## Internals and reference
 
-1. discover candidate plugin roots
-2. read native or compatible bundle manifests and package metadata
-3. reject unsafe candidates
-4. normalize plugin config (`plugins.enabled`, `allow`, `deny`, `entries`,
-   `slots`, `load.paths`)
-5. decide enablement for each candidate
-6. load enabled native modules via jiti
-7. call native `register(api)` hooks and collect registrations into the plugin registry
-8. expose the registry to commands/runtime surfaces
+For the load pipeline, registry model, provider runtime hooks, Gateway HTTP routes, message tool schemas, channel target resolution, provider catalogs, context engine plugins, and the guide to adding a new capability, see [Plugin architecture internals](/plugins/architecture-internals).
 
-The safety gates happen **before** runtime execution. Candidates are blocked
-when the entry escapes the plugin root, the path is world-writable, or path
-ownership looks suspicious for non-bundled plugins.
+## Related
 
-### Manifest-first behavior
-
-The manifest is the control-plane source of truth. OpenClaw uses it to:
-
-- identify the plugin
-- discover declared channels/skills/config schema or bundle capabilities
-- validate `plugins.entries.<id>.config`
-- augment Control UI labels/placeholders
-- show install/catalog metadata
-
-For native plugins, the runtime module is the data-plane part. It registers
-actual behavior such as hooks, tools, commands, or provider flows.
-
-### What the loader caches
-
-OpenClaw keeps short in-process caches for:
-
-- discovery results
-- manifest registry data
-- loaded plugin registries
-
-These caches reduce bursty startup and repeated command overhead. They are safe
-to think of as short-lived performance caches, not persistence.
-
-Performance note:
-
-- Set `OPENCLAW_DISABLE_PLUGIN_DISCOVERY_CACHE=1` or
-  `OPENCLAW_DISABLE_PLUGIN_MANIFEST_CACHE=1` to disable these caches.
-- Tune cache windows with `OPENCLAW_PLUGIN_DISCOVERY_CACHE_MS` and
-  `OPENCLAW_PLUGIN_MANIFEST_CACHE_MS`.
-
-## Registry model
-
-Loaded plugins do not directly mutate random core globals. They register into a
-central plugin registry.
-
-The registry tracks:
-
-- plugin records (identity, source, origin, status, diagnostics)
-- tools
-- legacy hooks and typed hooks
-- channels
-- providers
-- gateway RPC handlers
-- HTTP routes
-- CLI registrars
-- background services
-- plugin-owned commands
-
-Core features then read from that registry instead of talking to plugin modules
-directly. This keeps loading one-way:
-
-- plugin module -> registry registration
-- core runtime -> registry consumption
-
-That separation matters for maintainability. It means most core surfaces only
-need one integration point: "read the registry", not "special-case every plugin
-module".
-
-## Conversation binding callbacks
-
-Plugins that bind a conversation can react when an approval is resolved.
-
-Use `api.onConversationBindingResolved(...)` to receive a callback after a bind
-request is approved or denied:
-
-```ts
-export default {
-  id: "my-plugin",
-  register(api) {
-    api.onConversationBindingResolved(async (event) => {
-      if (event.status === "approved") {
-        // A binding now exists for this plugin + conversation.
-        console.log(event.binding?.conversationId);
-        return;
-      }
-
-      // The request was denied; clear any local pending state.
-      console.log(event.request.conversation.conversationId);
-    });
-  },
-};
-```
-
-Callback payload fields:
-
-- `status`: `"approved"` or `"denied"`
-- `decision`: `"allow-once"`, `"allow-always"`, or `"deny"`
-- `binding`: the resolved binding for approved requests
-- `request`: the original request summary, detach hint, sender id, and
-  conversation metadata
-
-This callback is notification-only. It does not change who is allowed to bind a
-conversation, and it runs after core approval handling finishes.
-
-## Provider runtime hooks
-
-Provider plugins now have two layers:
-
-- manifest metadata: `providerAuthEnvVars` for cheap env-auth lookup before
-  runtime load, plus `providerAuthChoices` for cheap onboarding/auth-choice
-  labels and CLI flag metadata before runtime load
-- config-time hooks: `catalog` / legacy `discovery`
-- runtime hooks: `resolveDynamicModel`, `prepareDynamicModel`, `normalizeResolvedModel`, `capabilities`, `prepareExtraParams`, `wrapStreamFn`, `formatApiKey`, `refreshOAuth`, `buildAuthDoctorHint`, `isCacheTtlEligible`, `buildMissingAuthMessage`, `suppressBuiltInModel`, `augmentModelCatalog`, `isBinaryThinking`, `supportsXHighThinking`, `resolveDefaultThinkingLevel`, `isModernModelRef`, `prepareRuntimeAuth`, `resolveUsageAuth`, `fetchUsageSnapshot`
-
-OpenClaw still owns the generic agent loop, failover, transcript handling, and
-tool policy. These hooks are the extension surface for provider-specific behavior without
-needing a whole custom inference transport.
-
-Use manifest `providerAuthEnvVars` when the provider has env-based credentials
-that generic auth/status/model-picker paths should see without loading plugin
-runtime. Use manifest `providerAuthChoices` when onboarding/auth-choice CLI
-surfaces should know the provider's choice id, group labels, and simple
-one-flag auth wiring without loading provider runtime. Keep provider runtime
-`envVars` for operator-facing hints such as onboarding labels or OAuth
-client-id/client-secret setup vars.
-
-### Hook order and usage
-
-For model/provider plugins, OpenClaw calls hooks in this rough order.
-The "When to use" column is the quick decision guide.
-
-| #   | Hook                          | What it does                                                                             | When to use                                                                          |
-| --- | ----------------------------- | ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
-| 1   | `catalog`                     | Publish provider config into `models.providers` during `models.json` generation          | Provider owns a catalog or base URL defaults                                         |
-| --  | _(built-in model lookup)_     | OpenClaw tries the normal registry/catalog path first                                    | _(not a plugin hook)_                                                                |
-| 2   | `resolveDynamicModel`         | Sync fallback for provider-owned model ids not in the local registry yet                 | Provider accepts arbitrary upstream model ids                                        |
-| 3   | `prepareDynamicModel`         | Async warm-up, then `resolveDynamicModel` runs again                                     | Provider needs network metadata before resolving unknown ids                         |
-| 4   | `normalizeResolvedModel`      | Final rewrite before the embedded runner uses the resolved model                         | Provider needs transport rewrites but still uses a core transport                    |
-| 5   | `capabilities`                | Provider-owned transcript/tooling metadata used by shared core logic                     | Provider needs transcript/provider-family quirks                                     |
-| 6   | `prepareExtraParams`          | Request-param normalization before generic stream option wrappers                        | Provider needs default request params or per-provider param cleanup                  |
-| 7   | `wrapStreamFn`                | Stream wrapper after generic wrappers are applied                                        | Provider needs request headers/body/model compat wrappers without a custom transport |
-| 8   | `formatApiKey`                | Auth-profile formatter: stored profile becomes the runtime `apiKey` string               | Provider stores extra auth metadata and needs a custom runtime token shape           |
-| 9   | `refreshOAuth`                | OAuth refresh override for custom refresh endpoints or refresh-failure policy            | Provider does not fit the shared `pi-ai` refreshers                                  |
-| 10  | `buildAuthDoctorHint`         | Repair hint appended when OAuth refresh fails                                            | Provider needs provider-owned auth repair guidance after refresh failure             |
-| 11  | `isCacheTtlEligible`          | Prompt-cache policy for proxy/backhaul providers                                         | Provider needs proxy-specific cache TTL gating                                       |
-| 12  | `buildMissingAuthMessage`     | Replacement for the generic missing-auth recovery message                                | Provider needs a provider-specific missing-auth recovery hint                        |
-| 13  | `suppressBuiltInModel`        | Stale upstream model suppression plus optional user-facing error hint                    | Provider needs to hide stale upstream rows or replace them with a vendor hint        |
-| 14  | `augmentModelCatalog`         | Synthetic/final catalog rows appended after discovery                                    | Provider needs synthetic forward-compat rows in `models list` and pickers            |
-| 15  | `isBinaryThinking`            | On/off reasoning toggle for binary-thinking providers                                    | Provider exposes only binary thinking on/off                                         |
-| 16  | `supportsXHighThinking`       | `xhigh` reasoning support for selected models                                            | Provider wants `xhigh` on only a subset of models                                    |
-| 17  | `resolveDefaultThinkingLevel` | Default `/think` level for a specific model family                                       | Provider owns default `/think` policy for a model family                             |
-| 18  | `isModernModelRef`            | Modern-model matcher for live profile filters and smoke selection                        | Provider owns live/smoke preferred-model matching                                    |
-| 19  | `prepareRuntimeAuth`          | Exchange a configured credential into the actual runtime token/key just before inference | Provider needs a token exchange or short-lived request credential                    |
-| 20  | `resolveUsageAuth`            | Resolve usage/billing credentials for `/usage` and related status surfaces               | Provider needs custom usage/quota token parsing or a different usage credential      |
-| 21  | `fetchUsageSnapshot`          | Fetch and normalize provider-specific usage/quota snapshots after auth is resolved       | Provider needs a provider-specific usage endpoint or payload parser                  |
-
-If the provider needs a fully custom wire protocol or custom request executor,
-that is a different class of extension. These hooks are for provider behavior
-that still runs on OpenClaw's normal inference loop.
-
-### Provider example
-
-```ts
-api.registerProvider({
-  id: "example-proxy",
-  label: "Example Proxy",
-  auth: [],
-  catalog: {
-    order: "simple",
-    run: async (ctx) => {
-      const apiKey = ctx.resolveProviderApiKey("example-proxy").apiKey;
-      if (!apiKey) {
-        return null;
-      }
-      return {
-        provider: {
-          baseUrl: "https://proxy.example.com/v1",
-          apiKey,
-          api: "openai-completions",
-          models: [{ id: "auto", name: "Auto" }],
-        },
-      };
-    },
-  },
-  resolveDynamicModel: (ctx) => ({
-    id: ctx.modelId,
-    name: ctx.modelId,
-    provider: "example-proxy",
-    api: "openai-completions",
-    baseUrl: "https://proxy.example.com/v1",
-    reasoning: false,
-    input: ["text"],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 128000,
-    maxTokens: 8192,
-  }),
-  prepareRuntimeAuth: async (ctx) => {
-    const exchanged = await exchangeToken(ctx.apiKey);
-    return {
-      apiKey: exchanged.token,
-      baseUrl: exchanged.baseUrl,
-      expiresAt: exchanged.expiresAt,
-    };
-  },
-  resolveUsageAuth: async (ctx) => {
-    const auth = await ctx.resolveOAuthToken();
-    return auth ? { token: auth.token } : null;
-  },
-  fetchUsageSnapshot: async (ctx) => {
-    return await fetchExampleProxyUsage(ctx.token, ctx.timeoutMs, ctx.fetchFn);
-  },
-});
-```
-
-### Built-in examples
-
-- Anthropic uses `resolveDynamicModel`, `capabilities`, `buildAuthDoctorHint`,
-  `resolveUsageAuth`, `fetchUsageSnapshot`, `isCacheTtlEligible`,
-  `resolveDefaultThinkingLevel`, and `isModernModelRef` because it owns Claude
-  4.6 forward-compat, provider-family hints, auth repair guidance, usage
-  endpoint integration, prompt-cache eligibility, and Claude default/adaptive
-  thinking policy.
-- OpenAI uses `resolveDynamicModel`, `normalizeResolvedModel`, and
-  `capabilities` plus `buildMissingAuthMessage`, `suppressBuiltInModel`,
-  `augmentModelCatalog`, `supportsXHighThinking`, and `isModernModelRef`
-  because it owns GPT-5.4 forward-compat, the direct OpenAI
-  `openai-completions` -> `openai-responses` normalization, Codex-aware auth
-  hints, Spark suppression, synthetic OpenAI list rows, and GPT-5 thinking /
-  live-model policy.
-- OpenRouter uses `catalog` plus `resolveDynamicModel` and
-  `prepareDynamicModel` because the provider is pass-through and may expose new
-  model ids before OpenClaw's static catalog updates; it also uses
-  `capabilities`, `wrapStreamFn`, and `isCacheTtlEligible` to keep
-  provider-specific request headers, routing metadata, reasoning patches, and
-  prompt-cache policy out of core.
-- GitHub Copilot uses `catalog`, `auth`, `resolveDynamicModel`, and
-  `capabilities` plus `prepareRuntimeAuth` and `fetchUsageSnapshot` because it
-  needs provider-owned device login, model fallback behavior, Claude transcript
-  quirks, a GitHub token -> Copilot token exchange, and a provider-owned usage
-  endpoint.
-- OpenAI Codex uses `catalog`, `resolveDynamicModel`,
-  `normalizeResolvedModel`, `refreshOAuth`, and `augmentModelCatalog` plus
-  `prepareExtraParams`, `resolveUsageAuth`, and `fetchUsageSnapshot` because it
-  still runs on core OpenAI transports but owns its transport/base URL
-  normalization, OAuth refresh fallback policy, default transport choice,
-  synthetic Codex catalog rows, and ChatGPT usage endpoint integration.
-- Google AI Studio and Gemini CLI OAuth use `resolveDynamicModel` and
-  `isModernModelRef` because they own Gemini 3.1 forward-compat fallback and
-  modern-model matching; Gemini CLI OAuth also uses `formatApiKey`,
-  `resolveUsageAuth`, and `fetchUsageSnapshot` for token formatting, token
-  parsing, and quota endpoint wiring.
-- Moonshot uses `catalog` plus `wrapStreamFn` because it still uses the shared
-  OpenAI transport but needs provider-owned thinking payload normalization.
-- Kilocode uses `catalog`, `capabilities`, `wrapStreamFn`, and
-  `isCacheTtlEligible` because it needs provider-owned request headers,
-  reasoning payload normalization, Gemini transcript hints, and Anthropic
-  cache-TTL gating.
-- Z.AI uses `resolveDynamicModel`, `prepareExtraParams`, `wrapStreamFn`,
-  `isCacheTtlEligible`, `isBinaryThinking`, `isModernModelRef`,
-  `resolveUsageAuth`, and `fetchUsageSnapshot` because it owns GLM-5 fallback,
-  `tool_stream` defaults, binary thinking UX, modern-model matching, and both
-  usage auth + quota fetching.
-- Mistral, OpenCode Zen, and OpenCode Go use `capabilities` only to keep
-  transcript/tooling quirks out of core.
-- Catalog-only bundled providers such as `byteplus`, `cloudflare-ai-gateway`,
-  `huggingface`, `kimi-coding`, `modelstudio`, `nvidia`, `qianfan`,
-  `synthetic`, `together`, `venice`, `vercel-ai-gateway`, and `volcengine` use
-  `catalog` only.
-- Qwen portal uses `catalog`, `auth`, and `refreshOAuth`.
-- MiniMax and Xiaomi use `catalog` plus usage hooks because their `/usage`
-  behavior is plugin-owned even though inference still runs through the shared
-  transports.
-
-## Runtime helpers
-
-Plugins can access selected core helpers via `api.runtime`. For TTS:
-
-```ts
-const clip = await api.runtime.tts.textToSpeech({
-  text: "Hello from OpenClaw",
-  cfg: api.config,
-});
-
-const result = await api.runtime.tts.textToSpeechTelephony({
-  text: "Hello from OpenClaw",
-  cfg: api.config,
-});
-
-const voices = await api.runtime.tts.listVoices({
-  provider: "elevenlabs",
-  cfg: api.config,
-});
-```
-
-Notes:
-
-- `textToSpeech` returns the normal core TTS output payload for file/voice-note surfaces.
-- Uses core `messages.tts` configuration and provider selection.
-- Returns PCM audio buffer + sample rate. Plugins must resample/encode for providers.
-- `listVoices` is optional per provider. Use it for vendor-owned voice pickers or setup flows.
-- Voice listings can include richer metadata such as locale, gender, and personality tags for provider-aware pickers.
-- OpenAI and ElevenLabs support telephony today. Microsoft does not.
-
-Plugins can also register speech providers via `api.registerSpeechProvider(...)`.
-
-```ts
-api.registerSpeechProvider({
-  id: "acme-speech",
-  label: "Acme Speech",
-  isConfigured: ({ config }) => Boolean(config.messages?.tts),
-  synthesize: async (req) => {
-    return {
-      audioBuffer: Buffer.from([]),
-      outputFormat: "mp3",
-      fileExtension: ".mp3",
-      voiceCompatible: false,
-    };
-  },
-});
-```
-
-Notes:
-
-- Keep TTS policy, fallback, and reply delivery in core.
-- Use speech providers for vendor-owned synthesis behavior.
-- Legacy Microsoft `edge` input is normalized to the `microsoft` provider id.
-- The preferred ownership model is company-oriented: one vendor plugin can own
-  text, speech, image, and future media providers as OpenClaw adds those
-  capability contracts.
-
-For image/audio/video understanding, plugins register one typed
-media-understanding provider instead of a generic key/value bag:
-
-```ts
-api.registerMediaUnderstandingProvider({
-  id: "google",
-  capabilities: ["image", "audio", "video"],
-  describeImage: async (req) => ({ text: "..." }),
-  transcribeAudio: async (req) => ({ text: "..." }),
-  describeVideo: async (req) => ({ text: "..." }),
-});
-```
-
-Notes:
-
-- Keep orchestration, fallback, config, and channel wiring in core.
-- Keep vendor behavior in the provider plugin.
-- Additive expansion should stay typed: new optional methods, new optional
-  result fields, new optional capabilities.
-- If OpenClaw adds a new capability such as video generation later, define the
-  core capability contract first, then let vendor plugins register against it.
-
-For media-understanding runtime helpers, plugins can call:
-
-```ts
-const image = await api.runtime.mediaUnderstanding.describeImageFile({
-  filePath: "/tmp/inbound-photo.jpg",
-  cfg: api.config,
-  agentDir: "/tmp/agent",
-});
-
-const video = await api.runtime.mediaUnderstanding.describeVideoFile({
-  filePath: "/tmp/inbound-video.mp4",
-  cfg: api.config,
-});
-```
-
-For audio transcription, plugins can use either the media-understanding runtime
-or the older STT alias:
-
-```ts
-const { text } = await api.runtime.mediaUnderstanding.transcribeAudioFile({
-  filePath: "/tmp/inbound-audio.ogg",
-  cfg: api.config,
-  // Optional when MIME cannot be inferred reliably:
-  mime: "audio/ogg",
-});
-```
-
-Notes:
-
-- `api.runtime.mediaUnderstanding.*` is the preferred shared surface for
-  image/audio/video understanding.
-- Uses core media-understanding audio configuration (`tools.media.audio`) and provider fallback order.
-- Returns `{ text: undefined }` when no transcription output is produced (for example skipped/unsupported input).
-- `api.runtime.stt.transcribeAudioFile(...)` remains as a compatibility alias.
-
-Plugins can also launch background subagent runs through `api.runtime.subagent`:
-
-```ts
-const result = await api.runtime.subagent.run({
-  sessionKey: "agent:main:subagent:search-helper",
-  message: "Expand this query into focused follow-up searches.",
-  provider: "openai",
-  model: "gpt-4.1-mini",
-  deliver: false,
-});
-```
-
-Notes:
-
-- `provider` and `model` are optional per-run overrides, not persistent session changes.
-- OpenClaw only honors those override fields for trusted callers.
-- For plugin-owned fallback runs, operators must opt in with `plugins.entries.<id>.subagent.allowModelOverride: true`.
-- Use `plugins.entries.<id>.subagent.allowedModels` to restrict trusted plugins to specific canonical `provider/model` targets, or `"*"` to allow any target explicitly.
-- Untrusted plugin subagent runs still work, but override requests are rejected instead of silently falling back.
-
-For web search, plugins can consume the shared runtime helper instead of
-reaching into the agent tool wiring:
-
-```ts
-const providers = api.runtime.webSearch.listProviders({
-  config: api.config,
-});
-
-const result = await api.runtime.webSearch.search({
-  config: api.config,
-  args: {
-    query: "OpenClaw plugin runtime helpers",
-    count: 5,
-  },
-});
-```
-
-Plugins can also register web-search providers via
-`api.registerWebSearchProvider(...)`.
-
-Notes:
-
-- Keep provider selection, credential resolution, and shared request semantics in core.
-- Use web-search providers for vendor-specific search transports.
-- `api.runtime.webSearch.*` is the preferred shared surface for feature/channel plugins that need search behavior without depending on the agent tool wrapper.
-
-## Gateway HTTP routes
-
-Plugins can expose HTTP endpoints with `api.registerHttpRoute(...)`.
-
-```ts
-api.registerHttpRoute({
-  path: "/acme/webhook",
-  auth: "plugin",
-  match: "exact",
-  handler: async (_req, res) => {
-    res.statusCode = 200;
-    res.end("ok");
-    return true;
-  },
-});
-```
-
-Route fields:
-
-- `path`: route path under the gateway HTTP server.
-- `auth`: required. Use `"gateway"` to require normal gateway auth, or `"plugin"` for plugin-managed auth/webhook verification.
-- `match`: optional. `"exact"` (default) or `"prefix"`.
-- `replaceExisting`: optional. Allows the same plugin to replace its own existing route registration.
-- `handler`: return `true` when the route handled the request.
-
-Notes:
-
-- `api.registerHttpHandler(...)` is obsolete. Use `api.registerHttpRoute(...)`.
-- Plugin routes must declare `auth` explicitly.
-- Exact `path + match` conflicts are rejected unless `replaceExisting: true`, and one plugin cannot replace another plugin's route.
-- Overlapping routes with different `auth` levels are rejected. Keep `exact`/`prefix` fallthrough chains on the same auth level only.
-
-## Plugin SDK import paths
-
-Use SDK subpaths instead of the monolithic `openclaw/plugin-sdk` import when
-authoring plugins:
-
-- `openclaw/plugin-sdk/plugin-entry` for plugin registration primitives.
-- `openclaw/plugin-sdk/core` for the generic shared plugin-facing contract.
-- Stable channel primitives such as `openclaw/plugin-sdk/channel-setup`,
-  `openclaw/plugin-sdk/channel-pairing`,
-  `openclaw/plugin-sdk/channel-contract`,
-  `openclaw/plugin-sdk/channel-feedback`,
-  `openclaw/plugin-sdk/channel-inbound`,
-  `openclaw/plugin-sdk/channel-lifecycle`,
-  `openclaw/plugin-sdk/channel-reply-pipeline`,
-  `openclaw/plugin-sdk/command-auth`,
-  `openclaw/plugin-sdk/secret-input`, and
-  `openclaw/plugin-sdk/webhook-ingress` for shared setup/auth/reply/webhook
-  wiring. `channel-inbound` is the shared home for debounce, mention matching,
-  envelope formatting, and inbound envelope context helpers.
-- Domain subpaths such as `openclaw/plugin-sdk/channel-config-helpers`,
-  `openclaw/plugin-sdk/allow-from`,
-  `openclaw/plugin-sdk/channel-config-schema`,
-  `openclaw/plugin-sdk/channel-policy`,
-  `openclaw/plugin-sdk/config-runtime`,
-  `openclaw/plugin-sdk/infra-runtime`,
-  `openclaw/plugin-sdk/agent-runtime`,
-  `openclaw/plugin-sdk/lazy-runtime`,
-  `openclaw/plugin-sdk/reply-history`,
-  `openclaw/plugin-sdk/routing`,
-  `openclaw/plugin-sdk/status-helpers`,
-  `openclaw/plugin-sdk/runtime-store`, and
-  `openclaw/plugin-sdk/directory-runtime` for shared runtime/config helpers.
-- `openclaw/plugin-sdk/channel-runtime` remains only as a compatibility shim.
-  New code should import the narrower primitives instead.
-- Bundled extension internals remain private. External plugins should use only
-  `openclaw/plugin-sdk/*` subpaths. OpenClaw core/test code may use the repo
-  public entry points under `extensions/<id>/index.js`, `api.js`, `runtime-api.js`,
-  `setup-entry.js`, and narrowly scoped files such as `login-qr-api.js`. Never
-  import `extensions/<id>/src/*` from core or from another extension.
-- Repo entry point split:
-  `extensions/<id>/api.js` is the helper/types barrel,
-  `extensions/<id>/runtime-api.js` is the runtime-only barrel,
-  `extensions/<id>/index.js` is the bundled plugin entry,
-  and `extensions/<id>/setup-entry.js` is the setup plugin entry.
-- No bundled channel-branded public subpaths remain. Channel-specific helper and
-  runtime seams live under `extensions/<id>/api.js` and `extensions/<id>/runtime-api.js`;
-  the public SDK contract is the generic shared primitives instead.
-
-Compatibility note:
-
-- Avoid the root `openclaw/plugin-sdk` barrel for new code.
-- Prefer the narrow stable primitives first. The newer setup/pairing/reply/
-  feedback/contract/inbound/threading/command/secret-input/webhook/infra/
-  allowlist/status/message-tool subpaths are the intended contract for new
-  bundled and external plugin work.
-  Target parsing/matching belongs on `openclaw/plugin-sdk/channel-targets`.
-  Message action gates and reaction message-id helpers belong on
-  `openclaw/plugin-sdk/channel-actions`.
-- Bundled extension-specific helper barrels are not stable by default. If a
-  helper is only needed by a bundled extension, keep it behind the extension's
-  local `api.js` or `runtime-api.js` seam instead of promoting it into
-  `openclaw/plugin-sdk/<extension>`.
-- Channel-branded bundled bars stay private unless they are explicitly added
-  back to the public contract.
-- Capability-specific subpaths such as `image-generation`,
-  `media-understanding`, and `speech` exist because bundled/native plugins use
-  them today. Their presence does not by itself mean every exported helper is a
-  long-term frozen external contract.
-
-## Message tool schemas
-
-Plugins should own channel-specific `describeMessageTool(...)` schema
-contributions. Keep provider-specific fields in the plugin, not in shared core.
-
-For shared portable schema fragments, reuse the generic helpers exported through
-`openclaw/plugin-sdk/channel-actions`:
-
-- `createMessageToolButtonsSchema()` for button-grid style payloads
-- `createMessageToolCardSchema()` for structured card payloads
-
-If a schema shape only makes sense for one provider, define it in that plugin's
-own source instead of promoting it into the shared SDK.
-
-## Channel target resolution
-
-Channel plugins should own channel-specific target semantics. Keep the shared
-outbound host generic and use the messaging adapter surface for provider rules:
-
-- `messaging.inferTargetChatType({ to })` decides whether a normalized target
-  should be treated as `direct`, `group`, or `channel` before directory lookup.
-- `messaging.targetResolver.looksLikeId(raw, normalized)` tells core whether an
-  input should skip straight to id-like resolution instead of directory search.
-- `messaging.targetResolver.resolveTarget(...)` is the plugin fallback when
-  core needs a final provider-owned resolution after normalization or after a
-  directory miss.
-- `messaging.resolveOutboundSessionRoute(...)` owns provider-specific session
-  route construction once a target is resolved.
-
-Recommended split:
-
-- Use `inferTargetChatType` for category decisions that should happen before
-  searching peers/groups.
-- Use `looksLikeId` for "treat this as an explicit/native target id" checks.
-- Use `resolveTarget` for provider-specific normalization fallback, not for
-  broad directory search.
-- Keep provider-native ids like chat ids, thread ids, JIDs, handles, and room
-  ids inside `target` values or provider-specific params, not in generic SDK
-  fields.
-
-## Config-backed directories
-
-Plugins that derive directory entries from config should keep that logic in the
-plugin and reuse the shared helpers from
-`openclaw/plugin-sdk/directory-runtime`.
-
-Use this when a channel needs config-backed peers/groups such as:
-
-- allowlist-driven DM peers
-- configured channel/group maps
-- account-scoped static directory fallbacks
-
-The shared helpers in `directory-runtime` only handle generic operations:
-
-- query filtering
-- limit application
-- deduping/normalization helpers
-- building `ChannelDirectoryEntry[]`
-
-Channel-specific account inspection and id normalization should stay in the
-plugin implementation.
-
-## Provider catalogs
-
-Provider plugins can define model catalogs for inference with
-`registerProvider({ catalog: { run(...) { ... } } })`.
-
-`catalog.run(...)` returns the same shape OpenClaw writes into
-`models.providers`:
-
-- `{ provider }` for one provider entry
-- `{ providers }` for multiple provider entries
-
-Use `catalog` when the plugin owns provider-specific model ids, base URL
-defaults, or auth-gated model metadata.
-
-`catalog.order` controls when a plugin's catalog merges relative to OpenClaw's
-built-in implicit providers:
-
-- `simple`: plain API-key or env-driven providers
-- `profile`: providers that appear when auth profiles exist
-- `paired`: providers that synthesize multiple related provider entries
-- `late`: last pass, after other implicit providers
-
-Later providers win on key collision, so plugins can intentionally override a
-built-in provider entry with the same provider id.
-
-Compatibility:
-
-- `discovery` still works as a legacy alias
-- if both `catalog` and `discovery` are registered, OpenClaw uses `catalog`
-
-## Read-only channel inspection
-
-If your plugin registers a channel, prefer implementing
-`plugin.config.inspectAccount(cfg, accountId)` alongside `resolveAccount(...)`.
-
-Why:
-
-- `resolveAccount(...)` is the runtime path. It is allowed to assume credentials
-  are fully materialized and can fail fast when required secrets are missing.
-- Read-only command paths such as `openclaw status`, `openclaw status --all`,
-  `openclaw channels status`, `openclaw channels resolve`, and doctor/config
-  repair flows should not need to materialize runtime credentials just to
-  describe configuration.
-
-Recommended `inspectAccount(...)` behavior:
-
-- Return descriptive account state only.
-- Preserve `enabled` and `configured`.
-- Include credential source/status fields when relevant, such as:
-  - `tokenSource`, `tokenStatus`
-  - `botTokenSource`, `botTokenStatus`
-  - `appTokenSource`, `appTokenStatus`
-  - `signingSecretSource`, `signingSecretStatus`
-- You do not need to return raw token values just to report read-only
-  availability. Returning `tokenStatus: "available"` (and the matching source
-  field) is enough for status-style commands.
-- Use `configured_unavailable` when a credential is configured via SecretRef but
-  unavailable in the current command path.
-
-This lets read-only commands report "configured but unavailable in this command
-path" instead of crashing or misreporting the account as not configured.
-
-## Package packs
-
-A plugin directory may include a `package.json` with `openclaw.extensions`:
-
-```json
-{
-  "name": "my-pack",
-  "openclaw": {
-    "extensions": ["./src/safety.ts", "./src/tools.ts"],
-    "setupEntry": "./src/setup-entry.ts"
-  }
-}
-```
-
-Each entry becomes a plugin. If the pack lists multiple extensions, the plugin id
-becomes `name/<fileBase>`.
-
-If your plugin imports npm deps, install them in that directory so
-`node_modules` is available (`npm install` / `pnpm install`).
-
-Security guardrail: every `openclaw.extensions` entry must stay inside the plugin
-directory after symlink resolution. Entries that escape the package directory are
-rejected.
-
-Security note: `openclaw plugins install` installs plugin dependencies with
-`npm install --ignore-scripts` (no lifecycle scripts). Keep plugin dependency
-trees "pure JS/TS" and avoid packages that require `postinstall` builds.
-
-Optional: `openclaw.setupEntry` can point at a lightweight setup-only module.
-When OpenClaw needs setup surfaces for a disabled channel plugin, or
-when a channel plugin is enabled but still unconfigured, it loads `setupEntry`
-instead of the full plugin entry. This keeps startup and setup lighter
-when your main plugin entry also wires tools, hooks, or other runtime-only
-code.
-
-Optional: `openclaw.startup.deferConfiguredChannelFullLoadUntilAfterListen`
-can opt a channel plugin into the same `setupEntry` path during the gateway's
-pre-listen startup phase, even when the channel is already configured.
-
-Use this only when `setupEntry` fully covers the startup surface that must exist
-before the gateway starts listening. In practice, that means the setup entry
-must register every channel-owned capability that startup depends on, such as:
-
-- channel registration itself
-- any HTTP routes that must be available before the gateway starts listening
-- any gateway methods, tools, or services that must exist during that same window
-
-If your full entry still owns any required startup capability, do not enable
-this flag. Keep the plugin on the default behavior and let OpenClaw load the
-full entry during startup.
-
-Example:
-
-```json
-{
-  "name": "@scope/my-channel",
-  "openclaw": {
-    "extensions": ["./index.ts"],
-    "setupEntry": "./setup-entry.ts",
-    "startup": {
-      "deferConfiguredChannelFullLoadUntilAfterListen": true
-    }
-  }
-}
-```
-
-### Channel catalog metadata
-
-Channel plugins can advertise setup/discovery metadata via `openclaw.channel` and
-install hints via `openclaw.install`. This keeps the core catalog data-free.
-
-Example:
-
-```json
-{
-  "name": "@openclaw/nextcloud-talk",
-  "openclaw": {
-    "extensions": ["./index.ts"],
-    "channel": {
-      "id": "nextcloud-talk",
-      "label": "Nextcloud Talk",
-      "selectionLabel": "Nextcloud Talk (self-hosted)",
-      "docsPath": "/channels/nextcloud-talk",
-      "docsLabel": "nextcloud-talk",
-      "blurb": "Self-hosted chat via Nextcloud Talk webhook bots.",
-      "order": 65,
-      "aliases": ["nc-talk", "nc"]
-    },
-    "install": {
-      "npmSpec": "@openclaw/nextcloud-talk",
-      "localPath": "extensions/nextcloud-talk",
-      "defaultChoice": "npm"
-    }
-  }
-}
-```
-
-OpenClaw can also merge **external channel catalogs** (for example, an MPM
-registry export). Drop a JSON file at one of:
-
-- `~/.openclaw/mpm/plugins.json`
-- `~/.openclaw/mpm/catalog.json`
-- `~/.openclaw/plugins/catalog.json`
-
-Or point `OPENCLAW_PLUGIN_CATALOG_PATHS` (or `OPENCLAW_MPM_CATALOG_PATHS`) at
-one or more JSON files (comma/semicolon/`PATH`-delimited). Each file should
-contain `{ "entries": [ { "name": "@scope/pkg", "openclaw": { "channel": {...}, "install": {...} } } ] }`.
-
-## Context engine plugins
-
-Context engine plugins own session context orchestration for ingest, assembly,
-and compaction. Register them from your plugin with
-`api.registerContextEngine(id, factory)`, then select the active engine with
-`plugins.slots.contextEngine`.
-
-Use this when your plugin needs to replace or extend the default context
-pipeline rather than just add memory search or hooks.
-
-```ts
-export default function (api) {
-  api.registerContextEngine("lossless-claw", () => ({
-    info: { id: "lossless-claw", name: "Lossless Claw", ownsCompaction: true },
-    async ingest() {
-      return { ingested: true };
-    },
-    async assemble({ messages }) {
-      return { messages, estimatedTokens: 0 };
-    },
-    async compact() {
-      return { ok: true, compacted: false };
-    },
-  }));
-}
-```
-
-If your engine does **not** own the compaction algorithm, keep `compact()`
-implemented and delegate it explicitly:
-
-```ts
-import { delegateCompactionToRuntime } from "openclaw/plugin-sdk/core";
-
-export default function (api) {
-  api.registerContextEngine("my-memory-engine", () => ({
-    info: {
-      id: "my-memory-engine",
-      name: "My Memory Engine",
-      ownsCompaction: false,
-    },
-    async ingest() {
-      return { ingested: true };
-    },
-    async assemble({ messages }) {
-      return { messages, estimatedTokens: 0 };
-    },
-    async compact(params) {
-      return await delegateCompactionToRuntime(params);
-    },
-  }));
-}
-```
-
-## Adding a new capability
-
-When a plugin needs behavior that does not fit the current API, do not bypass
-the plugin system with a private reach-in. Add the missing capability.
-
-Recommended sequence:
-
-1. define the core contract
-   Decide what shared behavior core should own: policy, fallback, config merge,
-   lifecycle, channel-facing semantics, and runtime helper shape.
-2. add typed plugin registration/runtime surfaces
-   Extend `OpenClawPluginApi` and/or `api.runtime` with the smallest useful
-   typed capability surface.
-3. wire core + channel/feature consumers
-   Channels and feature plugins should consume the new capability through core,
-   not by importing a vendor implementation directly.
-4. register vendor implementations
-   Vendor plugins then register their backends against the capability.
-5. add contract coverage
-   Add tests so ownership and registration shape stay explicit over time.
-
-This is how OpenClaw stays opinionated without becoming hardcoded to one
-provider's worldview. See the [Capability Cookbook](/tools/capability-cookbook)
-for a concrete file checklist and worked example.
-
-### Capability checklist
-
-When you add a new capability, the implementation should usually touch these
-surfaces together:
-
-- core contract types in `src/<capability>/types.ts`
-- core runner/runtime helper in `src/<capability>/runtime.ts`
-- plugin API registration surface in `src/plugins/types.ts`
-- plugin registry wiring in `src/plugins/registry.ts`
-- plugin runtime exposure in `src/plugins/runtime/*` when feature/channel
-  plugins need to consume it
-- capture/test helpers in `src/test-utils/plugin-registration.ts`
-- ownership/contract assertions in `src/plugins/contracts/registry.ts`
-- operator/plugin docs in `docs/`
-
-If one of those surfaces is missing, that is usually a sign the capability is
-not fully integrated yet.
-
-### Capability template
-
-Minimal pattern:
-
-```ts
-// core contract
-export type VideoGenerationProviderPlugin = {
-  id: string;
-  label: string;
-  generateVideo: (req: VideoGenerationRequest) => Promise<VideoGenerationResult>;
-};
-
-// plugin API
-api.registerVideoGenerationProvider({
-  id: "openai",
-  label: "OpenAI",
-  async generateVideo(req) {
-    return await generateOpenAiVideo(req);
-  },
-});
-
-// shared runtime helper for feature/channel plugins
-const clip = await api.runtime.videoGeneration.generateFile({
-  prompt: "Show the robot walking through the lab.",
-  cfg,
-});
-```
-
-Contract test pattern:
-
-```ts
-expect(findVideoGenerationProviderIdsForPlugin("openai")).toEqual(["openai"]);
-```
-
-That keeps the rule simple:
-
-- core owns the capability contract + orchestration
-- vendor plugins own vendor implementations
-- feature/channel plugins consume runtime helpers
-- contract tests keep ownership explicit
+- [Building plugins](/plugins/building-plugins)
+- [Plugin manifest](/plugins/manifest)
+- [Plugin SDK setup](/plugins/sdk-setup)
+- [Context engines](/concepts/context-engine)
+- [Plugin Runtime](/plugins/sdk-runtime) - the `api.runtime` helpers plugins call

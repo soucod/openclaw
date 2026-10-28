@@ -1,5 +1,5 @@
-import type { OpenClawConfig } from "../../config/config.js";
-import { detectBinary as defaultDetectBinary } from "../../plugins/setup-binary.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { detectBinary as defaultDetectBinary } from "../../infra/detect-binary.js";
 import type {
   ChannelSetupWizard,
   ChannelSetupWizardStatus,
@@ -18,11 +18,15 @@ export function createDetectedBinaryStatus(params: {
   unconfiguredHint: string;
   configuredScore: number;
   unconfiguredScore: number;
-  resolveConfigured: (params: { cfg: OpenClawConfig }) => boolean | Promise<boolean>;
-  resolveBinaryPath: (params: { cfg: OpenClawConfig }) => string;
+  resolveConfigured: (params: {
+    cfg: OpenClawConfig;
+    accountId?: string;
+  }) => boolean | Promise<boolean>;
+  resolveBinaryPath: (params: { cfg: OpenClawConfig; accountId?: string }) => string;
   detectBinary?: (path: string) => Promise<boolean>;
 }): ChannelSetupWizardStatus {
   const detectBinary = params.detectBinary ?? defaultDetectBinary;
+
   return {
     configuredLabel: params.configuredLabel,
     unconfiguredLabel: params.unconfiguredLabel,
@@ -31,22 +35,29 @@ export function createDetectedBinaryStatus(params: {
     configuredScore: params.configuredScore,
     unconfiguredScore: params.unconfiguredScore,
     resolveConfigured: params.resolveConfigured,
-    resolveStatusLines: async ({ cfg, configured }: SetupStatusParams) => {
-      const binaryPath = params.resolveBinaryPath({ cfg });
+    async resolveStatusLines({ cfg, accountId, configured }: SetupStatusParams): Promise<string[]> {
+      const binaryPath = params.resolveBinaryPath({ cfg, accountId });
       const detected = await detectBinary(binaryPath);
+      // Report config state and binary detection separately; users can be
+      // configured but still missing the CLI binary required for runtime use.
       return [
         `${params.channelLabel}: ${configured ? params.configuredLabel : params.unconfiguredLabel}`,
         `${params.binaryLabel}: ${detected ? "found" : "missing"} (${binaryPath})`,
       ];
     },
-    resolveSelectionHint: async ({ cfg }) =>
-      (await detectBinary(params.resolveBinaryPath({ cfg })))
+    async resolveSelectionHint({ cfg, accountId }: SetupStatusParams): Promise<string | undefined> {
+      return (await detectBinary(params.resolveBinaryPath({ cfg, accountId })))
         ? params.configuredHint
-        : params.unconfiguredHint,
-    resolveQuickstartScore: async ({ cfg }) =>
-      (await detectBinary(params.resolveBinaryPath({ cfg })))
+        : params.unconfiguredHint;
+    },
+    async resolveQuickstartScore({
+      cfg,
+      accountId,
+    }: SetupStatusParams): Promise<number | undefined> {
+      return (await detectBinary(params.resolveBinaryPath({ cfg, accountId })))
         ? params.configuredScore
-        : params.unconfiguredScore,
+        : params.unconfiguredScore;
+    },
   };
 }
 
@@ -71,22 +82,9 @@ export function createCliPathTextInput(params: {
   };
 }
 
-export function createDelegatedSetupWizardStatusResolvers(
-  loadWizard: () => Promise<ChannelSetupWizard>,
-): Pick<
-  ChannelSetupWizardStatus,
-  "resolveStatusLines" | "resolveSelectionHint" | "resolveQuickstartScore"
-> {
-  return {
-    resolveStatusLines: async (params) =>
-      (await loadWizard()).status.resolveStatusLines?.(params) ?? [],
-    resolveSelectionHint: async (params) =>
-      await (await loadWizard()).status.resolveSelectionHint?.(params),
-    resolveQuickstartScore: async (params) =>
-      await (await loadWizard()).status.resolveQuickstartScore?.(params),
-  };
-}
-
+/**
+ * Delegates a text input's `shouldPrompt` check to a lazily loaded setup wizard.
+ */
 export function createDelegatedTextInputShouldPrompt(params: {
   loadWizard: () => Promise<ChannelSetupWizard>;
   inputKey: ChannelSetupWizardTextInput["inputKey"];

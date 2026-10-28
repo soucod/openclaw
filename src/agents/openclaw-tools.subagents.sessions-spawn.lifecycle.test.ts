@@ -1,378 +1,231 @@
-import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
+import assert from "node:assert/strict";
+import { afterAll, afterEach, beforeEach, expect, it, vi } from "vitest";
+import { createDeferred } from "../../test/helpers/promise.js";
+import { clearRuntimeConfigSnapshot, setRuntimeConfigSnapshot } from "../config/io.js";
 import { emitAgentEvent } from "../infra/agent-events.js";
-import "./test-helpers/fast-core-tools.js";
+import { disposeAllSessionMcpRuntimes } from "./agent-bundle-mcp-manager-api.js";
+import {
+  bindSessionMcpRuntimeTestScheduler,
+  getOrCreateSessionMcpRuntime,
+  getSessionMcpRuntimeTestManager,
+  unopenedMcpConfig,
+} from "./agent-bundle-mcp-manager.test-support.js";
 import {
   getCallGatewayMock,
   getSessionsSpawnTool,
+  resetSessionsSpawnAnnounceFlowOverride,
   resetSessionsSpawnConfigOverride,
+  resetSessionsSpawnHookRunnerOverride,
+  setSessionsSpawnHookRunnerOverride,
+  setSessionsSpawnAnnounceFlowOverride,
   setupSessionsSpawnGatewayMock,
   setSessionsSpawnConfigOverride,
+  waitForSessionsSpawnEvent,
 } from "./openclaw-tools.subagents.sessions-spawn.test-harness.js";
-import { resetSubagentRegistryForTests } from "./subagent-registry.js";
+import {
+  getLatestLiveSubagentRunByChildSessionKey,
+  getLatestSubagentRunByChildSessionKey,
+} from "./subagents/registry/subagent-registry-read.js";
+import { observeRootWork } from "./subagents/registry/subagent-registry.browser-cleanup.test-support.js";
+import { resetSubagentRegistryForTests } from "./subagents/registry/subagent-registry.test-helpers.js";
 
 const fastModeEnv = vi.hoisted(() => {
   const previous = process.env.OPENCLAW_TEST_FAST;
   process.env.OPENCLAW_TEST_FAST = "1";
   return { previous };
 });
+const mainContext = { agentSessionKey: "agent:main:main", agentChannel: "whatsapp" };
+const discordContext = { agentSessionKey: "agent:main:discord:group:req", agentChannel: "discord" };
+async function spawn(
+  context: Parameters<typeof getSessionsSpawnTool>[0] = discordContext,
+  args: Record<string, unknown> = {},
+) {
+  const tool = await getSessionsSpawnTool(context);
+  const result = await tool.execute("spawn", { task: "do thing", ...args });
+  expect(result.details).toMatchObject({ status: "accepted", runId: expect.any(String) });
+}
+function childOf(ctx: ReturnType<typeof setupSessionsSpawnGatewayMock>) {
+  const child = ctx.getChild();
+  assert(child.sessionKey && child.runId);
+  return { sessionKey: child.sessionKey, runId: child.runId };
+}
+async function waitForCleanup(childSessionKey: string) {
+  await waitForSessionsSpawnEvent(
+    "run cleanup bookkeeping",
+    () => getLatestLiveSubagentRunByChildSessionKey(childSessionKey)?.cleanupCompletedAt != null,
+  );
+}
 
-vi.mock("./pi-embedded.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("./pi-embedded.js")>();
-  return {
-    ...actual,
-    isEmbeddedPiRunActive: () => false,
-    isEmbeddedPiRunStreaming: () => false,
-    queueEmbeddedPiMessage: () => false,
-    waitForEmbeddedPiRunEnd: async () => true,
-  };
+beforeEach(async () => {
+  await disposeAllSessionMcpRuntimes();
+  await bindSessionMcpRuntimeTestScheduler();
+  resetSessionsSpawnAnnounceFlowOverride();
+  resetSessionsSpawnHookRunnerOverride();
+  resetSessionsSpawnConfigOverride();
+  const config = {
+    session: { mainKey: "main", scope: "per-sender" },
+    messages: { queue: {} },
+    agents: { defaults: { subagents: { runTimeoutSeconds: 1 } } },
+  } satisfies Parameters<typeof setSessionsSpawnConfigOverride>[0];
+  setSessionsSpawnConfigOverride(config);
+  setRuntimeConfigSnapshot(config);
+  await resetSubagentRegistryForTests({ persist: false });
+  setSessionsSpawnHookRunnerOverride({
+    hasHooks: (name: string) =>
+      name === "subagent_spawned" || name === "subagent_progress" || name === "subagent_ended",
+    runSubagentSpawned: async () => {},
+    runSubagentProgress: async () => {},
+    runSubagentEnded: async () => {},
+  });
+  getCallGatewayMock().mockClear();
+});
+afterEach(async () => {
+  resetSessionsSpawnAnnounceFlowOverride();
+  resetSessionsSpawnHookRunnerOverride();
+  resetSessionsSpawnConfigOverride();
+  await resetSubagentRegistryForTests({ persist: false });
+  await disposeAllSessionMcpRuntimes();
+  clearRuntimeConfigSnapshot();
+});
+afterAll(() => {
+  if (fastModeEnv.previous === undefined) {
+    delete process.env.OPENCLAW_TEST_FAST;
+  } else {
+    process.env.OPENCLAW_TEST_FAST = fastModeEnv.previous;
+  }
 });
 
-vi.mock("./tools/agent-step.js", () => ({
-  readLatestAssistantReply: async () => "done",
-}));
-
-const callGatewayMock = getCallGatewayMock();
-const RUN_TIMEOUT_SECONDS = 1;
-
-function buildDiscordCleanupHooks(onDelete: (key: string | undefined) => void) {
-  return {
-    onAgentSubagentSpawn: (params: unknown) => {
-      const rec = params as { channel?: string; timeout?: number } | undefined;
-      expect(rec?.channel).toBe("discord");
-      expect(rec?.timeout).toBe(1);
-    },
-    onSessionsDelete: (params: unknown) => {
-      const rec = params as { key?: string } | undefined;
-      onDelete(rec?.key);
-    },
-  };
-}
-
-const waitFor = async (predicate: () => boolean, timeoutMs = 1_500) => {
-  await vi.waitFor(
-    () => {
-      expect(predicate()).toBe(true);
-    },
-    { timeout: timeoutMs, interval: 8 },
-  );
-};
-
-async function getDiscordGroupSpawnTool() {
-  return await getSessionsSpawnTool({
-    agentSessionKey: "discord:group:req",
-    agentChannel: "discord",
+it("retires the child's bundle MCP runtime after run-mode cleanup", async () => {
+  const settleRootWork = observeRootWork();
+  const started = createDeferred();
+  const gate = createDeferred<"delivered">();
+  setSessionsSpawnAnnounceFlowOverride(async () => {
+    started.resolve();
+    return await gate.promise;
   });
-}
-
-async function executeSpawnAndExpectAccepted(params: {
-  tool: Awaited<ReturnType<typeof getSessionsSpawnTool>>;
-  callId: string;
-  cleanup?: "delete" | "keep";
-  label?: string;
-}) {
-  const result = await params.tool.execute(params.callId, {
-    task: "do thing",
-    runTimeoutSeconds: RUN_TIMEOUT_SECONDS,
-    ...(params.cleanup ? { cleanup: params.cleanup } : {}),
-    ...(params.label ? { label: params.label } : {}),
+  const ctx = setupSessionsSpawnGatewayMock({
+    includeChatHistory: true,
+    agentWaitResult: { status: "ok", startedAt: 3000, endedAt: 4000 },
   });
-  expect(result.details).toMatchObject({
-    status: "accepted",
-    runId: "run-1",
-  });
-  return result;
-}
-
-async function emitLifecycleEndAndFlush(params: {
-  runId: string;
-  startedAt: number;
-  endedAt: number;
-}) {
-  vi.useFakeTimers();
+  let childSessionId: string | undefined;
   try {
-    emitAgentEvent({
-      runId: params.runId,
-      stream: "lifecycle",
-      data: {
-        phase: "end",
-        startedAt: params.startedAt,
-        endedAt: params.endedAt,
-      },
+    await spawn(mainContext, { cleanup: "keep" });
+    const child = childOf(ctx);
+    await started.promise;
+    childSessionId = getLatestLiveSubagentRunByChildSessionKey(child.sessionKey)
+      ?.childSessionIdentity?.sessionId;
+    assert(childSessionId);
+    await getOrCreateSessionMcpRuntime({
+      sessionId: childSessionId,
+      sessionKey: child.sessionKey,
+      workspaceDir: "/tmp/openclaw-subagent-mcp-retire",
+      cfg: unopenedMcpConfig,
     });
-
-    await vi.runAllTimersAsync();
+    expect(getSessionMcpRuntimeTestManager().listSessionIds()).toContain(childSessionId);
   } finally {
-    vi.useRealTimers();
+    gate.resolve("delivered");
+    const key = ctx.getChild().sessionKey;
+    try {
+      if (key) {
+        await waitForCleanup(key);
+      }
+    } finally {
+      await settleRootWork();
+    }
   }
-}
+  assert(childSessionId);
+  await waitForSessionsSpawnEvent(
+    "bundle MCP runtime retirement",
+    () => !getSessionMcpRuntimeTestManager().listSessionIds().includes(childSessionId),
+  );
+});
 
-describe("openclaw-tools: subagents (sessions_spawn lifecycle)", () => {
-  beforeEach(() => {
-    resetSessionsSpawnConfigOverride();
-    setSessionsSpawnConfigOverride({
-      session: {
-        mainKey: "main",
-        scope: "per-sender",
-      },
-      messages: {
-        queue: {
-          debounceMs: 0,
-        },
-      },
-    });
-    resetSubagentRegistryForTests();
-    callGatewayMock.mockClear();
+it("runs cleanup via a child lifecycle event", async () => {
+  const settleRootWork = observeRootWork();
+  let deletedKey: string | undefined;
+  const ctx = setupSessionsSpawnGatewayMock({
+    onSessionsDelete: (params) => {
+      deletedKey = (params as { key?: string } | undefined)?.key;
+    },
   });
-
-  afterAll(() => {
-    if (fastModeEnv.previous === undefined) {
-      delete process.env.OPENCLAW_TEST_FAST;
-      return;
-    }
-    process.env.OPENCLAW_TEST_FAST = fastModeEnv.previous;
-  });
-
-  it("sessions_spawn runs cleanup flow after subagent completion", async () => {
-    const patchCalls: Array<{ key?: string; label?: string }> = [];
-
-    const ctx = setupSessionsSpawnGatewayMock({
-      includeSessionsList: true,
-      includeChatHistory: true,
-      onSessionsPatch: (params) => {
-        const rec = params as { key?: string; label?: string } | undefined;
-        patchCalls.push({ key: rec?.key, label: rec?.label });
-      },
-    });
-
-    const tool = await getSessionsSpawnTool({
-      agentSessionKey: "main",
-      agentChannel: "whatsapp",
-    });
-
-    await executeSpawnAndExpectAccepted({
-      tool,
-      callId: "call2",
-      label: "my-task",
-    });
-
-    const child = ctx.getChild();
-    if (!child.runId) {
-      throw new Error("missing child runId");
-    }
-    await waitFor(
-      () =>
-        ctx.waitCalls.some((call) => call.runId === child.runId) &&
-        patchCalls.some((call) => call.label === "my-task") &&
-        ctx.calls.filter((call) => call.method === "agent").length >= 2,
-    );
-
-    const childWait = ctx.waitCalls.find((call) => call.runId === child.runId);
-    expect(childWait?.timeoutMs).toBe(1000);
-    // Cleanup should patch the label
-    const labelPatch = patchCalls.find((call) => call.label === "my-task");
-    expect(labelPatch?.key).toBe(child.sessionKey);
-    expect(labelPatch?.label).toBe("my-task");
-
-    // Two agent calls: subagent spawn + main agent trigger
-    const agentCalls = ctx.calls.filter((c) => c.method === "agent");
-    expect(agentCalls).toHaveLength(2);
-
-    // First call: subagent spawn
-    const first = agentCalls[0]?.params as { lane?: string } | undefined;
-    expect(first?.lane).toBe("subagent");
-
-    // Second call: main agent trigger (not "Sub-agent announce step." anymore)
-    const second = agentCalls[1]?.params as { sessionKey?: string; message?: string } | undefined;
-    expect(second?.sessionKey).toBe("agent:main:main");
-    expect(second?.message).toContain("subagent task");
-
-    // No direct send to external channel (main agent handles delivery)
-    const sendCalls = ctx.calls.filter((c) => c.method === "send");
-    expect(sendCalls.length).toBe(0);
-    expect(child.sessionKey?.startsWith("agent:main:subagent:")).toBe(true);
-  });
-
-  it("sessions_spawn runs cleanup via lifecycle events", async () => {
-    let deletedKey: string | undefined;
-    const ctx = setupSessionsSpawnGatewayMock({
-      ...buildDiscordCleanupHooks((key) => {
-        deletedKey = key;
-      }),
-    });
-
-    const tool = await getDiscordGroupSpawnTool();
-    await executeSpawnAndExpectAccepted({
-      tool,
-      callId: "call1",
-      cleanup: "delete",
-    });
-
-    const child = ctx.getChild();
-    if (!child.runId) {
-      throw new Error("missing child runId");
-    }
-    await emitLifecycleEndAndFlush({
+  try {
+    await spawn(discordContext, { cleanup: "delete" });
+    const child = childOf(ctx);
+    emitAgentEvent({
       runId: child.runId,
-      startedAt: 1234,
-      endedAt: 2345,
+      stream: "lifecycle",
+      data: { phase: "end", startedAt: 1234, endedAt: 2345 },
     });
-
-    await waitFor(
-      () => ctx.calls.filter((call) => call.method === "agent").length >= 2 && Boolean(deletedKey),
-    );
-
-    const childWait = ctx.waitCalls.find((call) => call.runId === child.runId);
-    expect(childWait?.timeoutMs).toBe(1000);
-
-    const agentCalls = ctx.calls.filter((call) => call.method === "agent");
-    expect(agentCalls).toHaveLength(2);
-
-    const first = agentCalls[0]?.params as
-      | {
-          lane?: string;
-          deliver?: boolean;
-          sessionKey?: string;
-          channel?: string;
-        }
-      | undefined;
-    expect(first?.lane).toBe("subagent");
-    expect(first?.deliver).toBe(false);
-    expect(first?.channel).toBe("discord");
-    expect(first?.sessionKey?.startsWith("agent:main:subagent:")).toBe(true);
-    expect(child.sessionKey?.startsWith("agent:main:subagent:")).toBe(true);
-
-    const second = agentCalls[1]?.params as
-      | {
-          sessionKey?: string;
-          message?: string;
-          deliver?: boolean;
-        }
-      | undefined;
-    expect(second?.sessionKey).toBe("agent:main:discord:group:req");
-    expect(second?.deliver).toBe(false);
-    expect(second?.message).toContain("subagent task");
-
-    const sendCalls = ctx.calls.filter((c) => c.method === "send");
-    expect(sendCalls.length).toBe(0);
-
-    expect(deletedKey?.startsWith("agent:main:subagent:")).toBe(true);
-  });
-
-  it("sessions_spawn deletes session when cleanup=delete via agent.wait", async () => {
-    let deletedKey: string | undefined;
-    const ctx = setupSessionsSpawnGatewayMock({
-      includeChatHistory: true,
-      ...buildDiscordCleanupHooks((key) => {
-        deletedKey = key;
-      }),
-      agentWaitResult: { status: "ok", startedAt: 3000, endedAt: 4000 },
-    });
-
-    const tool = await getDiscordGroupSpawnTool();
-    await executeSpawnAndExpectAccepted({
-      tool,
-      callId: "call1b",
-      cleanup: "delete",
-    });
-
-    const child = ctx.getChild();
-    if (!child.runId) {
-      throw new Error("missing child runId");
-    }
-    await waitFor(
+    await waitForSessionsSpawnEvent(
+      "lifecycle cleanup",
       () =>
-        ctx.waitCalls.some((call) => call.runId === child.runId) &&
         ctx.calls.filter((call) => call.method === "agent").length >= 2 &&
-        Boolean(deletedKey),
+        deletedKey === child.sessionKey,
     );
+    expect(deletedKey).toBe(child.sessionKey);
+    expect(ctx.waitCalls.find((call) => call.runId === child.runId)?.timeoutMs).toBe(1000);
+  } finally {
+    await settleRootWork();
+  }
+});
 
-    const childWait = ctx.waitCalls.find((call) => call.runId === child.runId);
-    expect(childWait?.timeoutMs).toBe(1000);
-    expect(child.sessionKey?.startsWith("agent:main:subagent:")).toBe(true);
-
-    // Two agent calls: subagent spawn + main agent trigger
-    const agentCalls = ctx.calls.filter((call) => call.method === "agent");
-    expect(agentCalls).toHaveLength(2);
-
-    // First call: subagent spawn
-    const first = agentCalls[0]?.params as { lane?: string } | undefined;
-    expect(first?.lane).toBe("subagent");
-
-    // Second call: main agent trigger
-    const second = agentCalls[1]?.params as { sessionKey?: string; deliver?: boolean } | undefined;
-    expect(second?.sessionKey).toBe("agent:main:discord:group:req");
-    expect(second?.deliver).toBe(false);
-
-    // No direct send to external channel (main agent handles delivery)
-    const sendCalls = ctx.calls.filter((c) => c.method === "send");
-    expect(sendCalls.length).toBe(0);
-
-    // Session should be deleted
-    expect(deletedKey?.startsWith("agent:main:subagent:")).toBe(true);
+it("records timeout when agent.wait and the child session are terminal", async () => {
+  const ctx = setupSessionsSpawnGatewayMock({
+    includeChatHistory: true,
+    chatHistoryText: "still working",
+    agentWaitResult: { status: "timeout", startedAt: 6000, endedAt: 7000 },
+    subagentSessionEntryPatch: { status: "timeout", endedAt: 7000 },
   });
+  await spawn(discordContext, { cleanup: "keep", expectsCompletionMessage: false });
+  const child = childOf(ctx);
+  await waitForCleanup(child.sessionKey);
+  expect(ctx.waitCalls.find((call) => call.runId === child.runId)?.timeoutMs).toBe(1000);
+  expect(
+    (await getLatestSubagentRunByChildSessionKey(child.sessionKey))?.execution.outcome?.status,
+  ).toBe("timeout");
+});
 
-  it("sessions_spawn reports timed out when agent.wait returns timeout", async () => {
-    const ctx = setupSessionsSpawnGatewayMock({
-      includeChatHistory: true,
-      chatHistoryText: "still working",
-      agentWaitResult: { status: "timeout", startedAt: 6000, endedAt: 7000 },
-    });
-
-    const tool = await getDiscordGroupSpawnTool();
-    await executeSpawnAndExpectAccepted({
-      tool,
-      callId: "call-timeout",
-      cleanup: "keep",
-    });
-
-    await waitFor(() => ctx.calls.filter((call) => call.method === "agent").length >= 2);
-
-    const mainAgentCall = ctx.calls
-      .filter((call) => call.method === "agent")
-      .find((call) => {
-        const params = call.params as { lane?: string } | undefined;
-        return params?.lane !== "subagent";
-      });
-    const mainMessage = (mainAgentCall?.params as { message?: string } | undefined)?.message ?? "";
-
-    expect(mainMessage).toContain("timed out");
-    expect(mainMessage).not.toContain("completed successfully");
+it("uses the target agent's bound account for a Matrix room", async () => {
+  const room = "!exampleRoomId:example.org";
+  setSessionsSpawnConfigOverride({
+    session: { mainKey: "main", scope: "per-sender" },
+    messages: { queue: {} },
+    agents: {
+      defaults: { subagents: { allowAgents: ["bot-alpha"] } },
+      entries: { main: {}, "bot-alpha": {} },
+    },
+    bindings: [
+      {
+        type: "route",
+        agentId: "bot-alpha",
+        match: { channel: "matrix", peer: { kind: "channel", id: room }, accountId: "bot-alpha" },
+      },
+    ],
   });
-
-  it("sessions_spawn announces with requester accountId", async () => {
-    const ctx = setupSessionsSpawnGatewayMock({});
-
-    const tool = await getSessionsSpawnTool({
-      agentSessionKey: "main",
-      agentChannel: "whatsapp",
-      agentAccountId: "kev",
-    });
-
-    await executeSpawnAndExpectAccepted({
-      tool,
-      callId: "call-announce-account",
+  let accountId: string | undefined;
+  const ctx = setupSessionsSpawnGatewayMock({
+    onAgentSubagentSpawn: (params) => {
+      accountId = (params as { accountId?: string } | undefined)?.accountId;
+    },
+  });
+  await spawn(
+    {
+      agentSessionKey: "agent:main:main",
+      agentChannel: "matrix",
+      agentAccountId: "bot-beta",
+      agentTo: room,
+    },
+    {
+      agentId: "bot-alpha",
       cleanup: "keep",
-    });
-
-    const child = ctx.getChild();
-    if (!child.runId) {
-      throw new Error("missing child runId");
+    },
+  );
+  const key = ctx.getChild().sessionKey;
+  try {
+    expect(accountId).toBe("bot-alpha");
+  } finally {
+    if (key) {
+      await waitForCleanup(key);
     }
-    await emitLifecycleEndAndFlush({
-      runId: child.runId,
-      startedAt: 1000,
-      endedAt: 2000,
-    });
-
-    await waitFor(() => ctx.calls.filter((call) => call.method === "agent").length >= 2);
-
-    const agentCalls = ctx.calls.filter((call) => call.method === "agent");
-    expect(agentCalls).toHaveLength(2);
-    const announceParams = agentCalls[1]?.params as
-      | { accountId?: string; channel?: string; deliver?: boolean }
-      | undefined;
-    expect(announceParams?.deliver).toBe(false);
-    expect(announceParams?.channel).toBeUndefined();
-    expect(announceParams?.accountId).toBeUndefined();
-  });
+  }
 });

@@ -1,88 +1,41 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
+import { parseIMessageAllowFromEntries } from "./setup-surface.js";
 import {
   formatIMessageChatTarget,
   inferIMessageTargetChatType,
+  isAllowedIMessageReplyContextSender,
   isAllowedIMessageSender,
   looksLikeIMessageExplicitTargetId,
   normalizeIMessageHandle,
   parseIMessageTarget,
 } from "./targets.js";
 
-const spawnMock = vi.hoisted(() => vi.fn());
-
-vi.mock("node:child_process", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("node:child_process")>();
-  return {
-    ...actual,
-    spawn: (...args: unknown[]) => spawnMock(...args),
-  };
-});
-
 describe("imessage targets", () => {
-  it("parses chat_id targets", () => {
-    const target = parseIMessageTarget("chat_id:123");
-    expect(target).toEqual({ kind: "chat_id", chatId: 123 });
+  it("normalizes service-prefixed chat identifiers", () => {
+    expect(normalizeIMessageHandle("auto:chatident:AbC")).toBe("chat_identifier:AbC");
   });
 
-  it("parses chat targets", () => {
-    const target = parseIMessageTarget("chat:456");
-    expect(target).toEqual({ kind: "chat_id", chatId: 456 });
-  });
-
-  it("parses sms handles with service", () => {
-    const target = parseIMessageTarget("sms:+1555");
-    expect(target).toEqual({ kind: "handle", to: "+1555", service: "sms" });
-  });
-
-  it("normalizes handles", () => {
-    expect(normalizeIMessageHandle("Name@Example.com")).toBe("name@example.com");
-    expect(normalizeIMessageHandle(" +1 (555) 222-3333 ")).toBe("+15552223333");
-  });
-
-  it("normalizes chat_id prefixes case-insensitively", () => {
-    expect(normalizeIMessageHandle("CHAT_ID:123")).toBe("chat_id:123");
-    expect(normalizeIMessageHandle("Chat_Id:456")).toBe("chat_id:456");
-    expect(normalizeIMessageHandle("chatid:789")).toBe("chat_id:789");
-    expect(normalizeIMessageHandle("CHAT:42")).toBe("chat_id:42");
-  });
-
-  it("normalizes chat_guid prefixes case-insensitively", () => {
-    expect(normalizeIMessageHandle("CHAT_GUID:abc-def")).toBe("chat_guid:abc-def");
-    expect(normalizeIMessageHandle("ChatGuid:XYZ")).toBe("chat_guid:XYZ");
-    expect(normalizeIMessageHandle("GUID:test-guid")).toBe("chat_guid:test-guid");
-  });
-
-  it("normalizes chat_identifier prefixes case-insensitively", () => {
-    expect(normalizeIMessageHandle("CHAT_IDENTIFIER:iMessage;-;chat123")).toBe(
-      "chat_identifier:iMessage;-;chat123",
-    );
-    expect(normalizeIMessageHandle("ChatIdentifier:test")).toBe("chat_identifier:test");
-    expect(normalizeIMessageHandle("CHATIDENT:foo")).toBe("chat_identifier:foo");
-  });
-
-  it("checks allowFrom against chat_id", () => {
-    const ok = isAllowedIMessageSender({
-      allowFrom: ["chat_id:9"],
+  it.each([
+    ["chat_id:9", { chatId: 9 }],
+    ["imessage:chat_id:9", { chatId: 9 }],
+    ["imessage:chat_guid:team-thread", { chatGuid: "team-thread" }],
+    ["chat_identifier:team", { chatIdentifier: "team" }],
+  ] as const)("only permits conversation allowFrom %s for reply context", (entry, context) => {
+    const params = {
       sender: "+1555",
-      chatId: 9,
-    });
-    expect(ok).toBe(true);
+      ...context,
+      allowFrom: [entry],
+      allowConversationTargets: true,
+    };
+    expect(isAllowedIMessageSender(params)).toBe(false);
+    expect(isAllowedIMessageReplyContextSender(params)).toBe(true);
   });
 
-  it("checks allowFrom against handle", () => {
-    const ok = isAllowedIMessageSender({
-      allowFrom: ["user@example.com"],
-      sender: "User@Example.com",
-    });
-    expect(ok).toBe(true);
-  });
-
-  it("denies when allowFrom is empty", () => {
-    const ok = isAllowedIMessageSender({
-      allowFrom: [],
-      sender: "+1555",
-    });
-    expect(ok).toBe(false);
+  it.each([
+    [["user@example.com"], "User@Example.com", true],
+    [[], "+1555", false],
+  ] as const)("checks sender %s / %s", (allowFrom, sender, allowed) => {
+    expect(isAllowedIMessageSender({ allowFrom: [...allowFrom], sender })).toBe(allowed);
   });
 
   it("formats chat targets", () => {
@@ -94,26 +47,34 @@ describe("imessage targets", () => {
     expect(looksLikeIMessageExplicitTargetId("chat_id:42")).toBe(true);
     expect(looksLikeIMessageExplicitTargetId("sms:+15552223333")).toBe(true);
     expect(looksLikeIMessageExplicitTargetId("+15552223333")).toBe(false);
-    expect(looksLikeIMessageExplicitTargetId("user@example.com")).toBe(false);
+    expect(looksLikeIMessageExplicitTargetId("7d5297154d5f436d83dbbdf03fcc8fdd")).toBe(true);
   });
 
-  it("infers direct and group chat types from normalized targets", () => {
-    expect(inferIMessageTargetChatType("+15552223333")).toBe("direct");
-    expect(inferIMessageTargetChatType("chat_id:42")).toBe("group");
+  it("treats bare 32-char hex strings as chat identifiers, not phone numbers", () => {
+    const hex = "7d5297154d5f436d83dbbdf03fcc8fdd";
+    expect(normalizeIMessageHandle(hex)).toBe(`chat_identifier:${hex}`);
+    expect(normalizeIMessageHandle(hex.toUpperCase())).toBe(`chat_identifier:${hex}`);
+    const parsed = { kind: "chat_identifier", chatIdentifier: hex };
+    expect([hex, `imessage:${hex.toUpperCase()}`].map(parseIMessageTarget)).toEqual([
+      parsed,
+      parsed,
+    ]);
+    expect(inferIMessageTargetChatType(hex)).toBeUndefined();
+    expect(inferIMessageTargetChatType("chat_id:42")).toBeUndefined();
   });
 });
 
-describe("createIMessageRpcClient", () => {
-  beforeEach(() => {
-    spawnMock.mockClear();
-    vi.stubEnv("VITEST", "true");
+describe("parseIMessageAllowFromEntries", () => {
+  it("parses handles", () => {
+    expect(parseIMessageAllowFromEntries("+15555550123, user@example.com")).toEqual({
+      entries: ["+15555550123", "user@example.com"],
+    });
   });
 
-  it("refuses to spawn imsg rpc in test environments", async () => {
-    const { createIMessageRpcClient } = await import("./client.js");
-    await expect(createIMessageRpcClient()).rejects.toThrow(
-      /Refusing to start imsg rpc in test environment/i,
-    );
-    expect(spawnMock).not.toHaveBeenCalled();
+  it.each(["chat_id:123", "imessage:chat_id:123"])("rejects chat target entry %s", (entry) => {
+    expect(parseIMessageAllowFromEntries(entry)).toEqual({
+      entries: [],
+      error: `iMessage allowFrom entries must be sender handles: ${entry}`,
+    });
   });
 });

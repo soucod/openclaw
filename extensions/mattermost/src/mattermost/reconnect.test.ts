@@ -1,192 +1,93 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { setTimeout as delay } from "node:timers/promises";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runWithReconnect } from "./reconnect.js";
 
-beforeEach(() => {
-  vi.clearAllMocks();
+vi.mock("node:timers/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:timers/promises")>();
+  return { ...actual, setTimeout: vi.fn(actual.setTimeout) };
 });
 
+beforeEach(() => {
+  vi.restoreAllMocks();
+  vi.useFakeTimers();
+  vi.clearAllMocks();
+  vi.spyOn(Math, "random").mockReturnValue(0.5);
+  vi.mocked(delay).mockResolvedValue(undefined);
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.useRealTimers();
+});
+
+async function resolveReconnectRun(promise: Promise<void>): Promise<void> {
+  await vi.runAllTimersAsync();
+  await promise;
+}
+
+async function runConnections(steps: (Error | undefined)[], reconnectAfterClose = true) {
+  const abort = new AbortController();
+  const delays: number[] = [];
+  const connect = vi.fn(async () => {
+    if (!steps.length) {
+      return abort.abort();
+    }
+    const error = steps.shift();
+    if (error) {
+      throw error;
+    }
+  });
+  await resolveReconnectRun(
+    runWithReconnect(connect, {
+      abortSignal: abort.signal,
+      onReconnect: (ms) => delays.push(ms),
+      reconnectAfterClose,
+    }),
+  );
+  return { connect, delays };
+}
+
 describe("runWithReconnect", () => {
-  it("retries after connectFn resolves (normal close)", async () => {
-    let callCount = 0;
-    const abort = new AbortController();
-    const connectFn = vi.fn(async () => {
-      callCount++;
-      if (callCount >= 3) {
-        abort.abort();
-      }
-    });
-
-    await runWithReconnect(connectFn, {
-      abortSignal: abort.signal,
-      initialDelayMs: 1,
-    });
-
-    expect(connectFn).toHaveBeenCalledTimes(3);
-  });
-
-  it("retries after connectFn throws (connection error)", async () => {
-    let callCount = 0;
-    const abort = new AbortController();
-    const onError = vi.fn();
-    const connectFn = vi.fn(async () => {
-      callCount++;
-      if (callCount < 3) {
-        throw new Error("fetch failed");
-      }
-      abort.abort();
-    });
-
-    await runWithReconnect(connectFn, {
-      abortSignal: abort.signal,
-      onError,
-      initialDelayMs: 1,
-    });
-
-    expect(connectFn).toHaveBeenCalledTimes(3);
-    expect(onError).toHaveBeenCalledTimes(2);
-    expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: "fetch failed" }));
-  });
-
-  it("uses exponential backoff on consecutive errors, capped at maxDelayMs", async () => {
-    const abort = new AbortController();
-    const delays: number[] = [];
-    let callCount = 0;
-    const connectFn = vi.fn(async () => {
-      callCount++;
-      if (callCount >= 6) {
-        abort.abort();
-        return;
-      }
-      throw new Error("connection refused");
-    });
-
-    await runWithReconnect(connectFn, {
-      abortSignal: abort.signal,
-      onReconnect: (delayMs) => delays.push(delayMs),
-      // Keep this test fast: validate the exponential pattern, not real-time waiting.
-      initialDelayMs: 1,
-      maxDelayMs: 10,
-    });
-
-    expect(connectFn).toHaveBeenCalledTimes(6);
-    // 5 errors produce delays: 1, 2, 4, 8, 10(cap)
-    // 6th succeeds -> delay resets to 100
-    // But 6th also aborts → onReconnect NOT called (abort check fires first)
-    expect(delays).toEqual([1, 2, 4, 8, 10]);
-  });
-
   it("resets backoff after successful connection", async () => {
-    const abort = new AbortController();
-    const delays: number[] = [];
-    let callCount = 0;
-    const connectFn = vi.fn(async () => {
-      callCount++;
-      if (callCount === 1) {
-        throw new Error("first failure");
-      }
-      if (callCount === 2) {
-        return; // success
-      }
-      if (callCount === 3) {
-        throw new Error("second failure");
-      }
-      abort.abort();
-    });
-
-    await runWithReconnect(connectFn, {
-      abortSignal: abort.signal,
-      onReconnect: (delayMs) => delays.push(delayMs),
-      initialDelayMs: 1,
-      maxDelayMs: 60_000,
-    });
-
-    expect(connectFn).toHaveBeenCalledTimes(4);
-    // call 1: fail -> delay 1
-    // call 2: success → delay resets to 1
-    // call 3: fail -> delay 1 (reset held)
-    // call 4: success + abort → no onReconnect
-    expect(delays).toEqual([1, 1, 1]);
-  });
-
-  it("stops immediately when abort signal is pre-fired", async () => {
-    const abort = new AbortController();
-    abort.abort();
-    const connectFn = vi.fn(async () => {});
-
-    await runWithReconnect(connectFn, { abortSignal: abort.signal });
-
-    expect(connectFn).not.toHaveBeenCalled();
-  });
-
-  it("stops after current connection when abort fires mid-connection", async () => {
-    const abort = new AbortController();
-    const connectFn = vi.fn(async () => {
-      abort.abort();
-    });
-
-    await runWithReconnect(connectFn, {
-      abortSignal: abort.signal,
-      initialDelayMs: 1,
-    });
-
-    expect(connectFn).toHaveBeenCalledTimes(1);
+    const { connect, delays } = await runConnections([
+      new Error("first failure"),
+      undefined,
+      new Error("second failure"),
+    ]);
+    expect(connect).toHaveBeenCalledTimes(4);
+    expect(delays).toEqual([2000, 2000, 2000]);
   });
 
   it("abort signal interrupts backoff sleep immediately", async () => {
+    const actual =
+      await vi.importActual<typeof import("node:timers/promises")>("node:timers/promises");
+    vi.mocked(delay).mockImplementation(actual.setTimeout);
     const abort = new AbortController();
     const connectFn = vi.fn(async () => {
-      // Schedule abort to fire 10ms into the 60s sleep
       setTimeout(() => abort.abort(), 10);
     });
 
-    const start = Date.now();
-    await runWithReconnect(connectFn, {
+    const run = runWithReconnect(connectFn, {
       abortSignal: abort.signal,
-      initialDelayMs: 60_000,
     });
-    const elapsed = Date.now() - start;
+    await resolveReconnectRun(run);
 
     expect(connectFn).toHaveBeenCalledTimes(1);
-    expect(elapsed).toBeLessThan(5000);
   });
 
-  it("applies jitter to reconnect delay when configured", async () => {
-    const abort = new AbortController();
-    const delays: number[] = [];
-    let callCount = 0;
-    const connectFn = vi.fn(async () => {
-      callCount++;
-      if (callCount === 1) {
-        throw new Error("connection refused");
-      }
-      abort.abort();
-    });
-
-    await runWithReconnect(connectFn, {
-      abortSignal: abort.signal,
-      onReconnect: (delayMs) => delays.push(delayMs),
-      initialDelayMs: 10,
-      jitterRatio: 0.5,
-      random: () => 1,
-    });
-
-    expect(connectFn).toHaveBeenCalledTimes(2);
-    expect(delays).toEqual([15]);
+  it("applies twenty percent jitter to reconnect delay", async () => {
+    vi.mocked(Math.random).mockReturnValue(1);
+    const { connect, delays } = await runConnections([new Error("connection refused")]);
+    expect(connect).toHaveBeenCalledTimes(2);
+    expect(delays).toEqual([2400]);
   });
 
-  it("supports strategy hook to stop reconnecting after failure", async () => {
-    const onReconnect = vi.fn();
-    const connectFn = vi.fn(async () => {
-      throw new Error("fatal");
-    });
-
-    await runWithReconnect(connectFn, {
-      initialDelayMs: 1,
-      onReconnect,
-      shouldReconnect: (params) => params.outcome !== "rejected",
-    });
-
-    expect(connectFn).toHaveBeenCalledTimes(1);
-    expect(onReconnect).not.toHaveBeenCalled();
+  it("finishes authentication on success after retrying failures", async () => {
+    const { connect, delays } = await runConnections(
+      [new Error("authentication pending"), undefined],
+      false,
+    );
+    expect(connect).toHaveBeenCalledTimes(2);
+    expect(delays).toEqual([2000]);
   });
 });

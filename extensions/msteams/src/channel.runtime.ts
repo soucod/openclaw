@@ -1,22 +1,50 @@
+import { listMSTeamsDirectoryGroupsLive, listMSTeamsDirectoryPeersLive } from "./directory-live.js";
 import {
-  listMSTeamsDirectoryGroupsLive as listMSTeamsDirectoryGroupsLiveImpl,
-  listMSTeamsDirectoryPeersLive as listMSTeamsDirectoryPeersLiveImpl,
-} from "./directory-live.js";
-import { msteamsOutbound as msteamsOutboundImpl } from "./outbound.js";
-import { probeMSTeams as probeMSTeamsImpl } from "./probe.js";
+  addParticipantMSTeams,
+  removeParticipantMSTeams,
+  renameGroupMSTeams,
+} from "./graph-group-management.js";
+import { getMemberInfoMSTeams } from "./graph-members.js";
 import {
-  deleteMessageMSTeams as deleteMessageMSTeamsImpl,
-  editMessageMSTeams as editMessageMSTeamsImpl,
-  sendAdaptiveCardMSTeams as sendAdaptiveCardMSTeamsImpl,
-  sendMessageMSTeams as sendMessageMSTeamsImpl,
+  getMessageMSTeams,
+  listPinsMSTeams,
+  listReactionsMSTeams,
+  pinMessageMSTeams,
+  reactMessageMSTeams,
+  searchMessagesMSTeams,
+  unpinMessageMSTeams,
+  unreactMessageMSTeams,
+} from "./graph-messages.js";
+import { listChannelsMSTeams, getChannelInfoMSTeams } from "./graph-teams.js";
+import { msteamsOutbound } from "./outbound.js";
+import { probeMSTeams } from "./probe.js";
+import {
+  deleteMessageMSTeams,
+  editMessageMSTeams,
+  sendAdaptiveCardMSTeams,
+  sendMessageMSTeams,
 } from "./send.js";
 export const msTeamsChannelRuntime = {
-  deleteMessageMSTeams: deleteMessageMSTeamsImpl,
-  editMessageMSTeams: editMessageMSTeamsImpl,
-  listMSTeamsDirectoryGroupsLive: listMSTeamsDirectoryGroupsLiveImpl,
-  listMSTeamsDirectoryPeersLive: listMSTeamsDirectoryPeersLiveImpl,
-  msteamsOutbound: { ...msteamsOutboundImpl },
-  probeMSTeams: probeMSTeamsImpl,
-  sendAdaptiveCardMSTeams: sendAdaptiveCardMSTeamsImpl,
-  sendMessageMSTeams: sendMessageMSTeamsImpl,
+  addParticipantMSTeams,
+  deleteMessageMSTeams,
+  editMessageMSTeams,
+  getChannelInfoMSTeams,
+  getMemberInfoMSTeams,
+  getMessageMSTeams,
+  listChannelsMSTeams,
+  listPinsMSTeams,
+  listReactionsMSTeams,
+  pinMessageMSTeams,
+  reactMessageMSTeams,
+  removeParticipantMSTeams,
+  renameGroupMSTeams,
+  searchMessagesMSTeams,
+  unpinMessageMSTeams,
+  unreactMessageMSTeams,
+  listMSTeamsDirectoryGroupsLive,
+  listMSTeamsDirectoryPeersLive,
+  msteamsOutbound,
+  probeMSTeams,
+  sendAdaptiveCardMSTeams,
+  sendMessageMSTeams,
 };

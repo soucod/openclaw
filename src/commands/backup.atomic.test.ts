@@ -1,133 +1,126 @@
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import * as directoryDurability from "../infra/directory-durability.js";
 import { createTempHomeEnv, type TempHomeEnv } from "../test-utils/temp-home.js";
+import {
+  createMockTarStream,
+  mockStateOnlyBackupPlan,
+  resetBackupTempHome,
+  backupWalkMock,
+} from "./backup.test-support.js";
+import { createTestRuntime } from "./test-runtime-config-helpers.js";
 
-const tarCreateMock = vi.hoisted(() => vi.fn());
-const backupVerifyCommandMock = vi.hoisted(() => vi.fn());
+const sleepMock = vi.hoisted(() => vi.fn(async (_ms: number) => {}));
 
-vi.mock("tar", () => ({
-  c: tarCreateMock,
-}));
-
-vi.mock("./backup-verify.js", () => ({
-  backupVerifyCommand: backupVerifyCommandMock,
+vi.mock("../utils/sleep.js", () => ({
+  sleep: (ms: number) => sleepMock(ms),
 }));
 
 const { backupCreateCommand } = await import("./backup.js");
+const archiveDirs = useAutoCleanupTempDirTracker(afterEach);
 
 describe("backupCreateCommand atomic archive write", () => {
   let tempHome: TempHomeEnv;
+  let archiveDir: string;
+  let outputPath: string;
+  let runtime: ReturnType<typeof createTestRuntime>;
+
+  beforeAll(async () => {
+    tempHome = await createTempHomeEnv("openclaw-backup-atomic-test-");
+  });
 
   beforeEach(async () => {
-    tempHome = await createTempHomeEnv("openclaw-backup-atomic-test-");
-    tarCreateMock.mockReset();
-    backupVerifyCommandMock.mockReset();
+    await resetBackupTempHome(tempHome);
+    backupWalkMock.mockReset();
+    sleepMock.mockClear();
+    const stateDir = path.join(tempHome.home, ".openclaw");
+    archiveDir = archiveDirs.make("openclaw-backup-atomic-");
+    outputPath = path.join(archiveDir, "backup.tar.gz");
+    runtime = createTestRuntime();
+    await fs.writeFile(path.join(stateDir, "state.txt"), "state\n", "utf8");
+    await mockStateOnlyBackupPlan(stateDir);
   });
 
-  afterEach(async () => {
-    await tempHome.restore();
-  });
+  afterEach(vi.restoreAllMocks);
+  afterAll(() => tempHome.restore());
 
   it("does not leave a partial final archive behind when tar creation fails", async () => {
-    const stateDir = path.join(tempHome.home, ".openclaw");
-    const archiveDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-backup-failure-"));
-    try {
-      await fs.writeFile(path.join(stateDir, "openclaw.json"), JSON.stringify({}), "utf8");
-      await fs.writeFile(path.join(stateDir, "state.txt"), "state\n", "utf8");
+    backupWalkMock.mockReturnValueOnce(createMockTarStream({ error: new Error("disk full") }));
 
-      tarCreateMock.mockRejectedValueOnce(new Error("disk full"));
+    await expect(backupCreateCommand(runtime, { output: outputPath })).rejects.toThrow(
+      /disk full/i,
+    );
 
-      const runtime = {
-        log: vi.fn(),
-        error: vi.fn(),
-        exit: vi.fn(),
-      };
-      const outputPath = path.join(archiveDir, "backup.tar.gz");
+    await expect(fs.access(outputPath)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.readdir(archiveDir)).resolves.toStrictEqual([]);
+  });
 
-      await expect(
-        backupCreateCommand(runtime, {
-          output: outputPath,
-        }),
-      ).rejects.toThrow(/disk full/i);
+  it("cleans intermediate retry archives after a later attempt succeeds", async () => {
+    const volatilePath = path.join(tempHome.home, ".openclaw", "logs", "gateway.log");
+    await fs.mkdir(path.dirname(volatilePath), { recursive: true });
+    await fs.writeFile(volatilePath, "volatile log\n", "utf8");
+    const originalUnlinkSync = fsSync.unlinkSync.bind(fsSync);
+    let blockedPartialPath: string | undefined;
+    let blockedPartialCleanupAttempts = 0;
+    vi.spyOn(fsSync, "unlinkSync").mockImplementation((target) => {
+      const targetPath = path.resolve(String(target));
+      if (!blockedPartialPath && targetPath.endsWith("archive.tar.gz.tmp")) {
+        blockedPartialPath = targetPath;
+      }
+      if (targetPath === blockedPartialPath) {
+        blockedPartialCleanupAttempts += 1;
+        if (blockedPartialCleanupAttempts === 1) {
+          throw Object.assign(new Error("busy"), { code: "EBUSY" });
+        }
+      }
+      return originalUnlinkSync(target);
+    });
+    let tarAttempt = 0;
+    backupWalkMock.mockImplementation((options: { skip: (entryPath: string) => boolean }) => {
+      tarAttempt += 1;
+      return createMockTarStream({
+        beforeRead: () => {
+          expect(options.skip(volatilePath)).toBe(true);
+        },
+        contents: `archive-attempt-${tarAttempt}`,
+        ...(tarAttempt < 3
+          ? {
+              error: Object.assign(new Error("encountered unexpected EOF"), {
+                code: "EOF",
+                path: path.join(tempHome.home, ".openclaw", "state.txt"),
+              }),
+            }
+          : {}),
+      });
+    });
 
-      await expect(fs.access(outputPath)).rejects.toThrow();
-      const remaining = await fs.readdir(archiveDir);
-      expect(remaining).toEqual([]);
-    } finally {
-      await fs.rm(archiveDir, { recursive: true, force: true });
-    }
+    const result = await backupCreateCommand(runtime, { output: outputPath });
+
+    expect(result).toMatchObject({ archivePath: outputPath, skippedVolatileCount: 1 });
+    expect(sleepMock.mock.calls).toStrictEqual([[10_000], [20_000]]);
+    expect(blockedPartialCleanupAttempts).toBeGreaterThanOrEqual(2);
+    expect((await fs.readdir(archiveDir)).toSorted()).toStrictEqual([path.basename(outputPath)]);
   });
 
   it("does not overwrite an archive created after readiness checks complete", async () => {
-    const stateDir = path.join(tempHome.home, ".openclaw");
-    const archiveDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-backup-race-"));
-    const realLink = fs.link.bind(fs);
-    const linkSpy = vi.spyOn(fs, "link");
-    try {
-      await fs.writeFile(path.join(stateDir, "openclaw.json"), JSON.stringify({}), "utf8");
-      await fs.writeFile(path.join(stateDir, "state.txt"), "state\n", "utf8");
-
-      tarCreateMock.mockImplementationOnce(async ({ file }: { file: string }) => {
-        await fs.writeFile(file, "archive-bytes", "utf8");
+    const publish = directoryDurability.publishFileExclusive;
+    const publicationSpy = vi.spyOn(directoryDurability, "publishFileExclusive");
+    backupWalkMock.mockReturnValueOnce(createMockTarStream());
+    publicationSpy.mockImplementationOnce(async (options) => {
+      await fs.writeFile(options.targetPath, "concurrent-archive", {
+        encoding: "utf8",
+        flag: "wx",
       });
-      linkSpy.mockImplementationOnce(async (existingPath, newPath) => {
-        await fs.writeFile(newPath, "concurrent-archive", "utf8");
-        return await realLink(existingPath, newPath);
-      });
+      return await publish(options);
+    });
 
-      const runtime = {
-        log: vi.fn(),
-        error: vi.fn(),
-        exit: vi.fn(),
-      };
-      const outputPath = path.join(archiveDir, "backup.tar.gz");
+    await expect(backupCreateCommand(runtime, { output: outputPath })).rejects.toThrow(
+      /refusing to overwrite existing backup archive/i,
+    );
 
-      await expect(
-        backupCreateCommand(runtime, {
-          output: outputPath,
-        }),
-      ).rejects.toThrow(/refusing to overwrite existing backup archive/i);
-
-      expect(await fs.readFile(outputPath, "utf8")).toBe("concurrent-archive");
-    } finally {
-      linkSpy.mockRestore();
-      await fs.rm(archiveDir, { recursive: true, force: true });
-    }
-  });
-
-  it("falls back to exclusive copy when hard-link publication is unsupported", async () => {
-    const stateDir = path.join(tempHome.home, ".openclaw");
-    const archiveDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-backup-copy-fallback-"));
-    const linkSpy = vi.spyOn(fs, "link");
-    try {
-      await fs.writeFile(path.join(stateDir, "openclaw.json"), JSON.stringify({}), "utf8");
-      await fs.writeFile(path.join(stateDir, "state.txt"), "state\n", "utf8");
-
-      tarCreateMock.mockImplementationOnce(async ({ file }: { file: string }) => {
-        await fs.writeFile(file, "archive-bytes", "utf8");
-      });
-      linkSpy.mockRejectedValueOnce(
-        Object.assign(new Error("hard links not supported"), { code: "EOPNOTSUPP" }),
-      );
-
-      const runtime = {
-        log: vi.fn(),
-        error: vi.fn(),
-        exit: vi.fn(),
-      };
-      const outputPath = path.join(archiveDir, "backup.tar.gz");
-
-      const result = await backupCreateCommand(runtime, {
-        output: outputPath,
-      });
-
-      expect(result.archivePath).toBe(outputPath);
-      expect(await fs.readFile(outputPath, "utf8")).toBe("archive-bytes");
-    } finally {
-      linkSpy.mockRestore();
-      await fs.rm(archiveDir, { recursive: true, force: true });
-    }
+    expect(await fs.readFile(outputPath, "utf8")).toBe("concurrent-archive");
   });
 });

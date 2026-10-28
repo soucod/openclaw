@@ -1,8 +1,52 @@
 {
   "id": "vllm",
+  "categories": ["models"],
+  "activation": {
+    "onStartup": false
+  },
+  "enabledByDefault": true,
   "providers": ["vllm"],
-  "providerAuthEnvVars": {
-    "vllm": ["VLLM_API_KEY"]
+  "modelCatalog": {
+    "discovery": {
+      "vllm": "refreshable"
+    }
+  },
+  "providerRequest": {
+    "providers": {
+      "vllm": {
+        "family": "vllm",
+        "modelParamsSchema": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "priorityScheduling": {
+              "type": "boolean",
+              "default": false,
+              "title": "Priority scheduling",
+              "description": "Prioritize interactive requests on this vLLM model ahead of background and utility work. Requires the vLLM server to run with --scheduling-policy priority. Disabled by default."
+            }
+          }
+        },
+        "openAICompletions": {
+          "supportsStreamingUsage": true
+        }
+      }
+    }
+  },
+  "modelPricing": {
+    "providers": {
+      "vllm": {
+        "external": false
+      }
+    }
+  },
+  "setup": {
+    "providers": [
+      {
+        "id": "vllm",
+        "envVars": ["VLLM_API_KEY"]
+      }
+    ]
   },
   "providerAuthChoices": [
     {

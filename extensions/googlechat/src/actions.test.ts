@@ -1,176 +1,101 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
 
-const listEnabledGoogleChatAccounts = vi.hoisted(() => vi.fn());
 const resolveGoogleChatAccount = vi.hoisted(() => vi.fn());
-const createGoogleChatReaction = vi.hoisted(() => vi.fn());
-const deleteGoogleChatReaction = vi.hoisted(() => vi.fn());
-const listGoogleChatReactions = vi.hoisted(() => vi.fn());
 const sendGoogleChatMessage = vi.hoisted(() => vi.fn());
-const uploadGoogleChatAttachment = vi.hoisted(() => vi.fn());
 const resolveGoogleChatOutboundSpace = vi.hoisted(() => vi.fn());
-const getGoogleChatRuntime = vi.hoisted(() => vi.fn());
 
+// mock-isolation: Action fixtures provide account selection without loading real credentials.
 vi.mock("./accounts.js", () => ({
-  listEnabledGoogleChatAccounts,
+  inspectGoogleChatAccount: vi.fn(),
+  listGoogleChatAccountIds: vi.fn(),
   resolveGoogleChatAccount,
 }));
 
 vi.mock("./api.js", () => ({
-  createGoogleChatReaction,
-  deleteGoogleChatReaction,
-  listGoogleChatReactions,
   sendGoogleChatMessage,
-  uploadGoogleChatAttachment,
-}));
-
-vi.mock("./runtime.js", () => ({
-  getGoogleChatRuntime,
 }));
 
 vi.mock("./targets.js", () => ({
   resolveGoogleChatOutboundSpace,
 }));
 
-describe("googlechat message actions", () => {
-  it("describes send and reaction actions only when enabled accounts exist", async () => {
-    const { googlechatMessageActions } = await import("./actions.js");
+let googlechatMessageActions: typeof import("./message-tool-api.js").googlechatMessageActions;
+const remoteMedia = "https://example.invalid/image.png";
+const link = `Attachment: ${remoteMedia}`;
 
-    listEnabledGoogleChatAccounts.mockReturnValueOnce([]);
-    expect(googlechatMessageActions.describeMessageTool?.({ cfg: {} as never })).toBeNull();
+beforeAll(async () => {
+  ({ googlechatMessageActions } = await import("./message-tool-api.js"));
+});
 
-    listEnabledGoogleChatAccounts.mockReturnValueOnce([
-      {
-        enabled: true,
-        credentialSource: "service-account",
-        config: { actions: { reactions: true } },
-      },
-    ]);
+beforeEach(() => {
+  vi.clearAllMocks();
+  resolveGoogleChatAccount.mockReturnValue({ credentialSource: "service-account" });
+  resolveGoogleChatOutboundSpace.mockResolvedValue("spaces/AAA");
+});
 
-    expect(googlechatMessageActions.describeMessageTool?.({ cfg: {} as never })).toEqual({
-      actions: ["send", "react", "reactions"],
-    });
+afterAll(() => {
+  vi.doUnmock("./accounts.js");
+  vi.doUnmock("./api.js");
+  vi.doUnmock("./targets.js");
+  vi.resetModules();
+});
+
+function send(params: Record<string, unknown>, action = "send") {
+  return googlechatMessageActions.handleAction({
+    action,
+    params,
+    cfg: {},
+    accountId: "default",
+  } as never);
+}
+
+it("supports only send actions", () => {
+  expect(googlechatMessageActions.supportsAction?.({ action: "send" })).toBe(true);
+  expect(googlechatMessageActions.supportsAction?.({ action: "upload-file" })).toBe(false);
+});
+
+it.each([
+  ["caption", undefined, "thread-1", "caption"],
+  [undefined, remoteMedia, undefined, link],
+  ["caption", remoteMedia, undefined, `caption\n\n${link}`],
+])("sends %s through the resolved space", async (message, media, thread, text) => {
+  sendGoogleChatMessage.mockResolvedValue({
+    messageName: "spaces/AAA/messages/msg-1",
+    threadName: "spaces/AAA/threads/thread-1",
   });
 
-  it("sends messages with uploaded media through the resolved space", async () => {
-    const { googlechatMessageActions } = await import("./actions.js");
-
-    resolveGoogleChatAccount.mockReturnValue({
-      credentialSource: "service-account",
-      config: { mediaMaxMb: 5 },
-    });
-    resolveGoogleChatOutboundSpace.mockResolvedValue("spaces/AAA");
-    getGoogleChatRuntime.mockReturnValue({
-      channel: {
-        media: {
-          fetchRemoteMedia: vi.fn(async () => ({
-            buffer: Buffer.from("remote-bytes"),
-            fileName: "remote.png",
-            contentType: "image/png",
-          })),
-        },
-      },
-    });
-    uploadGoogleChatAttachment.mockResolvedValue({
-      attachmentUploadToken: "token-1",
-    });
-    sendGoogleChatMessage.mockResolvedValue({
-      messageName: "spaces/AAA/messages/msg-1",
-    });
-
-    if (!googlechatMessageActions.handleAction) {
-      throw new Error("Expected googlechatMessageActions.handleAction to be defined");
-    }
-    const result = await googlechatMessageActions.handleAction({
-      action: "send",
-      params: {
-        to: "spaces/AAA",
-        message: "caption",
-        media: "https://example.com/file.png",
-        threadId: "thread-1",
-      },
-      cfg: {},
-      accountId: "default",
-    } as never);
-
-    expect(resolveGoogleChatOutboundSpace).toHaveBeenCalledWith(
-      expect.objectContaining({
-        target: "spaces/AAA",
-      }),
-    );
-    expect(uploadGoogleChatAttachment).toHaveBeenCalledWith(
-      expect.objectContaining({
-        space: "spaces/AAA",
-        filename: "remote.png",
-      }),
-    );
-    expect(sendGoogleChatMessage).toHaveBeenCalledWith(
-      expect.objectContaining({
-        space: "spaces/AAA",
-        text: "caption",
-        thread: "thread-1",
-      }),
-    );
-    expect(result).toMatchObject({
-      details: {
-        ok: true,
-        to: "spaces/AAA",
-      },
-    });
+  const result = await send({ to: "spaces/AAA", message, media, threadId: thread });
+  expect(sendGoogleChatMessage.mock.lastCall?.[0]).toMatchObject({
+    space: "spaces/AAA",
+    text,
+    thread,
   });
-
-  it("removes only matching app reactions on react remove", async () => {
-    const { googlechatMessageActions } = await import("./actions.js");
-
-    resolveGoogleChatAccount.mockReturnValue({
-      credentialSource: "service-account",
-      config: { botUser: "users/app-bot" },
-    });
-    listGoogleChatReactions.mockResolvedValue([
-      {
-        name: "reactions/1",
-        emoji: { unicode: "👍" },
-        user: { name: "users/app" },
-      },
-      {
-        name: "reactions/2",
-        emoji: { unicode: "👍" },
-        user: { name: "users/app-bot" },
-      },
-      {
-        name: "reactions/3",
-        emoji: { unicode: "👍" },
-        user: { name: "users/other" },
-      },
-    ]);
-
-    if (!googlechatMessageActions.handleAction) {
-      throw new Error("Expected googlechatMessageActions.handleAction to be defined");
-    }
-    const result = await googlechatMessageActions.handleAction({
-      action: "react",
-      params: {
-        messageId: "spaces/AAA/messages/msg-1",
-        emoji: "👍",
-        remove: true,
-      },
-      cfg: {},
-      accountId: "default",
-    } as never);
-
-    expect(deleteGoogleChatReaction).toHaveBeenCalledTimes(2);
-    expect(deleteGoogleChatReaction).toHaveBeenNthCalledWith(1, {
-      account: expect.anything(),
-      reactionName: "reactions/1",
-    });
-    expect(deleteGoogleChatReaction).toHaveBeenNthCalledWith(2, {
-      account: expect.anything(),
-      reactionName: "reactions/2",
-    });
-    expect(result).toMatchObject({
-      details: {
-        ok: true,
-        removed: 2,
-      },
-    });
+  expect(result.details).toEqual({
+    ok: true,
+    to: "spaces/AAA",
+    messageName: "spaces/AAA/messages/msg-1",
+    threadName: "spaces/AAA/threads/thread-1",
   });
+});
+
+it.each([
+  { media: "remote.png" },
+  { mediaUrls: ["remote.png"] },
+  { attachments: [{ url: "remote.png" }] },
+])("rejects local attachments %j before provider access", async (media) => {
+  await expect(send({ to: "spaces/AAA", message: "caption", ...media })).rejects.toThrow(
+    "Google Chat outbound attachments require remote HTTP(S) URLs.",
+  );
+
+  expect(resolveGoogleChatAccount).not.toHaveBeenCalled();
+  expect(resolveGoogleChatOutboundSpace).not.toHaveBeenCalled();
+  expect(sendGoogleChatMessage).not.toHaveBeenCalled();
+});
+
+it("rejects unsupported actions without provider access", async () => {
+  await expect(send({}, "react")).rejects.toThrow(
+    "Action react is not supported for provider googlechat.",
+  );
+
+  expect(sendGoogleChatMessage).not.toHaveBeenCalled();
 });

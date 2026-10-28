@@ -1,358 +1,143 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { OpenClawConfig } from "../config/config.js";
-import { NON_ENV_SECRETREF_MARKER } from "./model-auth-markers.js";
+import { afterAll, assert, beforeAll, expect, it, vi } from "vitest";
+import type { ModelProviderConfig } from "../config/types.models.js";
+import { NON_ENV_SECRETREF_MARKER } from "../secrets/provider-credential-values.js";
+import { createFixtureSuite } from "../test-utils/fixture-suite.js";
+import { configForProviders as config } from "./model-auth.fixtures.test-support.js";
 import {
   installModelsConfigTestHooks,
   MODELS_CONFIG_IMPLICIT_ENV_VARS,
   unsetEnv,
-  withModelsTempHome as withTempHome,
   withTempEnv,
 } from "./models-config.e2e-harness.js";
+import { enforceSourceManagedProviderSecrets } from "./models-config.providers.source-managed.js";
 
-vi.mock("./models-config.providers.js", async () => {
-  const actual = await vi.importActual<typeof import("./models-config.providers.js")>(
-    "./models-config.providers.js",
-  );
-  return {
-    ...actual,
-    resolveImplicitProviders: async () => ({}),
-  };
-});
+vi.mock("../plugins/manifest-registry.js", () => ({
+  loadPluginManifestRegistryCore: () => ({ plugins: [] }),
+}));
+
+vi.mock("./model-auth-env-vars.js", () => ({
+  listKnownProviderEnvApiKeyNames: () => ["OPENAI_API_KEY"],
+  resolveProviderEnvAuthLookupMaps: () => ({
+    aliasMap: {},
+    envCandidateMap: { openai: ["OPENAI_API_KEY"] },
+    authEvidenceMap: {},
+  }),
+}));
+
+vi.mock("../plugins/provider-runtime.js", () => ({
+  normalizeProviderConfigWithPlugin: () => undefined,
+  resolveProviderConfigApiKeyWithPlugin: () => undefined,
+  resolveProviderSyntheticAuthWithPlugin: () => undefined,
+}));
+
+vi.mock("./models-config.providers.implicit.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./models-config.providers.implicit.js")>()),
+  resolveImplicitProviders: async () => ({}),
+}));
 
 installModelsConfigTestHooks();
 
-let clearConfigCache: typeof import("../config/config.js").clearConfigCache;
-let clearRuntimeConfigSnapshot: typeof import("../config/config.js").clearRuntimeConfigSnapshot;
-let loadConfig: typeof import("../config/config.js").loadConfig;
-let setRuntimeConfigSnapshot: typeof import("../config/config.js").setRuntimeConfigSnapshot;
+let setRuntimeConfigSnapshot: typeof import("../config/io.js").setRuntimeConfigSnapshot;
 let ensureOpenClawModelsJson: typeof import("./models-config.js").ensureOpenClawModelsJson;
-let resetModelsJsonReadyCacheForTest: typeof import("./models-config.js").resetModelsJsonReadyCacheForTest;
+let planModelsJsonForTest: typeof import("./models-config.plan.test-support.js").planModelsJsonForTest;
 let readGeneratedModelsJson: typeof import("./models-config.test-utils.js").readGeneratedModelsJson;
-
-beforeEach(async () => {
-  vi.resetModules();
-  ({ clearConfigCache, clearRuntimeConfigSnapshot, loadConfig, setRuntimeConfigSnapshot } =
-    await import("../config/config.js"));
-  ({ ensureOpenClawModelsJson, resetModelsJsonReadyCacheForTest } =
-    await import("./models-config.js"));
+const fixtureSuite = createFixtureSuite("openclaw-models-runtime-source-");
+beforeAll(async () => {
+  await fixtureSuite.setup();
+  ({ setRuntimeConfigSnapshot } = await import("../config/io.js"));
+  ({ ensureOpenClawModelsJson } = await import("./models-config.js"));
+  ({ planModelsJsonForTest } = await import("./models-config.plan.test-support.js"));
   ({ readGeneratedModelsJson } = await import("./models-config.test-utils.js"));
 });
+afterAll(() => fixtureSuite.cleanup());
+type Providers = Record<string, ModelProviderConfig>;
+type ModelsJson = { providers: Providers };
 
-afterEach(() => {
-  resetModelsJsonReadyCacheForTest();
+function provider(fields: Partial<ModelProviderConfig> = {}): ModelProviderConfig {
+  return { baseUrl: "https://api.openai.com/v1", api: "openai-completions", models: [], ...fields };
+}
+const protectedSecrets = {
+  apiKey: "OPENAI_API_KEY",
+  headers: {
+    Authorization: "secretref-env:OPENAI_HEADER_TOKEN",
+    "X-Tenant-Token": NON_ENV_SECRETREF_MARKER,
+  },
+};
+const fileKey = { source: "file" as const, provider: "vault", id: "/token" };
+const source = provider({
+  apiKey: { source: "env", provider: "default", id: "OPENAI_API_KEY" },
+  headers: {
+    Authorization: { source: "env", provider: "default", id: "OPENAI_HEADER_TOKEN" },
+    "X-Tenant-Token": fileKey,
+  },
+});
+const alias = {
+  ...source,
+  apiKey: { source: "env" as const, provider: "default", id: "OPENAI_CASE_VARIANT" },
+};
+const runtime = provider({
+  apiKey: "sk-runtime-resolved", // pragma: allowlist secret
+  headers: {
+    Authorization: "Bearer runtime-openai-token",
+    "X-Tenant-Token": "runtime-tenant-token",
+  },
 });
 
-function createOpenAiApiKeySourceConfig(): OpenClawConfig {
-  return {
-    models: {
-      providers: {
-        openai: {
-          baseUrl: "https://api.openai.com/v1",
-          apiKey: { source: "env", provider: "default", id: "OPENAI_API_KEY" }, // pragma: allowlist secret
-          api: "openai-completions" as const,
-          models: [],
-        },
-      },
-    },
-  };
-}
-
-function createOpenAiApiKeyRuntimeConfig(): OpenClawConfig {
-  return {
-    models: {
-      providers: {
-        openai: {
-          baseUrl: "https://api.openai.com/v1",
-          apiKey: "sk-runtime-resolved", // pragma: allowlist secret
-          api: "openai-completions" as const,
-          models: [],
-        },
-      },
-    },
-  };
-}
-
-function createOpenAiHeaderSourceConfig(): OpenClawConfig {
-  return {
-    models: {
-      providers: {
-        openai: {
-          baseUrl: "https://api.openai.com/v1",
-          api: "openai-completions" as const,
-          headers: {
-            Authorization: {
-              source: "env",
-              provider: "default",
-              id: "OPENAI_HEADER_TOKEN", // pragma: allowlist secret
-            },
-            "X-Tenant-Token": {
-              source: "file",
-              provider: "vault",
-              id: "/providers/openai/tenantToken",
-            },
-          },
-          models: [],
-        },
-      },
-    },
-  };
-}
-
-function createOpenAiHeaderRuntimeConfig(): OpenClawConfig {
-  return {
-    models: {
-      providers: {
-        openai: {
-          baseUrl: "https://api.openai.com/v1",
-          api: "openai-completions" as const,
-          headers: {
-            Authorization: "Bearer runtime-openai-token",
-            "X-Tenant-Token": "runtime-tenant-token",
-          },
-          models: [],
-        },
-      },
-    },
-  };
-}
-
-function withGatewayTokenMode(config: OpenClawConfig): OpenClawConfig {
-  return {
-    ...config,
-    gateway: {
-      auth: {
-        mode: "token",
-      },
-    },
-  };
-}
-
-async function withGeneratedModelsFromRuntimeSource(
-  params: {
-    sourceConfig: OpenClawConfig;
-    runtimeConfig: OpenClawConfig;
-    candidateConfig?: OpenClawConfig;
-  },
-  runAssertions: () => Promise<void>,
-) {
-  await withTempHome(async () => {
-    await withTempEnv(MODELS_CONFIG_IMPLICIT_ENV_VARS, async () => {
-      unsetEnv(MODELS_CONFIG_IMPLICIT_ENV_VARS);
-      try {
-        setRuntimeConfigSnapshot(params.runtimeConfig, params.sourceConfig);
-        await ensureOpenClawModelsJson(params.candidateConfig ?? loadConfig());
-        await runAssertions();
-      } finally {
-        clearRuntimeConfigSnapshot();
-        clearConfigCache();
-      }
-    });
+it("replaces resolved env and file API keys with source markers", () => {
+  const moonshot = provider({ apiKey: "resolved-moonshot" });
+  const providers = enforceSourceManagedProviderSecrets({
+    providers: { openai: runtime, moonshot },
+    sourceConfigForSecrets: config({ openai: source, moonshot: provider({ apiKey: fileKey }) }),
   });
-}
+  expect(providers?.openai?.apiKey).toBe("OPENAI_API_KEY");
+  expect(providers?.moonshot?.apiKey).toBe(NON_ENV_SECRETREF_MARKER);
+});
 
-async function expectGeneratedProviderApiKey(providerId: string, expected: string) {
-  const parsed = await readGeneratedModelsJson<{
-    providers: Record<string, { apiKey?: string }>;
-  }>();
-  expect(parsed.providers[providerId]?.apiKey).toBe(expected);
-}
-
-async function expectGeneratedOpenAiHeaderMarkers() {
-  const parsed = await readGeneratedModelsJson<{
-    providers: Record<string, { headers?: Record<string, string> }>;
-  }>();
-  expect(parsed.providers.openai?.headers?.Authorization).toBe(
-    "secretref-env:OPENAI_HEADER_TOKEN", // pragma: allowlist secret
-  );
-  expect(parsed.providers.openai?.headers?.["X-Tenant-Token"]).toBe(NON_ENV_SECRETREF_MARKER);
-}
-
-describe("models-config runtime source snapshot", () => {
-  it("uses runtime source snapshot markers when passed the active runtime config", async () => {
-    await withGeneratedModelsFromRuntimeSource(
-      {
-        sourceConfig: createOpenAiApiKeySourceConfig(),
-        runtimeConfig: createOpenAiApiKeyRuntimeConfig(),
-      },
-      async () => expectGeneratedProviderApiKey("openai", "OPENAI_API_KEY"), // pragma: allowlist secret
-    );
-  });
-
-  it("uses non-env marker from runtime source snapshot for file refs", async () => {
-    await withTempHome(async () => {
-      await withTempEnv(MODELS_CONFIG_IMPLICIT_ENV_VARS, async () => {
-        unsetEnv(MODELS_CONFIG_IMPLICIT_ENV_VARS);
-        const sourceConfig: OpenClawConfig = {
-          models: {
-            providers: {
-              moonshot: {
-                baseUrl: "https://api.moonshot.ai/v1",
-                apiKey: { source: "file", provider: "vault", id: "/moonshot/apiKey" },
-                api: "openai-completions" as const,
-                models: [],
-              },
-            },
-          },
-        };
-        const runtimeConfig: OpenClawConfig = {
-          models: {
-            providers: {
-              moonshot: {
-                baseUrl: "https://api.moonshot.ai/v1",
-                apiKey: "sk-runtime-moonshot", // pragma: allowlist secret
-                api: "openai-completions" as const,
-                models: [],
-              },
-            },
-          },
-        };
-
-        try {
-          setRuntimeConfigSnapshot(runtimeConfig, sourceConfig);
-          await ensureOpenClawModelsJson(loadConfig());
-
-          const parsed = await readGeneratedModelsJson<{
-            providers: Record<string, { apiKey?: string }>;
-          }>();
-          expect(parsed.providers.moonshot?.apiKey).toBe(NON_ENV_SECRETREF_MARKER);
-        } finally {
-          clearRuntimeConfigSnapshot();
-          clearConfigCache();
-        }
+it("invalidates cached readiness when projected config changes under the same runtime snapshot", async () => {
+  const agentDir = await fixtureSuite.createCaseDir("agent");
+  await withTempEnv(MODELS_CONFIG_IMPLICIT_ENV_VARS, async () => {
+    unsetEnv(MODELS_CONFIG_IMPLICIT_ENV_VARS);
+    const candidate = (baseUrl: string, value: string) => {
+      const headers = { ...runtime.headers, "X-OpenClaw-Test": value };
+      return config({ openai: { ...runtime, baseUrl, headers } });
+    };
+    setRuntimeConfigSnapshot(config({ openai: runtime }), config({ openai: source }));
+    await ensureOpenClawModelsJson(candidate(runtime.baseUrl!, "one"), agentDir);
+    const expectProtectedProvider = async (value: string) => {
+      const { providers } = await readGeneratedModelsJson<ModelsJson>(agentDir);
+      expect(providers.openai).toMatchObject({
+        ...protectedSecrets,
+        baseUrl: runtime.baseUrl,
+        headers: { ...protectedSecrets.headers, "X-OpenClaw-Test": value },
       });
-    });
+    };
+    await expectProtectedProvider("one");
+    await ensureOpenClawModelsJson(candidate("https://mirror.example/v1", "two"), agentDir);
+    // Merge mode preserves the authored URL while the changed header invalidates readiness.
+    await expectProtectedProvider("two");
   });
+});
 
-  it("projects cloned runtime configs onto source snapshot when preserving provider auth", async () => {
-    await withTempHome(async () => {
-      await withTempEnv(MODELS_CONFIG_IMPLICIT_ENV_VARS, async () => {
-        unsetEnv(MODELS_CONFIG_IMPLICIT_ENV_VARS);
-        const sourceConfig = createOpenAiApiKeySourceConfig();
-        const runtimeConfig = createOpenAiApiKeyRuntimeConfig();
-        const clonedRuntimeConfig: OpenClawConfig = {
-          ...runtimeConfig,
-          agents: {
-            defaults: {
-              imageModel: "openai/gpt-image-1",
-            },
-          },
-        };
-
-        try {
-          setRuntimeConfigSnapshot(runtimeConfig, sourceConfig);
-          await ensureOpenClawModelsJson(clonedRuntimeConfig);
-          await expectGeneratedProviderApiKey("openai", "OPENAI_API_KEY"); // pragma: allowlist secret
-        } finally {
-          clearRuntimeConfigSnapshot();
-          clearConfigCache();
-        }
-      });
-    });
+it.each<Providers>([
+  { openai: source, OpenAI: alias },
+  { OpenAI: alias, openai: source },
+  { " OpenAI ": source },
+])("keeps canonical source secret ownership (ordering %#)", async (providers) => {
+  const plan = await planModelsJsonForTest({
+    cfg: config({ openai: runtime }),
+    sourceConfigForSecrets: config(providers),
+    agentDir: "/tmp/openclaw-models-plan",
+    env: {},
   });
+  assert(plan.action === "write");
+  const { providers: generated }: ModelsJson = JSON.parse(plan.contents);
+  expect(generated).toEqual({ openai: expect.objectContaining(protectedSecrets) });
+});
 
-  it("invalidates cached readiness when projected config changes under the same runtime snapshot", async () => {
-    await withTempHome(async () => {
-      await withTempEnv(MODELS_CONFIG_IMPLICIT_ENV_VARS, async () => {
-        unsetEnv(MODELS_CONFIG_IMPLICIT_ENV_VARS);
-        const sourceConfig = createOpenAiApiKeySourceConfig();
-        const runtimeConfig = createOpenAiApiKeyRuntimeConfig();
-        const firstCandidate: OpenClawConfig = {
-          ...runtimeConfig,
-          models: {
-            providers: {
-              openai: {
-                ...runtimeConfig.models!.providers!.openai,
-                baseUrl: "https://api.openai.com/v1",
-              },
-            },
-          },
-        };
-        const secondCandidate: OpenClawConfig = {
-          ...runtimeConfig,
-          models: {
-            providers: {
-              openai: {
-                ...runtimeConfig.models!.providers!.openai,
-                baseUrl: "https://mirror.example/v1",
-              },
-            },
-          },
-        };
-
-        try {
-          setRuntimeConfigSnapshot(runtimeConfig, sourceConfig);
-          await ensureOpenClawModelsJson(firstCandidate);
-          let parsed = await readGeneratedModelsJson<{
-            providers: Record<string, { baseUrl?: string; apiKey?: string }>;
-          }>();
-          expect(parsed.providers.openai?.baseUrl).toBe("https://api.openai.com/v1");
-          expect(parsed.providers.openai?.apiKey).toBe("OPENAI_API_KEY"); // pragma: allowlist secret
-
-          await ensureOpenClawModelsJson(secondCandidate);
-          parsed = await readGeneratedModelsJson<{
-            providers: Record<string, { baseUrl?: string; apiKey?: string }>;
-          }>();
-          expect(parsed.providers.openai?.baseUrl).toBe("https://mirror.example/v1");
-          expect(parsed.providers.openai?.apiKey).toBe("OPENAI_API_KEY"); // pragma: allowlist secret
-        } finally {
-          clearRuntimeConfigSnapshot();
-          clearConfigCache();
-        }
-      });
-    });
+it("uses a valid case alias when the canonical source entry is not a provider record", () => {
+  const providers = enforceSourceManagedProviderSecrets({
+    providers: { openai: runtime },
+    sourceConfigForSecrets: config({ openai: null, OpenAI: source } as unknown as Providers),
   });
-
-  it("uses header markers from runtime source snapshot instead of resolved runtime values", async () => {
-    await withGeneratedModelsFromRuntimeSource(
-      {
-        sourceConfig: createOpenAiHeaderSourceConfig(),
-        runtimeConfig: createOpenAiHeaderRuntimeConfig(),
-      },
-      expectGeneratedOpenAiHeaderMarkers,
-    );
-  });
-
-  it("keeps source markers when runtime projection is skipped for incompatible top-level shape", async () => {
-    await withTempHome(async () => {
-      await withTempEnv(MODELS_CONFIG_IMPLICIT_ENV_VARS, async () => {
-        unsetEnv(MODELS_CONFIG_IMPLICIT_ENV_VARS);
-        const sourceConfig = withGatewayTokenMode(createOpenAiApiKeySourceConfig());
-        const runtimeConfig = withGatewayTokenMode(createOpenAiApiKeyRuntimeConfig());
-        const incompatibleCandidate: OpenClawConfig = {
-          ...createOpenAiApiKeyRuntimeConfig(),
-        };
-
-        try {
-          setRuntimeConfigSnapshot(runtimeConfig, sourceConfig);
-          await ensureOpenClawModelsJson(incompatibleCandidate);
-          await expectGeneratedProviderApiKey("openai", "OPENAI_API_KEY"); // pragma: allowlist secret
-        } finally {
-          clearRuntimeConfigSnapshot();
-          clearConfigCache();
-        }
-      });
-    });
-  });
-
-  it("keeps source header markers when runtime projection is skipped for incompatible top-level shape", async () => {
-    await withTempHome(async () => {
-      await withTempEnv(MODELS_CONFIG_IMPLICIT_ENV_VARS, async () => {
-        unsetEnv(MODELS_CONFIG_IMPLICIT_ENV_VARS);
-        const sourceConfig = withGatewayTokenMode(createOpenAiHeaderSourceConfig());
-        const runtimeConfig = withGatewayTokenMode(createOpenAiHeaderRuntimeConfig());
-        const incompatibleCandidate: OpenClawConfig = {
-          ...createOpenAiHeaderRuntimeConfig(),
-        };
-
-        try {
-          setRuntimeConfigSnapshot(runtimeConfig, sourceConfig);
-          await ensureOpenClawModelsJson(incompatibleCandidate);
-          await expectGeneratedOpenAiHeaderMarkers();
-        } finally {
-          clearRuntimeConfigSnapshot();
-          clearConfigCache();
-        }
-      });
-    });
-  });
+  expect(providers?.openai?.apiKey).toBe("OPENAI_API_KEY");
 });

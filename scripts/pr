@@ -1,22 +1,1050 @@
 #!/usr/bin/env bash
+# Bash 5.3+ can deadlock writing heredoc pipes on macOS before the reader starts.
+if [[ ${OSTYPE:-} == darwin* && $BASH != /bin/bash ]] && ((BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 3))); then
+  exec /bin/bash "$0" "$@"
+fi
 
 set -euo pipefail
 
-# If invoked from a linked worktree copy of this script, re-exec the canonical
-# script from the repository root so behavior stays consistent across worktrees.
-script_self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+# Install creator cleanup before even the Git preflight or argument validation.
+# Physical paths keep helper argv aligned with Node's canonical module URLs.
+script_self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
 script_parent_dir="$(dirname "$script_self")"
-if common_git_dir=$(git -C "$script_parent_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null); then
+if [ -n "${OPENCLAW_PR_ANCHOR_REPO_ROOT:-}" ] &&
+  [ "${OPENCLAW_PR_ANCHOR_CREATOR_PID:-}" = "$$" ] && [ "${OPENCLAW_PR_ANCHOR_FD:-}" = 9 ]; then
+  trap 'node "$script_parent_dir/pr-lib/materialized-anchor.mjs" retire "$script_self" || true' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 131' QUIT
+  trap 'exit 143' TERM
+fi
+
+# This bootstrap stays inline: no local helper is trusted before code selection.
+pr_git() { "${OPENCLAW_PR_GIT:-${GIT_EXEC:-git}}" "$@"; }
+pr_run_bounded() (
+  set +e
+  # Separate jobs let the deadline reap a hung launcher and its children.
+  set -m
+  "$@" &
+  local tool_pid=$! timer_pid result
+  (/bin/sleep 10; kill -KILL -- "-$tool_pid" 2>/dev/null) &
+  timer_pid=$!
+  wait "$tool_pid" 2>/dev/null
+  result=$?
+  kill -KILL -- "-$timer_pid" 2>/dev/null
+  wait "$timer_pid" 2>/dev/null
+  exit "$result"
+)
+
+GIT_EXEC=$(command -v "${OPENCLAW_PR_GIT:-${GIT_EXEC:-git}}" 2>/dev/null || true)
+if [ -n "$GIT_EXEC" ]; then
+  case "$GIT_EXEC" in /*) ;; *) GIT_EXEC="$PWD/$GIT_EXEC" ;; esac
+fi
+if [ -z "$GIT_EXEC" ] || ! pr_run_bounded "$GIT_EXEC" --version >/dev/null 2>&1; then
+  echo "scripts/pr git preflight failed or exceeded 10 seconds: ${GIT_EXEC:-${OPENCLAW_PR_GIT:-git (not found on PATH)}}" >&2
+  echo "xcode-select -p: $(pr_run_bounded xcode-select -p 2>/dev/null || printf 'unavailable')" >&2
+  echo "export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer or set OPENCLAW_PR_GIT" >&2
+  exit 1
+fi
+export GIT_EXEC
+export OPENCLAW_PR_GIT="$GIT_EXEC"
+
+# Older trusted wrappers use bare Git before reaching a newer supervisor.
+# Keep this Git-only adapter across exec; OS temp reaping owns its lifetime.
+# Matching inodes let reentry reuse it.
+pr_path_git=$(type -P git 2>/dev/null || true)
+case "$pr_path_git" in /*|"") ;; *) pr_path_git="$PWD/$pr_path_git" ;; esac
+if [ -z "$pr_path_git" ] || [ ! "$pr_path_git" -ef "$GIT_EXEC" ]; then
+  pr_git_path_dir=$(mktemp -d "${TMPDIR:-/tmp}/openclaw-pr-git.XXXXXX")
+  if ! ln -s "$GIT_EXEC" "$pr_git_path_dir/git"; then
+    rm -rf "$pr_git_path_dir"
+    exit 1
+  fi
+  pr_git_path_dir=$(cd "$pr_git_path_dir" && pwd -P)
+  export PATH="$pr_git_path_dir:$PATH"
+fi
+unset pr_path_git pr_git_path_dir
+
+# This wrapper parses GitHub CLI JSON. Caller shells may force ANSI color globally.
+export NO_COLOR=1
+export CLICOLOR=0
+export CLICOLOR_FORCE=0
+export FORCE_COLOR=0
+unset COLORTERM
+
+# This is the single source of truth for the canonical-wrapper trust boundary.
+# Advisory commands may run a mismatched local wrapper only with the explicit
+# developer opt-in; landing commands must always use canonical/origin-main code.
+# Classification is independent of serialization: ci-dispatch remains locked
+# because GitHub exposes neither dispatch deduplication nor a correlation ID.
+# PR_SUBCOMMAND_CLASSIFICATIONS_BEGIN
+pr_subcommand_classification() {
+  case "$1" in
+    ls | workspace | ci-dispatch)
+      printf 'advisory\n'
+      ;;
+    gc | lock-recover | tooling-recover | review-init | review-checkout-main | review-checkout-pr | review-claim | review-guard | review-artifacts-init | review-validate-artifacts | review-tests | prepare-init | prepare-correction-init | prepare-correction-continue | prepare-correction-review-init | prepare-baseline-refresh | prepare-baseline-successor | prepare-baseline-signing-request | prepare-baseline-signing-continue | prepare-validate-commit | prepare-gates | prepare-push | prepare-sync-head | prepare-run | merge-verify | merge-run | merge-recover | merge-complete)
+      printf 'landing\n'
+      ;;
+    *) return 1 ;;
+  esac
+}
+# PR_SUBCOMMAND_CLASSIFICATIONS_END
+
+is_locked_pr_command() {
+  # Advisory trust classification permits local dogfood, but dispatches still
+  # serialize with landing operations because the remote mutation is not atomic.
+  if [ "$1" = "ci-dispatch" ]; then
+    return 0
+  fi
+  local classification
+  classification=$(pr_subcommand_classification "$1") || return 1
+  [ "$classification" = "landing" ] || return 1
+  # gc manages per-PR locks itself; lock-recover performs an exact-OID CAS.
+  [ "$1" != "gc" ] && [ "$1" != "lock-recover" ]
+}
+
+dev_wrapper_opt_in=0
+if [ "${OPENCLAW_PR_DEV_WRAPPER:-}" = "1" ]; then
+  dev_wrapper_opt_in=1
+fi
+if [ "${1-}" = "--dev-wrapper" ]; then
+  dev_wrapper_opt_in=1
+  export OPENCLAW_PR_DEV_WRAPPER=1
+  shift
+fi
+requested_subcommand="${1-}"
+
+# Only this explicit recovery may select current main over a retained workflow.
+# Parse before source selection, then parse normally again before taking a lock.
+PR_WORKFLOW_RECOVERY_OUTCOME=""
+PR_WORKFLOW_RECOVERY_HEAD=""
+pr_read_current_workflow_request() {
+  local argument found=0
+  for argument in "$@"; do
+    [ "$argument" != --current-workflow ] || found=$((found + 1))
+  done
+  [ "$found" -ne 0 ] || return 0
+  [ "$found" -eq 1 ] && [ "${1-}" = merge-recover ] &&
+    [[ "${2-}" =~ ^[1-9][0-9]*$ ]] && [[ "${3-}" =~ ^[0-9a-f]{40}$ ]] &&
+    [ "${4-}" = --confirmed-operator-recovery ] || return 2
+  PR_WORKFLOW_RECOVERY_OUTCOME="$3"
+  shift 4
+  local admin=false confirmed=false body=false current=false
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --current-workflow) [ "$current" = false ] || return 2; current=true; shift ;;
+      --replacement-head)
+        [ -z "$PR_WORKFLOW_RECOVERY_HEAD" ] && [[ "${2-}" =~ ^[0-9a-f]{40}$ ]] || return 2
+        PR_WORKFLOW_RECOVERY_HEAD="$2"; shift 2 ;;
+      --body-file) [ "$body" = false ] && [ -n "${2-}" ] || return 2; body=true; shift 2 ;;
+      --admin-evidence) [ "$admin" = false ] && [ -n "${2-}" ] || return 2; admin=true; shift 2 ;;
+      --confirmed-operator-admin) [ "$confirmed" = false ] || return 2; confirmed=true; shift ;;
+      *) return 2 ;;
+    esac
+  done
+  [ "$current" = true ] && [ "$admin" = "$confirmed" ] &&
+    { [ -n "$PR_WORKFLOW_RECOVERY_HEAD" ] || [ "$admin" = true ]; }
+}
+pr_read_current_workflow_request "$@" || {
+  echo "--current-workflow requires confirmed merge-recover with an exact outcome and either a replacement head or confirmed same-head admin recovery." >&2
+  exit 2
+}
+
+# This bootstrap cannot load helpers from an unverified extracted tree.
+pr_batch_wrapper_git() {
+  node --input-type=module - "$GIT_EXEC" "$@" <<'EOF_WRAPPER_GIT'
+import { spawnSync } from "node:child_process";
+import { fstatSync, lstatSync, readSync, realpathSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+const [binary, operation, repository, revision, ...paths] = process.argv.slice(2);
+function git(directory, args, input) {
+  const result = spawnSync(binary, ["-C", directory, ...args], {
+    input, maxBuffer: Infinity, stdio: ["pipe", "pipe", "ignore"],
+    env: { ...process.env, GIT_NO_LAZY_FETCH: "1" },
+  });
+  if (result.error || result.signal || result.status !== 0) throw new Error("Git read failed");
+  return result.stdout;
+}
+const oid = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
+try {
+  if (operation.startsWith("workflow-")) {
+    if (!/^[1-9][0-9]*$/.test(revision)) throw new Error("Invalid workflow PR");
+    const ref = `refs/openclaw/pr-workflow-bindings/${revision}`;
+    const run = args => git(repository, args).toString("utf8").trim();
+    const owner = realpathSync(run(["rev-parse", "--path-format=absolute", "--git-common-dir"]));
+    const remote = run(["remote", "get-url", "origin"]);
+    const url = /^[a-z][a-z0-9+.-]*:\/\//i.test(remote) ? new URL(remote) : null;
+    const scp = !url && /^(?:([^/@:]+)@)?(\[[^\]]+\]|[^/:]+):(.+)$/.exec(remote);
+    // SCP paths can be relative to an SSH user's home. Preserve that transport,
+    // user, path case and URL ports instead of conflating different endpoints.
+    const identity = url ? url.protocol === "file:"
+      ? realpathSync(fileURLToPath(url)) : url.href
+      : scp ? JSON.stringify(["scp", scp[1] ?? "", scp[2].toLowerCase(), scp[3]])
+      : realpathSync(resolve(repository, remote));
+    if (!identity || url && (url.username && url.protocol !== "ssh:" || url.password)) throw new Error("Invalid repository identity");
+    const read = () => {
+      const symbolic = spawnSync(binary, ["-C", repository, "symbolic-ref", "--quiet", ref], { stdio: "ignore" });
+      if (symbolic.error || symbolic.signal || symbolic.status !== 1) throw new Error("Invalid symbolic workflow binding");
+      const listing = run(["for-each-ref", "--format=%(objectname) %(symref)", ref]);
+      if (!listing) return null;
+      if (!oid.test(listing)) throw new Error("Invalid workflow binding ref");
+      const headers = run(["cat-file", "commit", listing]).split("\n\n", 1)[0].split("\n");
+      const parents = headers.filter(line => line.startsWith("parent ")).map(line => line.slice(7));
+      const entries = run(["ls-tree", listing]).split("\n");
+      if (parents.length !== 1 || entries.length !== 1 || !/^100644 blob [a-f0-9]+\tbinding.json$/.test(entries[0])) {
+        throw new Error("Invalid workflow binding tree");
+      }
+      if (Number(run(["cat-file", "-s", `${listing}:binding.json`])) > 4096) throw new Error("Oversized workflow binding");
+      const record = JSON.parse(run(["show", `${listing}:binding.json`]));
+      if (JSON.stringify(Object.keys(record).sort()) !== JSON.stringify(["owner", "pr", "repository", "source", "version"]) ||
+          record.version !== 1 || record.pr !== revision || record.owner !== owner || record.repository !== identity ||
+          !oid.test(record.source) || parents[0] !== record.source ||
+          run(["cat-file", "-t", record.source]) !== "commit") throw new Error("Workflow binding identity mismatch");
+      return { oid: listing, source: record.source };
+    };
+    const requireSource = (source, anchor = "refs/remotes/origin/main") => {
+      if (!oid.test(source)) throw new Error("Invalid workflow source");
+      run(["merge-base", "--is-ancestor", source, anchor]);
+    };
+    const current = read();
+    const requireRecovery = (source, outcome, replacementHead, anchor = "refs/remotes/origin/main") => {
+      const symbolicAnchor = spawnSync(binary, ["-C", repository, "symbolic-ref", "--quiet", anchor], { stdio: "ignore" });
+      if (symbolicAnchor.error || symbolicAnchor.signal || symbolicAnchor.status !== 1) {
+        throw new Error("Refusing symbolic or unreadable current workflow anchor");
+      }
+      if (!current || !oid.test(outcome) || (replacementHead !== "" && !oid.test(replacementHead)) ||
+          source !== run(["rev-parse", "--verify", `${anchor}^{commit}`]) ||
+          !["https://github.com/openclaw/openclaw", "https://github.com/openclaw/openclaw.git",
+            "git@github.com:openclaw/openclaw.git", "ssh://git@github.com/openclaw/openclaw.git"].includes(run(["config", "--get", "remote.origin.url"]))) {
+        throw new Error("Current workflow recovery requires official current main and a retained workflow");
+      }
+      requireSource(current.source, anchor);
+      const outcomeRef = `refs/openclaw/pr-merge-outcomes/${revision}`;
+      const symbolic = spawnSync(binary, ["-C", repository, "symbolic-ref", "--quiet", outcomeRef], { stdio: "ignore" });
+      if (symbolic.error || symbolic.signal || symbolic.status !== 1 ||
+          run(["rev-parse", "--verify", outcomeRef]) !== outcome || run(["cat-file", "-t", outcome]) !== "commit") {
+        throw new Error("Current workflow recovery outcome changed");
+      }
+      const record = JSON.parse(run(["show", `${outcome}:outcome.json`]));
+      const cancelledAuto = replacementHead !== "" && record.route === "auto" &&
+        record.cancellation?.state === "confirmed";
+      // This admits current trusted code, not another dispatch. The existing
+      // provider-rejection owner must still qualify exact HTTP 405 capture bytes
+      // and revalidate the unchanged head and live admin authority before writing.
+      const rejectedAdmin = replacementHead === "" && record.route === "admin" &&
+        record.accepted === false &&
+        record.priorCiAdmin?.dispatchTransport === "rest";
+      if (record.version !== 1 || record.pr !== Number(revision) ||
+          record.base !== "main" || record.phase !== "intent" ||
+          record.method !== "squash" || record.landed !== null || !(cancelledAuto || rejectedAdmin)) {
+        throw new Error("Current workflow recovery requires a confirmed cancelled nonqueue auto outcome or an unaccepted same-head REST admin intent");
+      }
+    };
+    if (operation === "workflow-recovery-select" || operation === "workflow-recovery-provenance") {
+      const [outcome, replacementHead, anchor = "refs/remotes/origin/main"] = paths;
+      const source = operation === "workflow-recovery-select" ? run(["rev-parse", "--verify", `${anchor}^{commit}`]) : paths[3];
+      requireRecovery(source, outcome, replacementHead, anchor);
+      process.stdout.write(operation === "workflow-recovery-select" ? `${current.oid}\t${source}\n` :
+        JSON.stringify({ binding: current.oid, from: current.source, to: source }));
+    } else if (operation === "workflow-read" || operation === "workflow-inspect") {
+      if (current && operation === "workflow-read") requireSource(current.source);
+      if (current) process.stdout.write(`${current.oid}\t${current.source}\n`);
+    } else if (operation === "workflow-context-write") {
+      const [source, binding, creator, bootstrapFlag, outcome = "", replacementHead = ""] = paths;
+      const bootstrap = bootstrapFlag === "1";
+      if (outcome) requireRecovery(source, outcome, replacementHead);
+      if (!oid.test(source) || (current?.oid ?? "") !== binding || !outcome && !bootstrap && current && current.source !== source ||
+          !/^[1-9][0-9]*$/.test(creator)) throw new Error("Workflow selection changed before handoff");
+      if (bootstrap) {
+        if (source !== run(["rev-parse", "--verify", "HEAD^{commit}"])) throw new Error("Canonical bootstrap changed");
+      } else requireSource(source);
+      process.stdout.write(JSON.stringify({ version: 1, owner, repository: identity, pr: revision, source, binding, creator, bootstrap,
+        ...(outcome ? { recovery: { outcome, replacementHead } } : {}) }));
+    } else if (operation === "workflow-context-read") {
+      const held = fstatSync(8);
+      if (!held.isFile() || held.uid !== process.getuid() || (held.mode & 0o777) !== 0o400 || held.nlink !== 0 ||
+          held.size < 1 || held.size > 4096 || `${held.dev}:${held.ino}` !== process.env.OPENCLAW_PR_WORKFLOW_CONTEXT) {
+        throw new Error("Invalid workflow selection descriptor");
+      }
+      const bytes = Buffer.alloc(held.size);
+      if (readSync(8, bytes, 0, bytes.length, 0) !== bytes.length) throw new Error("Incomplete workflow selection");
+      const selection = JSON.parse(bytes.toString("utf8"));
+      const [creator, supervisor, outcome = "", replacementHead = ""] = paths;
+      if (outcome) {
+        if (JSON.stringify(selection.recovery) !== JSON.stringify({ outcome, replacementHead }) || selection.bootstrap) {
+          throw new Error("Workflow recovery selection changed across handoff");
+        }
+        requireRecovery(selection.source, outcome, replacementHead);
+      }
+      const supervised = selection.creator === supervisor && process.env.OPENCLAW_PR_DEDICATED_PROCESS_GROUP === "1" &&
+        process.env.OPENCLAW_PR_LOCK_NOTIFY_FD === "3" && process.env.OPENCLAW_PR_LOCK_SUPERVISOR_PID === supervisor;
+      const keys = ["binding", "bootstrap", "creator", "owner", "pr", "repository", "source", "version", ...(outcome ? ["recovery"] : [])].sort();
+      if (JSON.stringify(Object.keys(selection).sort()) !== JSON.stringify(keys) ||
+          selection.version !== 1 || selection.owner !== owner || selection.repository !== identity || selection.pr !== revision ||
+          typeof selection.bootstrap !== "boolean" ||
+          !oid.test(selection.source) || (selection.creator !== creator && !supervised) ||
+          selection.binding !== (current?.oid ?? "") || !outcome && !selection.bootstrap && current && current.source !== selection.source) {
+        throw new Error("Workflow selection changed across handoff");
+      }
+      if (!selection.bootstrap) requireSource(selection.source);
+      process.stdout.write(`${selection.binding || "-"}\t${selection.source}\t${selection.bootstrap ? "1" : "0"}\n`);
+    } else if (operation === "workflow-cold-select") {
+      const [bootstrap, expected, main] = paths;
+      if (!oid.test(bootstrap) || !oid.test(main) || (current?.oid ?? "") !== expected) {
+        throw new Error("Workflow binding changed during cold acquisition");
+      }
+      let selected;
+      if (current) {
+        requireSource(current.source, main);
+        selected = current.source;
+      } else {
+        const ancestry = spawnSync(binary, ["-C", repository, "merge-base", "--is-ancestor", bootstrap, main],
+          { stdio: "ignore", env: { ...process.env, GIT_NO_LAZY_FETCH: "1" } });
+        if (ancestry.error || ancestry.signal || ![0, 1].includes(ancestry.status)) throw new Error("Cannot qualify canonical bootstrap");
+        selected = ancestry.status === 0 ? bootstrap : main;
+      }
+      const closure = source => {
+        const inventory = run(["show", `${source}:scripts/pr-lib/wrapper-components.txt`]).split("\n");
+        return git(repository, ["ls-tree", "-r", "-z", "--full-tree", source, "--", "scripts/pr", "scripts/pr-lib", ...inventory]);
+      };
+      // Loaded helpers belong to the captured bootstrap, even if files move
+      // during acquisition. Compare immutable closures before admitting it.
+      if (!closure(bootstrap).equals(closure(selected))) {
+        throw new Error(`Cold workflow source differs from the running canonical wrapper ${bootstrap}; selected source ${selected}`);
+      }
+      process.stdout.write(selected);
+    } else if (operation === "workflow-admit") {
+      const [source, expected, anchor = "refs/remotes/origin/main", outcome = "", replacementHead = ""] = paths;
+      if (outcome) requireRecovery(source, outcome, replacementHead, anchor);
+      if (!oid.test(source) || (current?.oid ?? "") !== expected || !outcome && current && current.source !== source) {
+        throw new Error("Workflow binding changed before admission");
+      }
+      requireSource(source, anchor);
+      if (current) process.stdout.write(current.oid);
+      else {
+        const record = JSON.stringify({ version: 1, repository: identity, owner, pr: revision, source });
+        const blob = git(repository, ["hash-object", "-w", "--stdin"], record).toString().trim();
+        const tree = git(repository, ["mktree"], `100644 blob ${blob}\tbinding.json\n`).toString().trim();
+        const commit = git(repository, ["-c", "commit.gpgsign=false", "commit-tree", tree, "-p", source],
+          "Native PR workflow binding\n").toString().trim();
+        run(["update-ref", "--no-deref", ref, commit, "0".repeat(source.length)]);
+        process.stdout.write(commit);
+      }
+    } else if (operation === "workflow-retire") {
+      if (!current || current.oid !== paths[0]) throw new Error("Workflow binding changed before completion");
+      requireSource(current.source, paths[1]);
+      run(["update-ref", "--no-deref", "-d", ref, current.oid]);
+    } else throw new Error("Unknown workflow operation");
+  } else if (operation === "differences") {
+    const queries = paths.flatMap(path => [`HEAD:${path}`, `${revision}:${path}`]);
+    const rows = git(repository, ["cat-file", "--batch-check=%(objectname)"], queries.join("\n") + "\n")
+      .toString("utf8").split("\n");
+    if (rows.pop() !== "" || rows.length !== queries.length) throw new Error("Incomplete revisions");
+    process.stdout.write(paths.filter((_, index) => {
+      const [head, anchor] = rows.slice(index * 2, index * 2 + 2);
+      return !oid.test(head) || !oid.test(anchor) || head !== anchor;
+    }).join("\n"));
+  } else if (operation === "verify") {
+    const [directory, ...components] = paths;
+    const listing = git(repository, ["ls-tree", "-r", "-z", "--full-tree", revision, "--", ...components]);
+    const text = listing.toString("utf8");
+    const rows = text.split("\0");
+    if (!Buffer.from(text).equals(listing) || rows.pop() !== "" || rows.length === 0) {
+      throw new Error("Incomplete anchor listing");
+    }
+    const names = new Set();
+    const directories = new Set();
+    const expected = [];
+    if (!lstatSync(directory).isDirectory()) throw new Error("Invalid extraction root");
+    for (const row of rows) {
+      const entry = /^(100644|100755) blob ([a-f0-9]+)\t([^\0]+)$/.exec(row);
+      if (!entry || !oid.test(entry[2])) throw new Error("Invalid anchor entry");
+      const [, , hash, path] = entry;
+      if (names.has(path) || path.split("/").some(part => !part || part === "." || part === "..")) {
+        throw new Error("Invalid anchor path");
+      }
+      let parent = "";
+      for (const part of path.split("/").slice(0, -1)) {
+        parent = parent ? `${parent}/${part}` : part;
+        if (!directories.has(parent)) {
+          if (!lstatSync(join(directory, parent)).isDirectory()) throw new Error("Non-directory anchor parent");
+          directories.add(parent);
+        }
+      }
+      if (!lstatSync(join(directory, path)).isFile()) throw new Error("Non-regular anchor file");
+      names.add(path);
+      expected.push(hash);
+    }
+    if (components.some(path => !names.has(path) && !directories.has(path))) throw new Error("Incomplete anchor components");
+    // Git's stdin path quoting uses C/octal escapes, not JSON's Unicode escapes.
+    const input = [...names].map(path => '"' + join(directory, path).replace(/[\x00-\x1f\x7f\\"]/g, char =>
+      char === "\\" || char === '"' ? "\\" + char : "\\" + char.charCodeAt(0).toString(8).padStart(3, "0"),
+    ) + '"').join("\n") + "\n";
+    const actual = git(repository, ["hash-object", "--no-filters", "--stdin-paths"], input);
+    if (!actual.equals(Buffer.from(expected.join("\n") + "\n"))) throw new Error("Anchor bytes differ");
+  } else {
+    throw new Error("Unknown wrapper Git operation");
+  }
+} catch (error) {
+  if (operation.startsWith("workflow-")) console.error(error.message);
+  process.exitCode = 1;
+}
+EOF_WRAPPER_GIT
+}
+
+PR_WORKFLOW_PR=""
+PR_WORKFLOW_BINDING_OID=""
+PR_WORKFLOW_SOURCE_REVISION=""
+PR_WORKFLOW_BOOTSTRAP=0
+PR_WORKFLOW_RECOVERY_PROVENANCE=""
+PR_WORKFLOW_TRUST_ANCHOR="refs/remotes/origin/main"
+pr_read_workflow_binding() {
+  local classification binding tracking_status=0
+  classification=$(pr_subcommand_classification "$requested_subcommand" 2>/dev/null || true)
+  [ "$classification" = landing ] || return 0
+  case "$requested_subcommand" in gc | lock-recover) return 0 ;; esac
+  [[ "${2-}" =~ ^[1-9][0-9]*$ ]] || return 0
+  PR_WORKFLOW_PR="$2"
+  if [ -n "${OPENCLAW_PR_WORKFLOW_CONTEXT:-}" ]; then
+    binding=$(pr_batch_wrapper_git workflow-context-read "$canonical_repo_root" "$PR_WORKFLOW_PR" "$$" "$PPID" \
+      "$PR_WORKFLOW_RECOVERY_OUTCOME" "$PR_WORKFLOW_RECOVERY_HEAD") || return 1
+    IFS=$'\t' read -r PR_WORKFLOW_BINDING_OID PR_WORKFLOW_SOURCE_REVISION PR_WORKFLOW_BOOTSTRAP <<< "$binding"
+  else
+    if [ -n "$PR_WORKFLOW_RECOVERY_OUTCOME" ]; then
+      binding=$(pr_batch_wrapper_git workflow-recovery-select "$canonical_repo_root" "$PR_WORKFLOW_PR" \
+        "$PR_WORKFLOW_RECOVERY_OUTCOME" "$PR_WORKFLOW_RECOVERY_HEAD") || return 1
+      IFS=$'\t' read -r PR_WORKFLOW_BINDING_OID PR_WORKFLOW_SOURCE_REVISION <<< "$binding"
+      return 0
+    fi
+    if pr_git -C "$canonical_repo_root" symbolic-ref -q refs/remotes/origin/main >/dev/null 2>&1; then
+      echo "Refusing a symbolic main tracking ref for workflow selection." >&2
+      return 1
+    fi
+    pr_git -C "$canonical_repo_root" show-ref --verify --quiet refs/remotes/origin/main || tracking_status=$?
+    if [ "$tracking_status" -eq 1 ] && [ "$script_self" = "$canonical_repo_root/scripts/pr" ]; then
+      # Only canonical code may bootstrap. A retained record is data until the
+      # locked acquisition authenticates its source against canonical main.
+      binding=$(pr_batch_wrapper_git workflow-inspect "$canonical_repo_root" "$PR_WORKFLOW_PR") || return 1
+      IFS=$'\t' read -r PR_WORKFLOW_BINDING_OID PR_WORKFLOW_SOURCE_REVISION <<< "$binding"
+      PR_WORKFLOW_SOURCE_REVISION=$(pr_git -C "$canonical_repo_root" rev-parse --verify 'HEAD^{commit}') || return 1
+      PR_WORKFLOW_BOOTSTRAP=1
+    else
+      [ "$tracking_status" -le 1 ] || return 1
+      binding=$(pr_batch_wrapper_git workflow-read "$canonical_repo_root" "$PR_WORKFLOW_PR") || return 1
+      IFS=$'\t' read -r PR_WORKFLOW_BINDING_OID PR_WORKFLOW_SOURCE_REVISION <<< "$binding"
+    fi
+  fi
+  [ "$PR_WORKFLOW_BINDING_OID" != - ] || PR_WORKFLOW_BINDING_OID=""
+  if [ "$PR_WORKFLOW_BOOTSTRAP" = 1 ]; then
+    [ "$script_self" = "$canonical_repo_root/scripts/pr" ] || return 1
+  fi
+  if [ -n "${OPENCLAW_PR_WORKFLOW_CONTEXT:-}" ] || [ "$PR_WORKFLOW_BOOTSTRAP" = 1 ]; then
+    verify_pr_workflow_source "$PR_WORKFLOW_SOURCE_REVISION" "$script_parent_dir/.." || return 1
+  fi
+}
+
+verify_pr_workflow_source() {
+  local inventory component
+  local components=(scripts/pr scripts/pr-lib)
+  inventory=$(pr_git -C "$canonical_repo_root" show "$1:scripts/pr-lib/wrapper-components.txt") || return 1
+  while IFS= read -r component; do components+=("$component"); done <<< "$inventory"
+  pr_batch_wrapper_git verify "$canonical_repo_root" "$1" "$2" "${components[@]}"
+}
+
+hold_pr_workflow_selection() {
+  [ -n "$PR_WORKFLOW_PR" ] && [ -z "${OPENCLAW_PR_WORKFLOW_CONTEXT:-}" ] || return 0
+  verify_pr_workflow_source "$1" "$2" || return 1
+  local context
+  context=$(mktemp "${TMPDIR:-/tmp}/openclaw-pr-selection.XXXXXX") || return 1
+  if ! pr_batch_wrapper_git workflow-context-write "$canonical_repo_root" "$PR_WORKFLOW_PR" \
+    "$1" "$PR_WORKFLOW_BINDING_OID" "$$" "$PR_WORKFLOW_BOOTSTRAP" \
+    "$PR_WORKFLOW_RECOVERY_OUTCOME" "$PR_WORKFLOW_RECOVERY_HEAD" > "$context" || ! chmod 400 "$context"; then
+    rm -f "$context"
+    return 1
+  fi
+  # FD 8 carries selection; FD 9 remains the archive cleanup owner.
+  # Positional reads keep exec/child reentry independent of shared FD offsets.
+  exec 8< "$context"
+  rm "$context"
+  OPENCLAW_PR_WORKFLOW_CONTEXT=$(node -e 'const s=require("node:fs").fstatSync(8); process.stdout.write(`${s.dev}:${s.ino}`)') || return 1
+  export OPENCLAW_PR_WORKFLOW_CONTEXT
+}
+
+admit_pr_workflow_binding() {
+  [ -n "$PR_WORKFLOW_PR" ] || return 0
+  [ "$PR_WORKFLOW_PR" = "$1" ] && [ -n "$PR_WORKFLOW_SOURCE_REVISION" ] || return 1
+  local qualification_ref="" main=""
+  if [ "$PR_WORKFLOW_BOOTSTRAP" = 1 ] || [ -n "$PR_WORKFLOW_RECOVERY_OUTCOME" ]; then
+    qualification_ref="refs/openclaw/pr-workflow-qualification/$1/$PR_OPERATION_LOCK_OWNER_OID"
+    local ref_status=0 symbolic_status=0 selected
+    pr_git -C "$canonical_repo_root" symbolic-ref -q "$qualification_ref" >/dev/null 2>&1 || symbolic_status=$?
+    [ "$symbolic_status" -eq 1 ] || { echo "Refusing symbolic or unreadable qualification ref: $qualification_ref." >&2; return 1; }
+    pr_git -C "$canonical_repo_root" show-ref --verify --quiet "$qualification_ref" || ref_status=$?
+    [ "$ref_status" -eq 1 ] || { echo "Workflow qualification ref already exists; preserve $qualification_ref." >&2; return 1; }
+    mark_pr_operation_side_effects_started || return 1
+    if ! fetch_canonical_main "$qualification_ref"; then
+      echo "Cold workflow acquisition failed; inspect $qualification_ref before any cleanup." >&2
+      return 1
+    fi
+    main=$(pr_git -C "$canonical_repo_root" rev-parse --verify "$qualification_ref^{commit}") || return 1
+    PR_WORKFLOW_TRUST_ANCHOR="$main"
+    if [ -n "$PR_WORKFLOW_RECOVERY_OUTCOME" ]; then
+      # Current main is selected only for this operation. Keep the historical
+      # binding intact so normal reconciliation still uses its admitted source.
+      verify_pr_workflow_source "$main" "$script_parent_dir/.." || {
+        echo "Current main workflow changed; rerun recovery from current main. Preserving $qualification_ref." >&2
+        return 1
+      }
+      selected="$main"
+    elif ! selected=$(pr_batch_wrapper_git workflow-cold-select "$canonical_repo_root" "$1" \
+      "$PR_WORKFLOW_SOURCE_REVISION" "$PR_WORKFLOW_BINDING_OID" "$main"); then
+      echo "Cold workflow qualification failed; use the admitted source from a qualified checkout. Preserving $qualification_ref." >&2
+      return 1
+    fi
+    verify_pr_workflow_source "$PR_WORKFLOW_SOURCE_REVISION" "$script_parent_dir/.." || return 1
+    PR_WORKFLOW_SOURCE_REVISION="$selected"
+  fi
+  # Verify again under the operation lock: initial selection may have waited
+  # behind another command, and only admitted bytes may mint a lasting pin.
+  verify_pr_workflow_source "$PR_WORKFLOW_SOURCE_REVISION" "$script_parent_dir/.." || return 1
+  pr_operation_lock_owner_is_current "$canonical_repo_root" "$PR_OPERATION_LOCK_REF" "$PR_OPERATION_LOCK_OWNER_OID" || return 1
+  mark_pr_operation_side_effects_started || return 1
+  PR_WORKFLOW_BINDING_OID=$(pr_batch_wrapper_git workflow-admit "$canonical_repo_root" "$1" \
+    "$PR_WORKFLOW_SOURCE_REVISION" "$PR_WORKFLOW_BINDING_OID" "$PR_WORKFLOW_TRUST_ANCHOR" \
+    "$PR_WORKFLOW_RECOVERY_OUTCOME" "$PR_WORKFLOW_RECOVERY_HEAD") || return 1
+  if [ -n "$PR_WORKFLOW_RECOVERY_OUTCOME" ]; then
+    PR_WORKFLOW_RECOVERY_PROVENANCE=$(pr_batch_wrapper_git workflow-recovery-provenance "$canonical_repo_root" "$1" \
+      "$PR_WORKFLOW_RECOVERY_OUTCOME" "$PR_WORKFLOW_RECOVERY_HEAD" "$PR_WORKFLOW_TRUST_ANCHOR" "$PR_WORKFLOW_SOURCE_REVISION") || return 1
+  fi
+  if [ -n "$qualification_ref" ]; then
+    # Preserve acquisition evidence until admission succeeds; retire only our
+    # captured value, never a changed qualification ref.
+    pr_operation_lock_owner_is_current "$canonical_repo_root" "$PR_OPERATION_LOCK_REF" "$PR_OPERATION_LOCK_OWNER_OID" || return 1
+    pr_git -C "$canonical_repo_root" update-ref --no-deref -d "$qualification_ref" "$main" || return 1
+  fi
+  exec 8<&-
+  unset OPENCLAW_PR_WORKFLOW_CONTEXT
+}
+
+# Keep dependency sourcing independent of wrapper selection. In particular, an
+# older anchor still supplies its own package/version policy to this bootstrap.
+pr_materialize_dependencies() {
+  # Location discovery uses only Git and Node built-ins, before dependency repair.
+  [ "$requested_subcommand" != workspace ] || return 0
+  node --input-type=module - "$1" "$canonical_repo_root" "$2" "${3:-${PR_WORKFLOW_SOURCE_REVISION:-}}" <<'EOF_TOOLING'
+import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import {
+  existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync,
+  readlinkSync, realpathSync, renameSync, rmSync, symlinkSync, utimesSync,
+} from "node:fs";
+import { homedir } from "node:os";
+import { delimiter, dirname, join, resolve } from "node:path";
+
+function repository(url, root) {
+  if (/^(?:\.?\.?\/|\/)/.test(url)) return realpathSync(resolve(root, url));
+  const parsed = new URL(url.replace(/^git@([^:]+):/, "ssh://git@$1/"));
+  if (parsed.protocol === "file:") return realpathSync(decodeURIComponent(parsed.pathname));
+  return `${parsed.hostname.toLowerCase()}/${parsed.pathname.replace(/^\/|\/$/g, "").replace(/\.git$/, "").toLowerCase()}`;
+}
+
+function sweep(cache, current) {
+  const entries = readdirSync(cache)
+    .filter((name) => /^(?:[a-f0-9]{64}|install-[0-9]+-[A-Za-z0-9]+)$/.test(name))
+    .map((name) => {
+      const path = join(cache, name);
+      return { name, path, stat: lstatSync(path, { throwIfNoEntry: false }) };
+    })
+    .filter(({ stat }) => stat)
+    .sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs);
+  let retained = 0;
+  for (const { name, path, stat } of entries) {
+    if (path === current || !stat?.isDirectory() || stat.uid !== process.getuid?.() ||
+        (stat.mode & 0o777) !== 0o700) continue;
+    // Creator PIDs survive the wrapper/supervisor exec chain. PID reuse only
+    // delays collection; a live consumer must never lose its pinned packages.
+    const users = join(path, ".pr-users");
+    const pids = existsSync(users) ? readdirSync(users) : [];
+    if (name.startsWith("install-")) pids.push(name.split("-")[1]);
+    if (pids.some((pid) => {
+      if (!/^[1-9][0-9]*$/.test(pid)) return true;
+      try { process.kill(Number(pid), 0); return true; }
+      catch (error) { return error.code !== "ESRCH"; }
+    })) continue;
+    if (!name.startsWith("install-") && existsSync(join(path, ".pr-complete"))) {
+      // Adjacent main heads get a small reuse window; live and current installs
+      // do not consume it. Age alone cannot bound one new tree per landing.
+      if (retained++ < 4) continue;
+    } else if (stat.mtimeMs >= Date.now() - 86_400_000) {
+      continue;
+    }
+    rmSync(path, { recursive: true, force: true });
+  }
+}
+
+function dependencyKey(rows, tree, audit) {
+  let identity = tree;
+  if (audit && audit.runtime.platform === process.platform && audit.runtime.arch === process.arch &&
+      audit.runtime.modules === process.versions.modules) {
+    const names = rows.map((row) => row.slice(row.indexOf("\t") + 1));
+    const codeInputs = [...audit.files, ...audit.directories];
+    const inputs = rows.filter((row, index) => {
+      const name = names[index];
+      return audit.files.includes(name) ||
+        name === "pnpm-lock.yaml" || name.startsWith("patches/") ||
+        /(?:^|\/)(?:package\.json|\.npmrc|\.pnpmfile\.[cm]js|pnpm-workspace\.yaml)$/.test(name) ||
+        (name.endsWith("/tsconfig.json") && codeInputs.some((input) =>
+          input.startsWith(name.slice(0, -"tsconfig.json".length)))) ||
+        (audit.directories.some((directory) => name.startsWith(`${directory}/`)) &&
+          /\.(?:ts|mts|mjs|js|json)$/.test(name) && !/\.(?:test|spec)\./.test(name));
+    });
+    // Changed executable inputs may read new source paths. Keep the original
+    // full-tree contract until their read set (including dependency hooks) is audited.
+    const digest = createHash("sha256").update(inputs.join("\0")).digest("hex");
+    if (digest === audit.auditSha256 && !names.some((name) => name.startsWith("dist/"))) {
+      identity = [inputs, audit.presence.map((path) =>
+        names.some((name) => name === path || name.startsWith(`${path}/`)))];
+    }
+  }
+  return createHash("sha256").update(JSON.stringify([
+    identity, process.platform, process.arch, process.versions.modules,
+  ])).digest("hex");
+}
+
+function materializeDependencies(owner, canonicalPath, destination, revision) {
+  const canonical = realpathSync(canonicalPath);
+  const gitBinary = process.env.OPENCLAW_PR_GIT;
+  const git = (root, args) => execFileSync(gitBinary, ["-C", root, ...args], {
+    encoding: "utf8", timeout: 300_000, maxBuffer: 32 * 1024 * 1024,
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trimEnd();
+  const config = (root, key, type = "--path") => {
+    const result = spawnSync(gitBinary, ["-C", root, "config", type, "--get", key], {
+      encoding: "utf8", timeout: 300_000,
+    });
+    if (result.status === 1) return "";
+    if (result.status !== 0) throw new Error(`Cannot read Git setting ${key} in ${root}.`);
+    return result.stdout.trim();
+  };
+  const requested = process.env.OPENCLAW_PR_TOOLING_ROOT || config(canonical, "openclaw.pr.toolingRoot");
+  const root = realpathSync(resolve(canonical, requested || "."));
+  if (requested) {
+    if (git(root, ["rev-parse", "--is-inside-work-tree"]) !== "true" ||
+        realpathSync(git(root, ["rev-parse", "--show-toplevel"])) !== root ||
+        config(root, "core.sparseCheckout", "--bool") === "true" ||
+        repository(git(root, ["remote", "get-url", "origin"]), root) !==
+          repository(git(canonical, ["remote", "get-url", "origin"]), canonical)) {
+      throw new Error(`Tooling root must be a full Git work tree of this repository: ${root}`);
+    }
+    console.error(`scripts/pr tooling root: ${root}`);
+  }
+  const materialize = (installed, target) => {
+    const result = spawnSync(process.execPath, [owner, join(installed, "node_modules"), target], {
+      encoding: "utf8", stdio: ["ignore", "inherit", "pipe"],
+    });
+    if (result.stderr) process.stderr.write(result.stderr);
+    if (result.error) throw result.error;
+    // Historical anchors returned 1 instead of 78 for the same refusal.
+    const drift = result.status === 78 || (result.status === 1 &&
+      /^Installed scripts\/pr dependency '[^\r\n]+' has version [^\r\n]+; the trust anchor requires [^\r\n]+\.$/m.test(result.stderr));
+    if (result.status !== 0 && !drift) throw new Error(`Dependency materialization failed in ${target}.`);
+    return result.status === 0;
+  };
+  if (materialize(root, destination)) return;
+
+  // The wrapper has already authenticated this source and verified its extracted
+  // inventory. Recheck ancestry and manifest identity before executing install hooks.
+  if (!/^[a-f0-9]{40}$/.test(revision ?? "")) throw new Error("Missing verified dependency anchor.");
+  git(canonical, ["merge-base", "--is-ancestor", revision, "refs/remotes/origin/main"]);
+  for (const name of ["package.json", "packages/markdown-core/package.json"]) {
+    const path = join(dirname(destination), name);
+    if (name !== "package.json" && !existsSync(path)) continue;
+    if (readFileSync(path, "utf8").trimEnd() !== git(canonical, ["show", `${revision}:${name}`])) {
+      throw new Error(`Dependency manifest differs from verified anchor: ${name}`);
+    }
+  }
+  const tree = git(canonical, ["rev-parse", `${revision}^{tree}`]);
+  const sourceRows = git(canonical, ["ls-tree", "-r", "-z", revision]).split("\0").filter(Boolean);
+  const auditPath = join(dirname(owner), "dependency-inputs.json");
+  // Older retained wrappers without a read-set audit keep full-tree isolation.
+  const audit = existsSync(auditPath) ? JSON.parse(readFileSync(auditPath, "utf8")) : null;
+  const key = dependencyKey(sourceRows, tree, audit);
+  const cache = join(homedir(), ".cache", "openclaw", "pr-dependencies");
+  mkdirSync(cache, { recursive: true, mode: 0o700 });
+  const entry = join(cache, key);
+  const complete = join(entry, ".pr-complete");
+  if (!existsSync(complete)) {
+    const stage = mkdtempSync(join(cache, `install-${process.ppid}-`));
+    try {
+      const archive = join(stage, ".pr-source.tar");
+      git(canonical, ["archive", "--format=tar", `--output=${archive}`, revision]);
+      execFileSync("tar", ["-xf", archive, "-C", stage]);
+      rmSync(archive);
+      // Verify archive bytes, including symlinks, before any package lifecycle runs.
+      const sourcePaths = new Set();
+      for (const row of sourceRows) {
+        const match = /^(100644|100755|120000) blob ([a-f0-9]{40})\t([^\0]+)$/.exec(row);
+        if (!match) throw new Error("Unsupported frozen install source entry.");
+        const [, mode, oid, name] = match;
+        sourcePaths.add(name);
+        const path = join(stage, name);
+        const stat = lstatSync(path);
+        const data = mode === "120000"
+          ? stat.isSymbolicLink() ? Buffer.from(readlinkSync(path)) : null
+          : stat.isFile() && Boolean(stat.mode & 0o100) === (mode === "100755") ? readFileSync(path) : null;
+        if (!data || createHash("sha1").update(`blob ${data.length}\0`).update(data).digest("hex") !== oid) {
+          throw new Error(`Frozen install source differs: ${name}`);
+        }
+      }
+      const verifyInventory = (directory, prefix = "") => {
+        for (const child of readdirSync(directory)) {
+          const name = prefix + child;
+          const path = join(directory, child);
+          if (lstatSync(path).isDirectory()) verifyInventory(path, `${name}/`);
+          else if (!sourcePaths.has(name)) throw new Error(`Unexpected frozen install source: ${name}`);
+        }
+      };
+      verifyInventory(stage);
+      console.error(`Installing frozen scripts/pr dependencies for ${revision}.`);
+      const bin = join(stage, ".pr-bin");
+      mkdirSync(bin);
+      symlinkSync(gitBinary, join(bin, "git"));
+      const installEnv = { ...process.env, PATH: `${bin}${delimiter}${process.env.PATH ?? ""}` };
+      // Lifecycle Git calls must not inherit a hook's checkout or index ownership.
+      for (const name of ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_PREFIX", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"]) delete installEnv[name];
+      const installed = spawnSync("pnpm", ["-C", stage, "install", "--frozen-lockfile", "--prefer-offline"], {
+        stdio: "inherit", env: installEnv,
+      });
+      rmSync(bin, { recursive: true });
+      if (installed.error) throw installed.error;
+      // Validation writes pins; keep them outside the install that will move.
+      const check = join(stage, ".pr-dependency-check");
+      if (installed.status !== 0 || !materialize(stage, check)) {
+        throw new Error("Frozen dependency installation failed.");
+      }
+      rmSync(check, { recursive: true });
+      mkdirSync(join(stage, ".pr-complete"));
+      try { renameSync(stage, entry); }
+      catch (error) {
+        if (!["EEXIST", "ENOTEMPTY"].includes(error.code) || !existsSync(complete)) throw error;
+      }
+    } finally {
+      rmSync(stage, { recursive: true, force: true });
+    }
+  }
+  mkdirSync(join(entry, ".pr-users", String(process.ppid)), { recursive: true });
+  const now = new Date();
+  utimesSync(entry, now, now);
+  if (!materialize(entry, destination)) throw new Error("Cached dependencies do not match the trust anchor.");
+  console.error(`Using frozen scripts/pr dependency installation: ${entry}`);
+  try { sweep(cache, entry); }
+  catch { console.error("Warning: unable to sweep stale scripts/pr dependency installations."); }
+}
+
+try {
+  materializeDependencies(...process.argv.slice(2));
+} catch (error) {
+  console.error(`Dependency materialization refused: ${error.message}`);
+  process.exitCode = 1;
+}
+EOF_TOOLING
+}
+
+# Select trusted wrapper code independently from the canonical repository root;
+# a linked wrapper may be removed by merge-run or gc before supervision ends.
+canonical_repo_root="$script_parent_dir/.."
+# Bootstrap paths stay fixed so an edited inventory cannot exclude itself from
+# the working-tree and anchor checks. The inventory owns the remaining closure.
+pr_wrapper_components=(scripts/pr scripts/pr-lib)
+# Anchor-exec handoff: this process was exec'd from wrapper bytes materialized
+# out of refs/remotes/origin/main by the selection logic below in a previous
+# wrapper. The env var conveys repository addressing only — code trust came
+# from the parent's per-blob verification of the materialized copy, the same
+# verify-then-exec contract as the canonical-checkout substitution. Skip
+# re-selection: the running bytes ARE the anchor, and the temp copy has no git
+# context of its own to select against.
+if [ -n "${OPENCLAW_PR_ANCHOR_REPO_ROOT:-}" ]; then
+  if ! pr_git -C "$OPENCLAW_PR_ANCHOR_REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "OPENCLAW_PR_ANCHOR_REPO_ROOT is not a git work tree: $OPENCLAW_PR_ANCHOR_REPO_ROOT" >&2
+    exit 1
+  fi
+  canonical_repo_root="$OPENCLAW_PR_ANCHOR_REPO_ROOT"
+  pr_read_workflow_binding "$@"
+  # Older parents pin only their own dependency set. The anchored child owns
+  # completing its installation before any loader, supervisor, or lock starts.
+  pr_materialize_dependencies "$script_parent_dir/pr-lib/materialize-dependencies.mjs" \
+    "$script_parent_dir/../node_modules"
+elif common_git_dir=$(pr_git -C "$script_parent_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null); then
   canonical_repo_root="$(dirname "$common_git_dir")"
   canonical_self="$canonical_repo_root/scripts/$(basename "${BASH_SOURCE[0]}")"
-  if [ "$script_self" != "$canonical_self" ] && [ -x "$canonical_self" ]; then
-    exec "$canonical_self" "$@"
+  pr_read_workflow_binding "$@"
+  if [ "$PR_WORKFLOW_BOOTSTRAP" != 1 ] && [ -x "$canonical_self" ] && { [ "$script_self" != "$canonical_self" ] || [ -n "$PR_WORKFLOW_PR" ]; }; then
+    linked_inventory=$(pr_git -C "$script_parent_dir" show HEAD:scripts/pr-lib/wrapper-components.txt)
+    while IFS= read -r wrapper_component; do
+      pr_wrapper_components+=("$wrapper_component")
+    done <<< "$linked_inventory"
+    if ! pr_git -C "$script_parent_dir" diff --quiet HEAD -- "${pr_wrapper_components[@]/#/:(top)}"; then
+      echo "scripts/pr wrapper files have uncommitted changes in this worktree." >&2
+      echo "Refusing to run unreviewed wrapper code from: $script_parent_dir" >&2
+      exit 1
+    fi
+    linked_wrapper_revision=$(
+      pr_git -C "$script_parent_dir" rev-parse "${pr_wrapper_components[@]/#/HEAD:}" 2>/dev/null || true
+    )
+    canonical_wrapper_revision=$(
+      pr_git -C "$canonical_repo_root" rev-parse "${pr_wrapper_components[@]/#/HEAD:}" 2>/dev/null || true
+    )
+    if [ "$script_self" != "$canonical_self" ] && [ -z "$PR_WORKFLOW_PR" ] && [ -n "$linked_wrapper_revision" ] &&
+      [ "$linked_wrapper_revision" = "$canonical_wrapper_revision" ] &&
+      pr_git -C "$canonical_repo_root" diff --quiet HEAD -- "${pr_wrapper_components[@]/#/:(top)}"; then
+      exec "$canonical_self" "$@"
+    fi
+    # The canonical checkout can be parked on another branch or carry local
+    # edits (release trains move it); maintainer-controlled origin/main is the
+    # trust anchor then. Matching code can run in place when its command
+    # does not need the materialized dependency context.
+    # refs/remotes/... explicitly: bare "origin/main" is a DWIM name that a
+    # local branch or tag named origin/main could shadow, spoofing the anchor.
+    anchor_commit="${PR_WORKFLOW_SOURCE_REVISION:-$(pr_git -C "$script_parent_dir" rev-parse --verify refs/remotes/origin/main^{commit} 2>/dev/null || true)}"
+    anchor_description="origin/main"
+    anchor_reference="refs/remotes/origin/main"
+    if [ -n "$PR_WORKFLOW_BINDING_OID" ]; then
+      anchor_description="retained PR #$PR_WORKFLOW_PR workflow $anchor_commit"
+      anchor_reference="$anchor_description"
+    fi
+    anchor_wrapper_revision=""
+    if [ -n "$anchor_commit" ] &&
+      anchor_inventory=$(pr_git -C "$script_parent_dir" show "$anchor_commit:scripts/pr-lib/wrapper-components.txt" 2>/dev/null); then
+      # A newer anchor can add helpers outside the caller's inventory. Its own
+      # closure governs canonical substitution as well as extraction below.
+      anchor_components=(scripts/pr scripts/pr-lib)
+      while IFS= read -r anchor_component; do
+        anchor_components+=("$anchor_component")
+      done <<< "$anchor_inventory"
+      anchor_wrapper_revision=$(
+        pr_git -C "$script_parent_dir" rev-parse "${anchor_components[@]/#/$anchor_commit:}" 2>/dev/null || true
+      )
+      canonical_wrapper_revision=$(
+        pr_git -C "$canonical_repo_root" rev-parse "${anchor_components[@]/#/HEAD:}" 2>/dev/null || true
+      )
+    fi
+    linked_matches_anchor=0
+    if [ -n "$linked_wrapper_revision" ] &&
+      [ "$linked_wrapper_revision" = "$anchor_wrapper_revision" ]; then
+      linked_matches_anchor=1
+    fi
+    # Node resolves helper imports from their source directory, not the Git owner.
+    # Reuse the verified materializer for code-only linked PR operations.
+    if [ "$linked_matches_anchor" != "1" ] ||
+      { is_locked_pr_command "$requested_subcommand" && [ ! -d "$script_parent_dir/../node_modules" ]; }; then
+      wrapper_route_reason="differs from $anchor_description"
+      if [ "$linked_matches_anchor" = "1" ]; then
+        wrapper_route_reason="matches $anchor_description but has no node_modules directory"
+      fi
+      requested_classification=$(pr_subcommand_classification "$requested_subcommand" 2>/dev/null || true)
+      if [ "$linked_matches_anchor" != "1" ] && [ "$dev_wrapper_opt_in" = "1" ] && [ "$requested_classification" = "advisory" ]; then
+        if [ "${OPENCLAW_PR_DEV_WRAPPER_BANNER_SHOWN:-}" != "1" ]; then
+          local_head_revision=$(pr_git -C "$script_parent_dir" rev-parse HEAD 2>/dev/null || printf 'unknown')
+          echo "WARNING: running local scripts/pr revision $local_head_revision via dev-wrapper opt-in." >&2
+          echo "subcommand '$requested_subcommand' is classified advisory." >&2
+          echo "The local wrapper differs from the canonical checkout and origin/main; landing subcommands remain refused." >&2
+          export OPENCLAW_PR_DEV_WRAPPER_BANNER_SHOWN=1
+        fi
+      else
+        if [ "$linked_matches_anchor" != "1" ] && [ "$dev_wrapper_opt_in" = "1" ] && [ -n "$requested_classification" ]; then
+          echo "subcommand '$requested_subcommand' is classified $requested_classification; dev-wrapper opt-in is unavailable." >&2
+        fi
+        # Worktrees routinely sit on a base that predates (or carries) wrapper
+        # changes relative to main. When the canonical checkout is byte-identical
+        # to the fetched origin/main anchor, exec-ing it runs exactly the trusted
+        # anchor code; announce the substitution so it is never silent.
+        if [ "$script_self" != "$canonical_self" ] && [ -n "$anchor_wrapper_revision" ] &&
+          [ "$canonical_wrapper_revision" = "$anchor_wrapper_revision" ] &&
+          pr_git -C "$canonical_repo_root" diff --quiet HEAD -- "${anchor_components[@]/#/:(top)}"; then
+          hold_pr_workflow_selection "$anchor_commit" "$canonical_repo_root" || exit 1
+          echo "scripts/pr wrapper in this worktree $wrapper_route_reason; running the canonical checkout's wrapper (matches the $anchor_description trust anchor): $canonical_repo_root" >&2
+          exec "$canonical_self" "$@"
+        fi
+        # The canonical checkout cannot supply trusted code and dependency context.
+        # Materialize the anchor wrapper bytes directly
+        # from refs/remotes/origin/main and exec that copy: trust flows from
+        # the fetched ref itself, so a queued PR stops paying a rebase + CI lap
+        # for unrelated wrapper drift on main. Requires the anchor entrypoint
+        # to understand the handoff; older anchors fall through to the refusal.
+        # Archive emits paths relative to its cwd, so run it (and the
+        # verification listing) from the worktree toplevel to keep component
+        # paths intact in the materialized tree.
+        anchor_git_root=$(pr_git -C "$script_parent_dir" rev-parse --show-toplevel 2>/dev/null || true)
+        if [ -n "$anchor_wrapper_revision" ] && [ -n "$anchor_git_root" ] &&
+          anchor_exec_dir=$(mktemp -d "${TMPDIR:-/tmp}/openclaw-pr-anchor.$$.XXXXXX" 2>/dev/null); then
+          # Hold the directory we created across exec, not an environment pathname.
+          # FD 9 is reserved for the supervisor; bootstrap children are awaited.
+          trap 'rm -rf "$anchor_exec_dir"' EXIT
+          trap 'exit 129' HUP
+          trap 'exit 130' INT
+          trap 'exit 131' QUIT
+          trap 'exit 143' TERM
+          exec 9< "$anchor_exec_dir"
+          anchor_extraction_valid=0
+          # BSD tar can stop at the end marker before Git finishes writing padding,
+          # causing SIGPIPE under pipefail. Require producer completion before reading.
+          if pr_git -C "$anchor_git_root" archive "$anchor_commit" -- \
+            "${anchor_components[@]}" > "$anchor_exec_dir/anchor.tar" 2>/dev/null &&
+            tar -xf "$anchor_exec_dir/anchor.tar" -C "$anchor_exec_dir" 2>/dev/null; then
+            rm "$anchor_exec_dir/anchor.tar"
+            # Verify every extracted file byte-matches its anchor blob so an
+            # archive/extract fault can never smuggle different code past the
+            # trust boundary. The temp dir is 0700 and exec'd immediately —
+            # the same TOCTOU class as the canonical-substitution exec above.
+            if pr_batch_wrapper_git verify "$anchor_git_root" "$anchor_commit" \
+              "$anchor_exec_dir" "${anchor_components[@]}"; then
+              anchor_extraction_valid=1
+            fi
+          fi
+          if [ "$anchor_extraction_valid" = "1" ] &&
+            grep -q "OPENCLAW_PR_ANCHOR_REPO_ROOT" "$anchor_exec_dir/scripts/pr" 2>/dev/null; then
+            # Only third-party tooling comes from the selected installed tree.
+            # Pin package directories: a later install may replace top-level aliases.
+            # A whole node_modules link could load unanchored workspace source.
+            anchor_dependency_owner="$anchor_exec_dir/scripts/pr-lib/materialize-dependencies.mjs"
+            # Older anchors still rely on their parent to prepare dependencies.
+            # Keep that bootstrap in this caller, using the extracted manifest.
+            if [ ! -f "$anchor_dependency_owner" ]; then
+              anchor_dependency_owner="$script_parent_dir/pr-lib/materialize-dependencies.mjs"
+            fi
+            if ! pr_materialize_dependencies "$anchor_dependency_owner" "$anchor_exec_dir/node_modules" "$anchor_commit"
+            then
+              exit 1
+            fi
+            # Bash re-reads this copy: successful exec hands cleanup to the
+            # same creator PID, in anchored bash or its drained supervisor.
+            # Older anchors without that handoff are reclaimed by the stale sweep.
+            hold_pr_workflow_selection "$anchor_commit" "$anchor_exec_dir" || exit 1
+            echo "scripts/pr wrapper in this worktree $wrapper_route_reason; running wrapper code materialized from the $anchor_reference trust anchor at revision $(pr_git -C "$script_parent_dir" rev-parse --short "$anchor_commit")." >&2
+            # Bash 3.2 clears traps even when exec fails; errexit must be off
+            # until we reinstall cleanup on the failure-only continuation.
+            shopt -s execfail
+            set +e
+            OPENCLAW_PR_ANCHOR_REPO_ROOT="$canonical_repo_root" \
+              OPENCLAW_PR_ANCHOR_CREATOR_PID="$$" OPENCLAW_PR_ANCHOR_FD=9 \
+              exec "$anchor_exec_dir/scripts/pr" "$@"
+            trap 'rm -rf "$anchor_exec_dir"' EXIT
+            echo "Unable to execute the materialized scripts/pr wrapper." >&2
+            exit 1
+          fi
+          rm -rf "$anchor_exec_dir"
+          trap - EXIT HUP INT QUIT TERM
+          exec 9<&-
+        fi
+        # HEAD blobs are authoritative here: the uncommitted-wrapper guard above
+        # already exited for any staged or unstaged edit to these paths, so
+        # the working tree matches HEAD and this list matches what was rejected.
+        # An absent anchor differs at every path without launching another Git read.
+        differing_wrapper_components=("${pr_wrapper_components[@]}")
+        if [ -n "$anchor_commit" ] &&
+          differing_components=$(pr_batch_wrapper_git differences "$script_parent_dir" \
+            "$anchor_commit" "${pr_wrapper_components[@]}"); then
+          differing_wrapper_components=()
+          while IFS= read -r wrapper_component; do
+            [ -z "$wrapper_component" ] || differing_wrapper_components+=("$wrapper_component")
+          done <<< "$differing_components"
+        fi
+        if [ "$linked_matches_anchor" = "1" ]; then
+          echo "scripts/pr wrapper matches origin/main, but its linked checkout has no node_modules directory." >&2
+        else
+          echo "scripts/pr implementation differs between this worktree and the canonical checkout, and does not match origin/main." >&2
+        fi
+        echo "differing wrapper components vs origin/main: ${differing_wrapper_components[*]}" >&2
+        echo "Refusing to silently substitute canonical wrapper code from: $canonical_repo_root" >&2
+        echo "Run scripts/pr from a checkout with installed dependencies whose wrapper matches the canonical checkout or a fetched origin/main." >&2
+        exit 1
+      fi
+    fi
   fi
 fi
+
+# Keep the verified owner available after cleanup removes a linked wrapper.
+canonical_repo_root="$(cd "$canonical_repo_root" && pwd -P)"
+readonly canonical_repo_root
+
+if [ -n "$PR_WORKFLOW_PR" ]; then
+  # A pin is admission state, not caller-selected code. The operation lock
+  # fences the verified closure and initial record before any PR side effect.
+  PR_WORKFLOW_SOURCE_REVISION="${PR_WORKFLOW_SOURCE_REVISION:-${anchor_commit:-$(pr_git -C "$canonical_repo_root" rev-parse --verify refs/remotes/origin/main^{commit})}}"
+  hold_pr_workflow_selection "$PR_WORKFLOW_SOURCE_REVISION" "$script_parent_dir/.." || exit 1
+fi
+
+is_main_only_pr_command() {
+  case "$1" in
+    prepare-init | prepare-correction-init | prepare-correction-continue | prepare-correction-review-init | prepare-baseline-refresh | prepare-baseline-successor | prepare-baseline-signing-request | prepare-baseline-signing-continue | prepare-validate-commit | prepare-gates | prepare-push | prepare-sync-head | prepare-run | merge-verify | merge-run | merge-recover) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_supervised_pr_process() {
+  [ "${OPENCLAW_PR_DEDICATED_PROCESS_GROUP:-}" = "1" ] &&
+    [ "${OPENCLAW_PR_LOCK_NOTIFY_FD:-}" = "3" ] &&
+    [ "${OPENCLAW_PR_LOCK_SUPERVISOR_PID:-}" = "$PPID" ]
+}
+
+# The supervisor changes cwd to the canonical repo. Resolve explicit body and
+# evidence paths relative to the operator's caller before crossing that
+# boundary; do not read them.
+if [ "${1-}" = tooling-recover ]; then
+  [ "$#" -ge 3 ] || { echo "tooling-recover requires a PR and plan" >&2; exit 2; }
+  recovery_plan=$(node -e 'process.stdout.write(require("node:path").resolve(process.argv[1]))' -- "$3") || exit 1
+  set -- "$1" "$2" "$recovery_plan" "${@:4}"
+fi
+
+if [ "${1-}" = merge-run ] || [ "${1-}" = merge-recover ] || [ "${1-}" = prepare-baseline-refresh ] || [ "${1-}" = prepare-baseline-successor ] || [ "${1-}" = prepare-baseline-signing-request ] || [ "${1-}" = prepare-baseline-signing-continue ]; then
+  merge_cli_args=() merge_cli_body_next=false
+  for merge_cli_arg in "$@"; do
+    if [ "$merge_cli_body_next" = true ] && [ -n "$merge_cli_arg" ]; then
+      merge_cli_arg=$(node -e 'process.stdout.write(require("node:path").resolve(process.argv[1]))' -- "$merge_cli_arg") || exit 1
+    fi
+    merge_cli_args+=("$merge_cli_arg")
+    merge_cli_body_next=false
+    if [ "$merge_cli_arg" = --body-file ] || [ "$merge_cli_arg" = --legacy-refusal ] || [ "$merge_cli_arg" = --pre-dispatch-refusal ] || [ "$merge_cli_arg" = --admin-evidence ] || [ "$merge_cli_arg" = --resolutions ] || [ "$merge_cli_arg" = --signed-commit ]; then merge_cli_body_next=true; fi
+  done
+  set -- "${merge_cli_args[@]}"
+fi
+
+if [ "${1-}" = "gc" ] || is_locked_pr_command "${1-}"; then
+  if is_supervised_pr_process; then
+    # operation-lock.sh consumes the one-shot marker when it installs the
+    # leader-only completion trap, before PR command tools can inherit it.
+    :
+  else
+    unset OPENCLAW_PR_DEDICATED_PROCESS_GROUP
+    unset OPENCLAW_PR_LOCK_NOTIFY_FD
+    unset OPENCLAW_PR_LOCK_SUPERVISOR_PID
+    command -v node >/dev/null 2>&1 || { echo "Missing required command: node" >&2; exit 1; }
+    shopt -s execfail
+    set +e
+    exec node "$script_parent_dir/pr-lib/process-group-runner.mjs" "$canonical_repo_root" "$script_self" "$@"
+    if [ "${OPENCLAW_PR_ANCHOR_CREATOR_PID:-}" = "$$" ] && [ "${OPENCLAW_PR_ANCHOR_FD:-}" = 9 ]; then
+      trap 'node "$script_parent_dir/pr-lib/materialized-anchor.mjs" retire "$script_self" || true' EXIT
+    fi
+    echo "Unable to execute the scripts/pr supervisor." >&2
+    exit 1
+  fi
+fi
+
+# shellcheck disable=SC1091
+source "$script_parent_dir/lib/plain-gh.sh"
 
 usage() {
   cat <<USAGE
 Usage:
+  scripts/pr [--dev-wrapper] <subcommand> ...
+  scripts/pr ls
+  scripts/pr workspace <PR>
+    Report physical checkout/artifact paths before review-init; no PR state changes.
+  scripts/pr gc [--pr <number>] [--dry-run]
+  scripts/pr lock-recover <PR> <OWNER_OID> --confirmed-no-running-tools
+  scripts/pr tooling-recover <PR> <plan> --plan-sha256 <SHA256> --confirmed-quiescent
   scripts/pr review-init <PR>
   scripts/pr review-checkout-main <PR>
   scripts/pr review-checkout-pr <PR>
@@ -26,1993 +1054,448 @@ Usage:
   scripts/pr review-validate-artifacts <PR>
   scripts/pr review-tests <PR> <test-file> [<test-file> ...]
   scripts/pr prepare-init <PR>
+  scripts/pr prepare-correction-init <PR>
+  scripts/pr prepare-correction-continue <PR> --expected-head <SHA> --expected-tree <OID> --incoming-head <SHA> --incoming-review <OID> --publication-receipt <push|sync> --publication-oid <OID>
+  scripts/pr prepare-correction-review-init <PR>
+  scripts/pr prepare-baseline-refresh <PR> --expected-head <SHA> --baseline <SHA> [--resolutions <file>]
+  scripts/pr prepare-baseline-successor <PR> --expected-head <SHA> --expected-tree <OID> --expected-review <OID> --predecessor-head <SHA> --predecessor-binding <OID> --baseline <SHA> [--resolutions <file>]
+  scripts/pr prepare-baseline-signing-request <PR> --expected-head <SHA> --baseline <SHA> --signer <fingerprint> [--resolutions <file>] [successor identity options]
+  scripts/pr prepare-baseline-signing-continue <PR> --request <OID> --signed-commit <file>
   scripts/pr prepare-validate-commit <PR>
   scripts/pr prepare-gates <PR>
-  scripts/pr prepare-push <PR>
+  scripts/pr prepare-push <PR> [--resume-crabbox-run <Actions run ID>]
+    Resume observes the selected protected publisher only; never pushes or dispatches.
   scripts/pr prepare-sync-head <PR>
   scripts/pr prepare-run <PR>
+  scripts/pr ci-dispatch <PR> [--backend crabbox]
   scripts/pr merge-verify <PR>
-  scripts/pr merge-run <PR>
+  scripts/pr merge-run <PR> [--auto-merge] [--body-file <path>] [--admin-evidence <path> --confirmed-operator-admin]
+    OPENCLAW_PR_MERGE_METHOD=merge|rebase preserves the PR commit series.
+    --auto-merge selects pinned immediate squash for CLEAN, auto for BEHIND/BLOCKED (MERGEABLE only).
+    OPENCLAW_PR_GATES_REMOTE=github prepare-run defers required CI to this auto-merge handoff.
+    OPENCLAW_PR_AUTO_MERGE=1 is equivalent.
+    --body-file snapshots a regular UTF-8 file relative to the caller, replacing squash prose.
+    Empty files are valid. Explicit/source co-authors and preview credit backed by tree-changing PR commits or PR authorship are retained; known machine credit is excluded. Queue merges reject it.
+    --admin-evidence admits reviewed prior-green conflict repairs or attributed pre-existing CI failures, with active organization-admin authority.
+    Exact evidence is required; branch-caused failures, security checks, and enforced reviews remain blocking.
+    This requires --confirmed-operator-admin and immediate squash without auto-merge.
+    Repeated merge-run reconciles retained outcomes; it never retries an uncertain dispatch.
+  scripts/pr merge-recover <PR> <OUTCOME_OID> --confirmed-operator-recovery [--replacement-head <SHA> [--auto-merge]] [--current-workflow] [--merged-head <SHA>] [--cancel-auto [--observed-head <SHA>]] [--body-file <path>] [--legacy-refusal <evidence-directory>] [--pre-dispatch-refusal <evidence-directory>] [--admin-evidence <path> --confirmed-operator-admin]
+    Explicitly authorize one new attempt after inspecting the retained outcome and remote history.
+    Defaults to the retained head; replacement requires an explicitly selected full lowercase 40-character SHA,
+    freshly authored exact-head review/preparation and completed CI proof. Standing landing authority covers
+    a replacement repairing the same scope; new scope or another method needs authorization. Never rebases automatically.
+    Ordinary recovery keeps prior evidence and requires the same method with immediate non-admin admission.
+    Paired admin flags permit an explicitly selected head after confirmed auto cancellation, including the retained SHA.
+    They also permit same-head recovery without --replacement-head for the complete known prior-CI REST base-modified HTTP 405 rejection.
+    This reruns current admin admission and retains the original captures; other admin failures remain fenced.
+    --current-workflow explicitly selects current official main for either cancelled-auto replacement or
+    same-head qualified HTTP 405 admin recovery; the retained binding remains unchanged.
+    --replacement-head <SHA> --auto-merge retires an unaccepted prior-CI REST admin intent fenced by a different
+    exact current head, then requests ordinary current-head auto-merge. It requires exact-head github_pending
+    preparation and all normal required-check gates; it never reuses prior admin evidence.
+    --cancel-auto instead retires the exact accepted or uncertain non-queue auto request before head repair.
+    Cancels a matching active request once, or records an already absent request without sending cancellation.
+    --observed-head <SHA> selects a changed OPEN head whose accepted auto request is already absent.
+    It records retirement only after stable observations; armed requests and concurrent drift stay refused.
+    Repeated cancellation reconciles only. Use its current outcome OID for later reviewed/prepared recovery.
+    --merged-head <SHA> records the receipt of an accepted auto request that GitHub merged on a pushed descendant
+    head after inspecting the PR timeline. It requires the exact authoritative merged head and never dispatches.
+  scripts/pr merge-complete <PR> <OUTCOME_OID> --confirmed-operator-completion
+    Finish a verified merge receipt after cleanup; never dispatches a merge or deletes resources.
+    Posts a first completion comment only from merged; uncertain comment attempts are lookup-only.
+
+  --dev-wrapper permits a mismatched local wrapper only for subcommands
+  classified advisory. OPENCLAW_PR_DEV_WRAPPER=1 is equivalent.
+
+Required commands: git, gh, jq, rg (ripgrep), pnpm, node.
+workspace does not require gh, jq, rg, pnpm, or installed Node packages.
+When macOS blocks ps, PR operation locks require Python 3 with ctypes on PATH.
 USAGE
 }
 
 require_cmds() {
   local missing=()
   local cmd
-  for cmd in git gh jq rg pnpm node; do
+  for cmd in gh jq rg pnpm node; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
       missing+=("$cmd")
     fi
   done
+  if ! resolve_plain_gh_bin >/dev/null; then
+    missing+=("gh")
+  fi
 
   if [ "${#missing[@]}" -gt 0 ]; then
-    echo "Missing required command(s): ${missing[*]}"
-    exit 1
-  fi
-}
-
-repo_root() {
-  # Resolve canonical repository root from git common-dir so wrappers work
-  # the same from main checkout or any linked worktree.
-  local script_dir
-  local common_git_dir
-  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-  if common_git_dir=$(git -C "$script_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null); then
-    (cd "$(dirname "$common_git_dir")" && pwd)
-    return
-  fi
-
-  # Fallback for environments where git common-dir is unavailable.
-  (cd "$script_dir/.." && pwd)
-}
-
-enter_worktree() {
-  local pr="$1"
-  local reset_to_main="${2:-false}"
-  local invoke_cwd
-  invoke_cwd="$PWD"
-  local root
-  root=$(repo_root)
-
-  if [ "$invoke_cwd" != "$root" ]; then
-    echo "Detected non-root invocation cwd=$invoke_cwd, using canonical root $root"
-  fi
-
-  cd "$root"
-  gh auth status >/dev/null
-  git fetch origin main
-
-  local dir=".worktrees/pr-$pr"
-  if [ -d "$dir" ]; then
-    cd "$dir"
-    git fetch origin main
-    if [ "$reset_to_main" = "true" ]; then
-      git checkout -B "temp/pr-$pr" origin/main
-    fi
-  else
-    git worktree add "$dir" -b "temp/pr-$pr" origin/main
-    cd "$dir"
-  fi
-
-  mkdir -p .local
-}
-
-pr_meta_json() {
-  local pr="$1"
-  gh pr view "$pr" --json number,title,state,isDraft,author,baseRefName,headRefName,headRefOid,headRepository,headRepositoryOwner,url,body,labels,assignees,reviewRequests,files,additions,deletions,statusCheckRollup
-}
-
-write_pr_meta_files() {
-  local json="$1"
-
-  printf '%s\n' "$json" > .local/pr-meta.json
-
-  cat > .local/pr-meta.env <<EOF_ENV
-PR_NUMBER=$(printf '%s\n' "$json" | jq -r .number)
-PR_URL=$(printf '%s\n' "$json" | jq -r .url)
-PR_AUTHOR=$(printf '%s\n' "$json" | jq -r .author.login)
-PR_BASE=$(printf '%s\n' "$json" | jq -r .baseRefName)
-PR_HEAD=$(printf '%s\n' "$json" | jq -r .headRefName)
-PR_HEAD_SHA=$(printf '%s\n' "$json" | jq -r .headRefOid)
-PR_HEAD_REPO=$(printf '%s\n' "$json" | jq -r .headRepository.nameWithOwner)
-PR_HEAD_REPO_URL=$(printf '%s\n' "$json" | jq -r '.headRepository.url // ""')
-PR_HEAD_OWNER=$(printf '%s\n' "$json" | jq -r '.headRepositoryOwner.login // ""')
-PR_HEAD_REPO_NAME=$(printf '%s\n' "$json" | jq -r '.headRepository.name // ""')
-EOF_ENV
-}
-
-require_artifact() {
-  local path="$1"
-  if [ ! -s "$path" ]; then
-    echo "Missing required artifact: $path"
-    exit 1
-  fi
-}
-
-print_relevant_log_excerpt() {
-  local log_file="$1"
-  if [ ! -s "$log_file" ]; then
-    echo "(no output captured)"
-    return 0
-  fi
-
-  local filtered_log
-  filtered_log=$(mktemp)
-  if rg -n -i 'error|err|failed|fail|fatal|panic|exception|TypeError|ReferenceError|SyntaxError|ELIFECYCLE|ERR_' "$log_file" >"$filtered_log"; then
-    echo "Relevant log lines:"
-    tail -n 120 "$filtered_log"
-  else
-    echo "No focused error markers found; showing last 120 lines:"
-    tail -n 120 "$log_file"
-  fi
-  rm -f "$filtered_log"
-}
-
-run_quiet_logged() {
-  local label="$1"
-  local log_file="$2"
-  shift 2
-
-  mkdir -p .local
-  if "$@" >"$log_file" 2>&1; then
-    echo "$label passed"
-    return 0
-  fi
-
-  echo "$label failed (log: $log_file)"
-  print_relevant_log_excerpt "$log_file"
-  return 1
-}
-
-bootstrap_deps_if_needed() {
-  if [ ! -x node_modules/.bin/vitest ]; then
-    run_quiet_logged "pnpm install --frozen-lockfile" ".local/bootstrap-install.log" pnpm install --frozen-lockfile
-  fi
-}
-
-wait_for_pr_head_sha() {
-  local pr="$1"
-  local expected_sha="$2"
-  local max_attempts="${3:-6}"
-  local sleep_seconds="${4:-2}"
-
-  local attempt
-  for attempt in $(seq 1 "$max_attempts"); do
-    local observed_sha
-    observed_sha=$(gh pr view "$pr" --json headRefOid --jq .headRefOid)
-    if [ "$observed_sha" = "$expected_sha" ]; then
-      return 0
-    fi
-
-    if [ "$attempt" -lt "$max_attempts" ]; then
-      sleep "$sleep_seconds"
-    fi
-  done
-
-  return 1
-}
-
-is_author_email_merge_error() {
-  local msg="$1"
-  printf '%s\n' "$msg" | rg -qi 'author.?email|email.*associated|associated.*email|invalid.*email'
-}
-
-merge_author_email_candidates() {
-  local reviewer="$1"
-  local reviewer_id="$2"
-
-  local gh_email
-  gh_email=$(gh api user --jq '.email // ""' 2>/dev/null || true)
-  local git_email
-  git_email=$(git config user.email 2>/dev/null || true)
-
-  printf '%s\n' \
-    "$gh_email" \
-    "$git_email" \
-    "${reviewer_id}+${reviewer}@users.noreply.github.com" \
-    "${reviewer}@users.noreply.github.com" | awk 'NF && !seen[$0]++'
-}
-
-checkout_prep_branch() {
-  local pr="$1"
-  require_artifact .local/prep-context.env
-  # shellcheck disable=SC1091
-  source .local/prep-context.env
-
-  local prep_branch
-  prep_branch=$(resolve_prep_branch_name "$pr")
-  git checkout "$prep_branch"
-}
-
-resolve_prep_branch_name() {
-  local pr="$1"
-  require_artifact .local/prep-context.env
-  # shellcheck disable=SC1091
-  source .local/prep-context.env
-
-  local prep_branch="${PREP_BRANCH:-pr-$pr-prep}"
-  if ! git show-ref --verify --quiet "refs/heads/$prep_branch"; then
-    echo "Expected prep branch $prep_branch not found. Run prepare-init first."
-    exit 1
-  fi
-
-  printf '%s\n' "$prep_branch"
-}
-
-verify_prep_branch_matches_prepared_head() {
-  local pr="$1"
-  local prepared_head_sha="$2"
-
-  local prep_branch
-  prep_branch=$(resolve_prep_branch_name "$pr")
-  local prep_branch_head_sha
-  prep_branch_head_sha=$(git rev-parse "refs/heads/$prep_branch")
-  if [ "$prep_branch_head_sha" = "$prepared_head_sha" ]; then
-    return 0
-  fi
-
-  echo "Local prep branch moved after prepare-push (branch=$prep_branch expected $prepared_head_sha, got $prep_branch_head_sha)."
-  if git merge-base --is-ancestor "$prepared_head_sha" "$prep_branch_head_sha" 2>/dev/null; then
-    echo "Unpushed local commits on prep branch:"
-    git log --oneline "${prepared_head_sha}..${prep_branch_head_sha}" | sed 's/^/  /' || true
-    echo "Run scripts/pr prepare-sync-head $pr to push them before merge."
-  else
-    echo "Prep branch no longer contains the prepared head. Re-run prepare-init."
-  fi
-  exit 1
-}
-
-resolve_head_push_url() {
-  # shellcheck disable=SC1091
-  source .local/pr-meta.env
-
-  if [ -n "${PR_HEAD_OWNER:-}" ] && [ -n "${PR_HEAD_REPO_NAME:-}" ]; then
-    printf 'git@github.com:%s/%s.git\n' "$PR_HEAD_OWNER" "$PR_HEAD_REPO_NAME"
-    return 0
-  fi
-
-  if [ -n "${PR_HEAD_REPO_URL:-}" ] && [ "$PR_HEAD_REPO_URL" != "null" ]; then
-    case "$PR_HEAD_REPO_URL" in
-      *.git) printf '%s\n' "$PR_HEAD_REPO_URL" ;;
-      *) printf '%s.git\n' "$PR_HEAD_REPO_URL" ;;
-    esac
-    return 0
-  fi
-
-  return 1
-}
-
-# Push to a fork PR branch via GitHub GraphQL createCommitOnBranch.
-# This uses the same permission model as the GitHub web editor, bypassing
-# the git-protocol 403 that occurs even when maintainer_can_modify is true.
-# Usage: graphql_push_to_fork <owner/repo> <branch> <expected_head_oid>
-# Pushes the diff between expected_head_oid and local HEAD as file additions/deletions.
-# File bytes are read from git objects (not the working tree) to avoid
-# symlink/special-file dereference risks from untrusted fork content.
-graphql_push_to_fork() {
-  local repo_nwo="$1"   # e.g. Oncomatic/openclaw
-  local branch="$2"     # e.g. fix/memory-flush-not-executing
-  local expected_oid="$3"
-  local max_blob_bytes=$((5 * 1024 * 1024))
-
-  # Build file changes JSON from the diff between expected_oid and HEAD.
-  local additions="[]"
-  local deletions="[]"
-
-  # Collect added/modified files
-  local added_files
-  added_files=$(git diff --no-renames --name-only --diff-filter=AM "$expected_oid" HEAD)
-  if [ -n "$added_files" ]; then
-    additions="["
-    local first=true
-    while IFS= read -r fpath; do
-      [ -n "$fpath" ] || continue
-
-      local tree_entry
-      tree_entry=$(git ls-tree HEAD -- "$fpath")
-      if [ -z "$tree_entry" ]; then
-        echo "GraphQL push could not resolve path in HEAD tree: $fpath" >&2
-        return 1
-      fi
-
-      local file_mode
-      file_mode=$(printf '%s\n' "$tree_entry" | awk '{print $1}')
-      local file_type
-      file_type=$(printf '%s\n' "$tree_entry" | awk '{print $2}')
-      local file_oid
-      file_oid=$(printf '%s\n' "$tree_entry" | awk '{print $3}')
-
-      if [ "$file_type" != "blob" ] || [ "$file_mode" = "160000" ]; then
-        echo "GraphQL push only supports blob files; refusing $fpath (mode=$file_mode type=$file_type)" >&2
-        return 1
-      fi
-
-      local blob_size
-      blob_size=$(git cat-file -s "$file_oid")
-      if [ "$blob_size" -gt "$max_blob_bytes" ]; then
-        echo "GraphQL push refused large file $fpath (${blob_size} bytes > ${max_blob_bytes})" >&2
-        return 1
-      fi
-
-      local b64
-      b64=$(git cat-file -p "$file_oid" | base64 | tr -d '\n')
-      if [ "$first" = true ]; then first=false; else additions+=","; fi
-      additions+="{\"path\":$(printf '%s' "$fpath" | jq -Rs .),\"contents\":$(printf '%s' "$b64" | jq -Rs .)}"
-    done <<< "$added_files"
-    additions+="]"
-  fi
-
-  # Collect deleted files
-  local deleted_files
-  deleted_files=$(git diff --no-renames --name-only --diff-filter=D "$expected_oid" HEAD)
-  if [ -n "$deleted_files" ]; then
-    deletions="["
-    local first=true
-    while IFS= read -r fpath; do
-      [ -n "$fpath" ] || continue
-      if [ "$first" = true ]; then first=false; else deletions+=","; fi
-      deletions+="{\"path\":$(printf '%s' "$fpath" | jq -Rs .)}"
-    done <<< "$deleted_files"
-    deletions+="]"
-  fi
-
-  local commit_headline
-  commit_headline=$(git log -1 --format=%s HEAD)
-
-  local query
-  query=$(cat <<'GRAPHQL'
-mutation($input: CreateCommitOnBranchInput!) {
-  createCommitOnBranch(input: $input) {
-    commit { oid url }
-  }
-}
-GRAPHQL
-)
-
-  local variables
-  variables=$(jq -n \
-    --arg nwo "$repo_nwo" \
-    --arg branch "$branch" \
-    --arg oid "$expected_oid" \
-    --arg headline "$commit_headline" \
-    --argjson additions "$additions" \
-    --argjson deletions "$deletions" \
-    '{input: {
-      branch: { repositoryNameWithOwner: $nwo, branchName: $branch },
-      message: { headline: $headline },
-      fileChanges: { additions: $additions, deletions: $deletions },
-      expectedHeadOid: $oid
-    }}')
-
-  local result
-  result=$(gh api graphql -f query="$query" --input - <<< "$variables" 2>&1) || {
-    echo "GraphQL push failed: $result" >&2
-    return 1
-  }
-
-  local new_oid
-  new_oid=$(printf '%s' "$result" | jq -r '.data.createCommitOnBranch.commit.oid // empty')
-  if [ -z "$new_oid" ]; then
-    echo "GraphQL push returned no commit OID: $result" >&2
-    return 1
-  fi
-
-  echo "GraphQL push succeeded: $new_oid" >&2
-  printf '%s\n' "$new_oid"
-}
-
-# Resolve HTTPS fallback URL for prhead push (used if SSH fails).
-resolve_head_push_url_https() {
-  # shellcheck disable=SC1091
-  source .local/pr-meta.env
-
-  if [ -n "${PR_HEAD_OWNER:-}" ] && [ -n "${PR_HEAD_REPO_NAME:-}" ]; then
-    printf 'https://github.com/%s/%s.git\n' "$PR_HEAD_OWNER" "$PR_HEAD_REPO_NAME"
-    return 0
-  fi
-
-  if [ -n "${PR_HEAD_REPO_URL:-}" ] && [ "$PR_HEAD_REPO_URL" != "null" ]; then
-    case "$PR_HEAD_REPO_URL" in
-      *.git) printf '%s\n' "$PR_HEAD_REPO_URL" ;;
-      *) printf '%s.git\n' "$PR_HEAD_REPO_URL" ;;
-    esac
-    return 0
-  fi
-
-  return 1
-}
-
-verify_pr_head_branch_matches_expected() {
-  local pr="$1"
-  local expected_head="$2"
-
-  local current_head
-  current_head=$(gh pr view "$pr" --json headRefName --jq .headRefName)
-  if [ "$current_head" != "$expected_head" ]; then
-    echo "PR head branch changed from $expected_head to $current_head. Re-run prepare-init."
-    exit 1
-  fi
-}
-
-setup_prhead_remote() {
-  local push_url
-  push_url=$(resolve_head_push_url) || {
-    echo "Unable to resolve PR head repo push URL."
-    exit 1
-  }
-
-  # Always set prhead to the correct fork URL for this PR.
-  # The remote is repo-level (shared across worktrees), so a previous
-  # prepare-pr run for a different fork PR can leave a stale URL.
-  git remote remove prhead 2>/dev/null || true
-  git remote add prhead "$push_url"
-}
-
-resolve_prhead_remote_sha() {
-  local pr_head="$1"
-
-  local remote_sha
-  remote_sha=$(git ls-remote prhead "refs/heads/$pr_head" 2>/dev/null | awk '{print $1}' || true)
-  if [ -z "$remote_sha" ]; then
-    local https_url
-    https_url=$(resolve_head_push_url_https 2>/dev/null) || true
-    local current_push_url
-    current_push_url=$(git remote get-url prhead 2>/dev/null || true)
-    if [ -n "$https_url" ] && [ "$https_url" != "$current_push_url" ]; then
-      echo "SSH remote failed; falling back to HTTPS..."
-      git remote set-url prhead "$https_url"
-      git remote set-url --push prhead "$https_url"
-      remote_sha=$(git ls-remote prhead "refs/heads/$pr_head" 2>/dev/null | awk '{print $1}' || true)
-    fi
-    if [ -z "$remote_sha" ]; then
-      echo "Remote branch refs/heads/$pr_head not found on prhead"
-      exit 1
-    fi
-  fi
-
-  printf '%s\n' "$remote_sha"
-}
-
-run_prepare_push_retry_gates() {
-  local docs_only="${1:-false}"
-
-  bootstrap_deps_if_needed
-  run_quiet_logged "pnpm build (lease-retry)" ".local/lease-retry-build.log" pnpm build
-  run_quiet_logged "pnpm check (lease-retry)" ".local/lease-retry-check.log" pnpm check
-  if [ "$docs_only" != "true" ]; then
-    run_quiet_logged "pnpm test (lease-retry)" ".local/lease-retry-test.log" pnpm test
-  fi
-}
-
-push_prep_head_to_pr_branch() {
-  local pr="$1"
-  local pr_head="$2"
-  local prep_head_sha="$3"
-  local lease_sha="$4"
-  local rerun_gates_on_lease_retry="${5:-false}"
-  local docs_only="${6:-false}"
-  local result_env_path="${7:-.local/push-result.env}"
-
-  setup_prhead_remote
-
-  local remote_sha
-  remote_sha=$(resolve_prhead_remote_sha "$pr_head")
-
-  local pushed_from_sha="$remote_sha"
-  if [ "$remote_sha" = "$prep_head_sha" ]; then
-    echo "Remote branch already at local prep HEAD; skipping push."
-  else
-    if [ "$remote_sha" != "$lease_sha" ]; then
-      echo "Remote SHA $remote_sha differs from PR head SHA $lease_sha. Refreshing lease SHA from remote."
-      lease_sha="$remote_sha"
-    fi
-    pushed_from_sha="$lease_sha"
-    local push_output
-    if ! push_output=$(
-      git push --force-with-lease=refs/heads/$pr_head:$lease_sha prhead HEAD:$pr_head 2>&1
-    ); then
-      echo "Push failed: $push_output"
-
-      if printf '%s' "$push_output" | grep -qiE '(permission|denied|403|forbidden)'; then
-        echo "Permission denied on git push; trying GraphQL createCommitOnBranch fallback..."
-        if [ -n "${PR_HEAD_OWNER:-}" ] && [ -n "${PR_HEAD_REPO_NAME:-}" ]; then
-          local graphql_oid
-          graphql_oid=$(graphql_push_to_fork "${PR_HEAD_OWNER}/${PR_HEAD_REPO_NAME}" "$pr_head" "$lease_sha")
-          prep_head_sha="$graphql_oid"
-        else
-          echo "Git push permission denied and no fork owner/repo info for GraphQL fallback."
-          exit 1
-        fi
-      else
-        echo "Lease push failed, retrying once with fresh PR head..."
-        lease_sha=$(gh pr view "$pr" --json headRefOid --jq .headRefOid)
-        pushed_from_sha="$lease_sha"
-
-        if [ "$rerun_gates_on_lease_retry" = "true" ]; then
-          git fetch origin "pull/$pr/head:pr-$pr-latest" --force
-          git rebase "pr-$pr-latest"
-          prep_head_sha=$(git rev-parse HEAD)
-          run_prepare_push_retry_gates "$docs_only"
-        fi
-
-        if ! push_output=$(
-          git push --force-with-lease=refs/heads/$pr_head:$lease_sha prhead HEAD:$pr_head 2>&1
-        ); then
-          echo "Retry push failed: $push_output"
-          if [ -n "${PR_HEAD_OWNER:-}" ] && [ -n "${PR_HEAD_REPO_NAME:-}" ]; then
-            echo "Retry failed; trying GraphQL createCommitOnBranch fallback..."
-            local graphql_oid
-            graphql_oid=$(graphql_push_to_fork "${PR_HEAD_OWNER}/${PR_HEAD_REPO_NAME}" "$pr_head" "$lease_sha")
-            prep_head_sha="$graphql_oid"
-          else
-            echo "Git push failed and no fork owner/repo info for GraphQL fallback."
-            exit 1
-          fi
-        fi
-      fi
-    fi
-  fi
-
-  if ! wait_for_pr_head_sha "$pr" "$prep_head_sha" 8 3; then
-    local observed_sha
-    observed_sha=$(gh pr view "$pr" --json headRefOid --jq .headRefOid)
-    echo "Pushed head SHA propagation timed out. expected=$prep_head_sha observed=$observed_sha"
-    exit 1
-  fi
-
-  local pr_head_sha_after
-  pr_head_sha_after=$(gh pr view "$pr" --json headRefOid --jq .headRefOid)
-
-  git fetch origin main
-  git fetch origin "pull/$pr/head:pr-$pr-verify" --force
-  git merge-base --is-ancestor origin/main "pr-$pr-verify" || {
-    echo "PR branch is behind main after push."
-    exit 1
-  }
-  git branch -D "pr-$pr-verify" 2>/dev/null || true
-  cat > "$result_env_path" <<EOF_ENV
-PUSH_PREP_HEAD_SHA=$prep_head_sha
-PUSHED_FROM_SHA=$pushed_from_sha
-PR_HEAD_SHA_AFTER_PUSH=$pr_head_sha_after
-EOF_ENV
-}
-
-set_review_mode() {
-  local mode="$1"
-  cat > .local/review-mode.env <<EOF_ENV
-REVIEW_MODE=$mode
-REVIEW_MODE_SET_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-EOF_ENV
-}
-
-review_claim() {
-  local pr="$1"
-  local root
-  root=$(repo_root)
-  cd "$root"
-  mkdir -p .local
-
-  local reviewer=""
-  local max_attempts=3
-  local attempt
-
-  for attempt in $(seq 1 "$max_attempts"); do
-    local user_log
-    user_log=".local/review-claim-user-attempt-$attempt.log"
-
-    if reviewer=$(gh api user --jq .login 2>"$user_log"); then
-      printf "%s\n" "$reviewer" >"$user_log"
-      break
-    fi
-
-    echo "Claim reviewer lookup failed (attempt $attempt/$max_attempts)."
-    print_relevant_log_excerpt "$user_log"
-
-    if [ "$attempt" -lt "$max_attempts" ]; then
-      sleep 2
-    fi
-  done
-
-  if [ -z "$reviewer" ]; then
-    echo "Failed to resolve reviewer login after $max_attempts attempts."
-    return 1
-  fi
-
-  for attempt in $(seq 1 "$max_attempts"); do
-    local claim_log
-    claim_log=".local/review-claim-assignee-attempt-$attempt.log"
-
-    if gh pr edit "$pr" --add-assignee "$reviewer" >"$claim_log" 2>&1; then
-      echo "review claim succeeded: @$reviewer assigned to PR #$pr"
-      return 0
-    fi
-
-    echo "Claim assignee update failed (attempt $attempt/$max_attempts)."
-    print_relevant_log_excerpt "$claim_log"
-
-    if [ "$attempt" -lt "$max_attempts" ]; then
-      sleep 2
-    fi
-  done
-
-  echo "Failed to assign @$reviewer to PR #$pr after $max_attempts attempts."
-  return 1
-}
-
-review_checkout_main() {
-  local pr="$1"
-  enter_worktree "$pr" false
-  git fetch origin main
-  git checkout --detach origin/main
-  set_review_mode main
-
-  echo "review mode set to main baseline"
-  echo "branch=$(git branch --show-current)"
-  echo "head=$(git rev-parse --short HEAD)"
-}
-
-review_checkout_pr() {
-  local pr="$1"
-  enter_worktree "$pr" false
-  git fetch origin "pull/$pr/head:pr-$pr" --force
-  git checkout --detach "pr-$pr"
-  set_review_mode pr
-
-  echo "review mode set to PR head"
-  echo "branch=$(git branch --show-current)"
-  echo "head=$(git rev-parse --short HEAD)"
-}
-
-review_guard() {
-  local pr="$1"
-  enter_worktree "$pr" false
-  require_artifact .local/review-mode.env
-  require_artifact .local/pr-meta.env
-  # shellcheck disable=SC1091
-  source .local/review-mode.env
-  # shellcheck disable=SC1091
-  source .local/pr-meta.env
-
-  local branch
-  branch=$(git branch --show-current)
-  local head_sha
-  head_sha=$(git rev-parse HEAD)
-
-  case "${REVIEW_MODE:-}" in
-    main)
-      local expected_main_sha
-      expected_main_sha=$(git rev-parse origin/main)
-      if [ "$head_sha" != "$expected_main_sha" ]; then
-        echo "Review guard failed: expected HEAD at origin/main ($expected_main_sha) for main baseline mode, got $head_sha"
-        exit 1
-      fi
-      ;;
-    pr)
-      if [ -z "${PR_HEAD_SHA:-}" ]; then
-        echo "Review guard failed: missing PR_HEAD_SHA in .local/pr-meta.env"
-        exit 1
-      fi
-      if [ "$head_sha" != "$PR_HEAD_SHA" ]; then
-        echo "Review guard failed: expected HEAD at PR_HEAD_SHA ($PR_HEAD_SHA), got $head_sha"
-        exit 1
-      fi
-      ;;
-    *)
-      echo "Review guard failed: unknown review mode '${REVIEW_MODE:-}'"
-      exit 1
-      ;;
-  esac
-
-  echo "review guard passed"
-  echo "mode=$REVIEW_MODE"
-  echo "branch=$branch"
-  echo "head=$head_sha"
-}
-
-review_artifacts_init() {
-  local pr="$1"
-  enter_worktree "$pr" false
-  require_artifact .local/pr-meta.env
-
-  if [ ! -f .local/review.md ]; then
-    cat > .local/review.md <<'EOF_MD'
-A) TL;DR recommendation
-
-B) What changed and what is good?
-
-C) Security findings
-
-D) What is the PR intent? Is this the most optimal implementation?
-
-E) Concerns or questions (actionable)
-
-F) Tests
-
-G) Docs status
-
-H) Changelog
-
-I) Follow ups (optional)
-
-J) Suggested PR comment (optional)
-EOF_MD
-  fi
-
-  if [ ! -f .local/review.json ]; then
-    cat > .local/review.json <<'EOF_JSON'
-{
-  "recommendation": "READY FOR /prepare-pr",
-  "findings": [],
-  "nitSweep": {
-    "performed": true,
-    "status": "none",
-    "summary": "No optional nits identified."
-  },
-  "behavioralSweep": {
-    "performed": true,
-    "status": "not_applicable",
-    "summary": "No runtime branch-level behavior changes require sweep evidence.",
-    "silentDropRisk": "none",
-    "branches": []
-  },
-  "issueValidation": {
-    "performed": true,
-    "source": "pr_body",
-    "status": "valid",
-    "summary": "PR description clearly states a valid problem."
-  },
-  "tests": {
-    "ran": [],
-    "gaps": [],
-    "result": "pass"
-  },
-  "docs": "not_applicable",
-  "changelog": "required"
-}
-EOF_JSON
-  fi
-
-  echo "review artifact templates are ready"
-  echo "files=.local/review.md .local/review.json"
-}
-
-review_validate_artifacts() {
-  local pr="$1"
-  enter_worktree "$pr" false
-  require_artifact .local/review.md
-  require_artifact .local/review.json
-  require_artifact .local/pr-meta.env
-  require_artifact .local/pr-meta.json
-
-  review_guard "$pr"
-
-  jq . .local/review.json >/dev/null
-
-  local section
-  for section in "A)" "B)" "C)" "D)" "E)" "F)" "G)" "H)" "I)" "J)"; do
-    awk -v s="$section" 'index($0, s) == 1 { found=1; exit } END { exit(found ? 0 : 1) }' .local/review.md || {
-      echo "Missing section header in .local/review.md: $section"
-      exit 1
-    }
-  done
-
-  local recommendation
-  recommendation=$(jq -r '.recommendation // ""' .local/review.json)
-  case "$recommendation" in
-    "READY FOR /prepare-pr"|"NEEDS WORK"|"NEEDS DISCUSSION"|"NOT USEFUL (CLOSE)")
-      ;;
-    *)
-      echo "Invalid recommendation in .local/review.json: $recommendation"
-      exit 1
-      ;;
-  esac
-
-  local invalid_severity_count
-  invalid_severity_count=$(jq '[.findings[]? | select((.severity // "") != "BLOCKER" and (.severity // "") != "IMPORTANT" and (.severity // "") != "NIT")] | length' .local/review.json)
-  if [ "$invalid_severity_count" -gt 0 ]; then
-    echo "Invalid finding severity in .local/review.json"
-    exit 1
-  fi
-
-  local invalid_findings_count
-  invalid_findings_count=$(jq '[.findings[]? | select((.id|type)!="string" or (.title|type)!="string" or (.area|type)!="string" or (.fix|type)!="string")] | length' .local/review.json)
-  if [ "$invalid_findings_count" -gt 0 ]; then
-    echo "Invalid finding shape in .local/review.json (id/title/area/fix must be strings)"
-    exit 1
-  fi
-
-  local nit_findings_count
-  nit_findings_count=$(jq '[.findings[]? | select((.severity // "") == "NIT")] | length' .local/review.json)
-
-  local nit_sweep_performed
-  nit_sweep_performed=$(jq -r '.nitSweep.performed // empty' .local/review.json)
-  if [ "$nit_sweep_performed" != "true" ]; then
-    echo "Invalid nit sweep in .local/review.json: nitSweep.performed must be true"
-    exit 1
-  fi
-
-  local nit_sweep_status
-  nit_sweep_status=$(jq -r '.nitSweep.status // ""' .local/review.json)
-  case "$nit_sweep_status" in
-    "none")
-      if [ "$nit_findings_count" -gt 0 ]; then
-        echo "Invalid nit sweep in .local/review.json: nitSweep.status is none but NIT findings exist"
-        exit 1
-      fi
-      ;;
-    "has_nits")
-      if [ "$nit_findings_count" -lt 1 ]; then
-        echo "Invalid nit sweep in .local/review.json: nitSweep.status is has_nits but no NIT findings exist"
-        exit 1
-      fi
-      ;;
-    *)
-      echo "Invalid nit sweep status in .local/review.json: $nit_sweep_status"
-      exit 1
-      ;;
-  esac
-
-  local invalid_nit_summary_count
-  invalid_nit_summary_count=$(jq '[.nitSweep.summary | select((type != "string") or (gsub("^\\s+|\\s+$";"") | length == 0))] | length' .local/review.json)
-  if [ "$invalid_nit_summary_count" -gt 0 ]; then
-    echo "Invalid nit sweep summary in .local/review.json: nitSweep.summary must be a non-empty string"
-    exit 1
-  fi
-
-  local issue_validation_performed
-  issue_validation_performed=$(jq -r '.issueValidation.performed // empty' .local/review.json)
-  if [ "$issue_validation_performed" != "true" ]; then
-    echo "Invalid issue validation in .local/review.json: issueValidation.performed must be true"
-    exit 1
-  fi
-
-  local issue_validation_source
-  issue_validation_source=$(jq -r '.issueValidation.source // ""' .local/review.json)
-  case "$issue_validation_source" in
-    "linked_issue"|"pr_body"|"both")
-      ;;
-    *)
-      echo "Invalid issue validation source in .local/review.json: $issue_validation_source"
-      exit 1
-      ;;
-  esac
-
-  local issue_validation_status
-  issue_validation_status=$(jq -r '.issueValidation.status // ""' .local/review.json)
-  case "$issue_validation_status" in
-    "valid"|"unclear"|"invalid"|"already_fixed_on_main")
-      ;;
-    *)
-      echo "Invalid issue validation status in .local/review.json: $issue_validation_status"
-      exit 1
-      ;;
-  esac
-
-  local invalid_issue_summary_count
-  invalid_issue_summary_count=$(jq '[.issueValidation.summary | select((type != "string") or (gsub("^\\s+|\\s+$";"") | length == 0))] | length' .local/review.json)
-  if [ "$invalid_issue_summary_count" -gt 0 ]; then
-    echo "Invalid issue validation summary in .local/review.json: issueValidation.summary must be a non-empty string"
-    exit 1
-  fi
-
-  local runtime_file_count
-  runtime_file_count=$(jq '[.files[]? | (.path // "") | select(test("^(src|extensions|apps)/")) | select(test("(^|/)__tests__/|\\.test\\.|\\.spec\\.") | not) | select(test("\\.(md|mdx)$") | not)] | length' .local/pr-meta.json)
-
-  local runtime_review_required="false"
-  if [ "$runtime_file_count" -gt 0 ]; then
-    runtime_review_required="true"
-  fi
-
-  local behavioral_sweep_performed
-  behavioral_sweep_performed=$(jq -r '.behavioralSweep.performed // empty' .local/review.json)
-  if [ "$behavioral_sweep_performed" != "true" ]; then
-    echo "Invalid behavioral sweep in .local/review.json: behavioralSweep.performed must be true"
-    exit 1
-  fi
-
-  local behavioral_sweep_status
-  behavioral_sweep_status=$(jq -r '.behavioralSweep.status // ""' .local/review.json)
-  case "$behavioral_sweep_status" in
-    "pass"|"needs_work"|"not_applicable")
-      ;;
-    *)
-      echo "Invalid behavioral sweep status in .local/review.json: $behavioral_sweep_status"
-      exit 1
-      ;;
-  esac
-
-  local behavioral_sweep_risk
-  behavioral_sweep_risk=$(jq -r '.behavioralSweep.silentDropRisk // ""' .local/review.json)
-  case "$behavioral_sweep_risk" in
-    "none"|"present"|"unknown")
-      ;;
-    *)
-      echo "Invalid behavioral sweep risk in .local/review.json: $behavioral_sweep_risk"
-      exit 1
-      ;;
-  esac
-
-  local invalid_behavioral_summary_count
-  invalid_behavioral_summary_count=$(jq '[.behavioralSweep.summary | select((type != "string") or (gsub("^\\s+|\\s+$";"") | length == 0))] | length' .local/review.json)
-  if [ "$invalid_behavioral_summary_count" -gt 0 ]; then
-    echo "Invalid behavioral sweep summary in .local/review.json: behavioralSweep.summary must be a non-empty string"
-    exit 1
-  fi
-
-  local behavioral_branches_is_array
-  behavioral_branches_is_array=$(jq -r 'if (.behavioralSweep.branches | type) == "array" then "true" else "false" end' .local/review.json)
-  if [ "$behavioral_branches_is_array" != "true" ]; then
-    echo "Invalid behavioral sweep in .local/review.json: behavioralSweep.branches must be an array"
-    exit 1
-  fi
-
-  local invalid_behavioral_branch_count
-  invalid_behavioral_branch_count=$(jq '[.behavioralSweep.branches[]? | select((.path|type)!="string" or (.decision|type)!="string" or (.outcome|type)!="string")] | length' .local/review.json)
-  if [ "$invalid_behavioral_branch_count" -gt 0 ]; then
-    echo "Invalid behavioral sweep branch entry in .local/review.json: each branch needs string path/decision/outcome"
-    exit 1
-  fi
-
-  local behavioral_branch_count
-  behavioral_branch_count=$(jq '[.behavioralSweep.branches[]?] | length' .local/review.json)
-
-  if [ "$runtime_review_required" = "true" ] && [ "$behavioral_sweep_status" = "not_applicable" ]; then
-    echo "Invalid behavioral sweep in .local/review.json: runtime file changes require behavioralSweep.status=pass|needs_work"
-    exit 1
-  fi
-
-  if [ "$runtime_review_required" = "true" ] && [ "$behavioral_branch_count" -lt 1 ]; then
-    echo "Invalid behavioral sweep in .local/review.json: runtime file changes require at least one branch entry"
-    exit 1
-  fi
-
-  if [ "$behavioral_sweep_status" = "not_applicable" ] && [ "$behavioral_branch_count" -gt 0 ]; then
-    echo "Invalid behavioral sweep in .local/review.json: not_applicable cannot include branch entries"
-    exit 1
-  fi
-
-  if [ "$behavioral_sweep_status" = "pass" ] && [ "$behavioral_sweep_risk" != "none" ]; then
-    echo "Invalid behavioral sweep in .local/review.json: status=pass requires silentDropRisk=none"
-    exit 1
-  fi
-
-  if [ "$recommendation" = "READY FOR /prepare-pr" ] && [ "$issue_validation_status" != "valid" ]; then
-    echo "Invalid recommendation in .local/review.json: READY FOR /prepare-pr requires issueValidation.status=valid"
-    exit 1
-  fi
-
-  if [ "$recommendation" = "READY FOR /prepare-pr" ] && [ "$behavioral_sweep_status" = "needs_work" ]; then
-    echo "Invalid recommendation in .local/review.json: READY FOR /prepare-pr requires behavioralSweep.status!=needs_work"
-    exit 1
-  fi
-
-  if [ "$recommendation" = "READY FOR /prepare-pr" ] && [ "$runtime_review_required" = "true" ] && [ "$behavioral_sweep_status" != "pass" ]; then
-    echo "Invalid recommendation in .local/review.json: READY FOR /prepare-pr on runtime changes requires behavioralSweep.status=pass"
-    exit 1
-  fi
-
-  if [ "$recommendation" = "READY FOR /prepare-pr" ] && [ "$behavioral_sweep_risk" = "present" ]; then
-    echo "Invalid recommendation in .local/review.json: READY FOR /prepare-pr is not allowed when behavioralSweep.silentDropRisk=present"
-    exit 1
-  fi
-
-  local docs_status
-  docs_status=$(jq -r '.docs // ""' .local/review.json)
-  case "$docs_status" in
-    "up_to_date"|"missing"|"not_applicable")
-      ;;
-    *)
-      echo "Invalid docs status in .local/review.json: $docs_status"
-      exit 1
-      ;;
-  esac
-
-  local changelog_status
-  changelog_status=$(jq -r '.changelog // ""' .local/review.json)
-  case "$changelog_status" in
-    "required")
-      ;;
-    *)
-      echo "Invalid changelog status in .local/review.json: $changelog_status (must be \"required\")"
-      exit 1
-      ;;
-  esac
-
-  echo "review artifacts validated"
-}
-
-review_tests() {
-  local pr="$1"
-  shift
-  if [ "$#" -lt 1 ]; then
-    echo "Usage: scripts/pr review-tests <PR> <test-file> [<test-file> ...]"
-    exit 2
-  fi
-
-  enter_worktree "$pr" false
-  review_guard "$pr"
-
-  local target
-  for target in "$@"; do
-    if [ ! -f "$target" ]; then
-      echo "Missing test target file: $target"
-      exit 1
-    fi
-  done
-
-  bootstrap_deps_if_needed
-
-  local list_log=".local/review-tests-list.log"
-  run_quiet_logged "pnpm vitest list" "$list_log" pnpm vitest list "$@"
-
-  local missing_list=()
-  for target in "$@"; do
-    local base
-    base=$(basename "$target")
-    if ! rg -F -q "$target" "$list_log" && ! rg -F -q "$base" "$list_log"; then
-      missing_list+=("$target")
-    fi
-  done
-
-  if [ "${#missing_list[@]}" -gt 0 ]; then
-    echo "These requested targets were not selected by vitest list:"
-    printf ' - %s\n' "${missing_list[@]}"
-    exit 1
-  fi
-
-  local run_log=".local/review-tests-run.log"
-  run_quiet_logged "pnpm vitest run" "$run_log" pnpm vitest run "$@"
-
-  local missing_run=()
-  for target in "$@"; do
-    local base
-    base=$(basename "$target")
-    if ! rg -F -q "$target" "$run_log" && ! rg -F -q "$base" "$run_log"; then
-      missing_run+=("$target")
-    fi
-  done
-
-  if [ "${#missing_run[@]}" -gt 0 ]; then
-    echo "These requested targets were not observed in vitest run output:"
-    printf ' - %s\n' "${missing_run[@]}"
-    exit 1
-  fi
-
-  {
-    echo "REVIEW_TESTS_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    echo "REVIEW_TEST_TARGET_COUNT=$#"
-  } > .local/review-tests.env
-
-  echo "review tests passed and were observed in output"
-}
-
-review_init() {
-  local pr="$1"
-  enter_worktree "$pr" true
-
-  local json
-  json=$(pr_meta_json "$pr")
-  write_pr_meta_files "$json"
-
-  git fetch origin "pull/$pr/head:pr-$pr" --force
-  local mb
-  mb=$(git merge-base origin/main "pr-$pr")
-
-  cat > .local/review-context.env <<EOF_ENV
-PR_NUMBER=$pr
-MERGE_BASE=$mb
-REVIEW_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-EOF_ENV
-  set_review_mode main
-
-  printf '%s\n' "$json" | jq '{number,title,url,state,isDraft,author:.author.login,base:.baseRefName,head:.headRefName,headSha:.headRefOid,headRepo:.headRepository.nameWithOwner,additions,deletions,files:(.files|length)}'
-  echo "worktree=$PWD"
-  echo "merge_base=$mb"
-  echo "branch=$(git branch --show-current)"
-  echo "wrote=.local/pr-meta.json .local/pr-meta.env .local/review-context.env .local/review-mode.env"
-  cat <<EOF_GUIDE
-Review guidance:
-- Inspect main baseline: scripts/pr review-checkout-main $pr
-- Inspect PR head:      scripts/pr review-checkout-pr $pr
-- Guard before writeout: scripts/pr review-guard $pr
-EOF_GUIDE
-}
-
-prepare_init() {
-  local pr="$1"
-  enter_worktree "$pr" true
-
-  require_artifact .local/pr-meta.env
-  require_artifact .local/review.md
-
-  if [ ! -s .local/review.json ]; then
-    echo "WARNING: .local/review.json is missing; structured findings are expected."
-  fi
-
-  # shellcheck disable=SC1091
-  source .local/pr-meta.env
-
-  local json
-  json=$(pr_meta_json "$pr")
-
-  local head
-  head=$(printf '%s\n' "$json" | jq -r .headRefName)
-  local pr_head_sha_before
-  pr_head_sha_before=$(printf '%s\n' "$json" | jq -r .headRefOid)
-
-  if [ -n "${PR_HEAD:-}" ] && [ "$head" != "$PR_HEAD" ]; then
-    echo "PR head branch changed from $PR_HEAD to $head. Re-run review-pr."
-    exit 1
-  fi
-
-  git fetch origin "pull/$pr/head:pr-$pr" --force
-  git checkout -B "pr-$pr-prep" "pr-$pr"
-  git fetch origin main
-  git rebase origin/main
-
-  cat > .local/prep-context.env <<EOF_ENV
-PR_NUMBER=$pr
-PR_HEAD=$head
-PR_HEAD_SHA_BEFORE=$pr_head_sha_before
-PREP_BRANCH=pr-$pr-prep
-PREP_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-EOF_ENV
-
-  if [ ! -f .local/prep.md ]; then
-    cat > .local/prep.md <<EOF_PREP
-# PR $pr prepare log
-
-- Initialized prepare context and rebased prep branch on origin/main.
-EOF_PREP
-  fi
-
-  echo "worktree=$PWD"
-  echo "branch=$(git branch --show-current)"
-  echo "wrote=.local/prep-context.env .local/prep.md"
-}
-
-prepare_validate_commit() {
-  local pr="$1"
-  enter_worktree "$pr" false
-  require_artifact .local/pr-meta.env
-
-  checkout_prep_branch "$pr"
-
-  # shellcheck disable=SC1091
-  source .local/pr-meta.env
-  local contrib="${PR_AUTHOR:-}"
-  local pr_number="${PR_NUMBER:-$pr}"
-
-  if [ -z "$contrib" ]; then
-    contrib=$(gh pr view "$pr" --json author --jq .author.login)
-  fi
-
-  local subject
-  subject=$(git log -1 --pretty=%s)
-
-  echo "$subject" | rg -q "openclaw#$pr_number" || {
-    echo "ERROR: commit subject missing openclaw#$pr_number"
-    exit 1
-  }
-
-  echo "$subject" | rg -q "thanks @$contrib" || {
-    echo "ERROR: commit subject missing thanks @$contrib"
-    exit 1
-  }
-
-  echo "commit subject validated: $subject"
-}
-
-validate_changelog_entry_for_pr() {
-  local pr="$1"
-  local contrib="$2"
-
-  local added_lines
-  added_lines=$(git diff --unified=0 origin/main...HEAD -- CHANGELOG.md | awk '
-    /^\+\+\+/ { next }
-    /^\+/ { print substr($0, 2) }
-  ')
-
-  if [ -z "$added_lines" ]; then
-    echo "CHANGELOG.md is in diff but no added lines were detected."
-    exit 1
-  fi
-
-  local pr_pattern
-  pr_pattern="(#$pr|openclaw#$pr)"
-
-  local with_pr
-  with_pr=$(printf '%s\n' "$added_lines" | rg -in "$pr_pattern" || true)
-  if [ -z "$with_pr" ]; then
-    echo "CHANGELOG.md update must reference PR #$pr (for example, (#$pr))."
-    exit 1
-  fi
-
-  local diff_file
-  diff_file=$(mktemp)
-  git diff --unified=0 origin/main...HEAD -- CHANGELOG.md > "$diff_file"
-
-  if ! awk -v pr_pattern="$pr_pattern" '
-BEGIN {
-  line_no = 0
-  file_line_count = 0
-  issue_count = 0
-}
-FNR == NR {
-  if ($0 ~ /^@@ /) {
-    if (match($0, /\+[0-9]+/)) {
-      line_no = substr($0, RSTART + 1, RLENGTH - 1) + 0
-    } else {
-      line_no = 0
-    }
-    next
-  }
-  if ($0 ~ /^\+\+\+/) {
-    next
-  }
-  if ($0 ~ /^\+/) {
-    if (line_no > 0) {
-      added[line_no] = 1
-      added_text = substr($0, 2)
-      if (added_text ~ pr_pattern) {
-        pr_added_lines[++pr_added_count] = line_no
-        pr_added_text[line_no] = added_text
-      }
-      line_no++
-    }
-    next
-  }
-  if ($0 ~ /^-/) {
-    next
-  }
-  if (line_no > 0) {
-    line_no++
-  }
-  next
-}
-{
-  changelog[FNR] = $0
-  file_line_count = FNR
-}
-END {
-  for (idx = 1; idx <= pr_added_count; idx++) {
-    entry_line = pr_added_lines[idx]
-    section_line = 0
-    for (i = entry_line; i >= 1; i--) {
-      if (changelog[i] ~ /^### /) {
-        section_line = i
-        break
-      }
-      if (changelog[i] ~ /^## /) {
-        break
-      }
-    }
-    if (section_line == 0) {
-      printf "CHANGELOG.md entry must be inside a subsection (### ...): line %d: %s\n", entry_line, pr_added_text[entry_line]
-      issue_count++
-      continue
-    }
-
-    section_name = changelog[section_line]
-    next_heading = file_line_count + 1
-    for (i = entry_line + 1; i <= file_line_count; i++) {
-      if (changelog[i] ~ /^### / || changelog[i] ~ /^## /) {
-        next_heading = i
-        break
-      }
-    }
-
-    for (i = entry_line + 1; i < next_heading; i++) {
-      line_text = changelog[i]
-      if (line_text ~ /^[[:space:]]*$/) {
-        continue
-      }
-      if (i in added) {
-        continue
-      }
-      printf "CHANGELOG.md PR-linked entry must be appended at the end of section %s: line %d: %s\n", section_name, entry_line, pr_added_text[entry_line]
-      printf "Found existing non-added line below it at line %d: %s\n", i, line_text
-      issue_count++
-      break
-    }
-  }
-
-  if (issue_count > 0) {
-    print "Move this PR changelog entry to the end of its section (just before the next heading)."
-    exit 1
-  }
-}
-' "$diff_file" CHANGELOG.md; then
-    rm -f "$diff_file"
-    exit 1
-  fi
-  rm -f "$diff_file"
-  echo "changelog placement validated: PR-linked entries are appended at section tail"
-
-  if [ -n "$contrib" ] && [ "$contrib" != "null" ]; then
-    local with_pr_and_thanks
-    with_pr_and_thanks=$(printf '%s\n' "$added_lines" | rg -in "$pr_pattern" | rg -i "thanks @$contrib" || true)
-    if [ -z "$with_pr_and_thanks" ]; then
-      echo "CHANGELOG.md update must include both PR #$pr and thanks @$contrib on the changelog entry line."
-      exit 1
-    fi
-    echo "changelog validated: found PR #$pr + thanks @$contrib"
-    return 0
-  fi
-
-  echo "changelog validated: found PR #$pr (contributor handle unavailable, skipping thanks check)"
-}
-
-validate_changelog_merge_hygiene() {
-  local diff
-  diff=$(git diff --unified=0 origin/main...HEAD -- CHANGELOG.md)
-
-  local removed_lines
-  removed_lines=$(printf '%s\n' "$diff" | awk '
-    /^---/ { next }
-    /^-/ { print substr($0, 2) }
-  ')
-  if [ -z "$removed_lines" ]; then
-    return 0
-  fi
-
-  local removed_refs
-  removed_refs=$(printf '%s\n' "$removed_lines" | rg -o '#[0-9]+' | sort -u || true)
-  if [ -z "$removed_refs" ]; then
-    return 0
-  fi
-
-  local added_lines
-  added_lines=$(printf '%s\n' "$diff" | awk '
-    /^\+\+\+/ { next }
-    /^\+/ { print substr($0, 2) }
-  ')
-
-  local ref
-  while IFS= read -r ref; do
-    [ -z "$ref" ] && continue
-    if ! printf '%s\n' "$added_lines" | rg -q -F "$ref"; then
-      echo "CHANGELOG.md drops existing entry reference $ref without re-adding it."
-      echo "Likely merge conflict loss; restore the dropped entry (or keep the same PR ref in rewritten text)."
-      exit 1
-    fi
-  done <<<"$removed_refs"
-
-  echo "changelog merge hygiene validated: no dropped PR references"
-}
-
-prepare_gates() {
-  local pr="$1"
-  enter_worktree "$pr" false
-
-  checkout_prep_branch "$pr"
-  bootstrap_deps_if_needed
-  require_artifact .local/pr-meta.env
-  # shellcheck disable=SC1091
-  source .local/pr-meta.env
-
-  local changed_files
-  changed_files=$(git diff --name-only origin/main...HEAD)
-  local non_docs
-  non_docs=$(printf '%s\n' "$changed_files" | grep -Ev '^(docs/|README.*\.md$|CHANGELOG\.md$|.*\.md$|.*\.mdx$|mintlify\.json$|docs\.json$)' || true)
-
-  local docs_only=false
-  if [ -n "$changed_files" ] && [ -z "$non_docs" ]; then
-    docs_only=true
-  fi
-
-  local has_changelog_update=false
-  if printf '%s\n' "$changed_files" | rg -q '^CHANGELOG\.md$'; then
-    has_changelog_update=true
-  fi
-
-  local unsupported_changelog_fragments
-  unsupported_changelog_fragments=$(printf '%s\n' "$changed_files" | rg '^changelog/fragments/' || true)
-  if [ -n "$unsupported_changelog_fragments" ]; then
-    echo "Unsupported changelog fragment files detected:"
-    printf '%s\n' "$unsupported_changelog_fragments"
-    echo "Move changelog fragment content into CHANGELOG.md and remove changelog/fragments files."
-    exit 1
-  fi
-
-  # Enforce workflow policy: every prepared PR must include CHANGELOG.md.
-  if [ "$has_changelog_update" = "false" ]; then
-    echo "Missing changelog update. Add CHANGELOG.md changes."
-    exit 1
-  fi
-  local contrib="${PR_AUTHOR:-}"
-  validate_changelog_merge_hygiene
-  validate_changelog_entry_for_pr "$pr" "$contrib"
-
-  run_quiet_logged "pnpm build" ".local/gates-build.log" pnpm build
-  run_quiet_logged "pnpm check" ".local/gates-check.log" pnpm check
-
-  if [ "$docs_only" = "true" ]; then
-    echo "Docs-only change detected with high confidence; skipping pnpm test."
-  else
-    run_quiet_logged "pnpm test" ".local/gates-test.log" pnpm test
-  fi
-
-  cat > .local/gates.env <<EOF_ENV
-PR_NUMBER=$pr
-DOCS_ONLY=$docs_only
-GATES_PASSED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-EOF_ENV
-
-  echo "docs_only=$docs_only"
-  echo "wrote=.local/gates.env"
-}
-
-prepare_push() {
-  local pr="$1"
-  enter_worktree "$pr" false
-
-  require_artifact .local/pr-meta.env
-  require_artifact .local/prep-context.env
-  require_artifact .local/gates.env
-
-  checkout_prep_branch "$pr"
-
-  # shellcheck disable=SC1091
-  source .local/pr-meta.env
-  # shellcheck disable=SC1091
-  source .local/prep-context.env
-  # shellcheck disable=SC1091
-  source .local/gates.env
-
-  local prep_head_sha
-  prep_head_sha=$(git rev-parse HEAD)
-
-  local lease_sha
-  lease_sha=$(gh pr view "$pr" --json headRefOid --jq .headRefOid)
-  local push_result_env=".local/prepare-push-result.env"
-
-  verify_pr_head_branch_matches_expected "$pr" "$PR_HEAD"
-  push_prep_head_to_pr_branch "$pr" "$PR_HEAD" "$prep_head_sha" "$lease_sha" true "${DOCS_ONLY:-false}" "$push_result_env"
-  # shellcheck disable=SC1090
-  source "$push_result_env"
-  prep_head_sha="$PUSH_PREP_HEAD_SHA"
-  local pushed_from_sha="$PUSHED_FROM_SHA"
-  local pr_head_sha_after="$PR_HEAD_SHA_AFTER_PUSH"
-
-  local contrib="${PR_AUTHOR:-}"
-  if [ -z "$contrib" ]; then
-    contrib=$(gh pr view "$pr" --json author --jq .author.login)
-  fi
-  local contrib_id
-  contrib_id=$(gh api "users/$contrib" --jq .id)
-  local coauthor_email="${contrib_id}+${contrib}@users.noreply.github.com"
-
-  cat >> .local/prep.md <<EOF_PREP
-- Gates passed and push succeeded to branch $PR_HEAD.
-- Verified PR head SHA matches local prep HEAD.
-- Verified PR head contains origin/main.
-EOF_PREP
-
-  cat > .local/prep.env <<EOF_ENV
-PR_NUMBER=$PR_NUMBER
-PR_AUTHOR=$contrib
-PR_HEAD=$PR_HEAD
-PR_HEAD_SHA_BEFORE=$pushed_from_sha
-PREP_HEAD_SHA=$prep_head_sha
-COAUTHOR_EMAIL=$coauthor_email
-EOF_ENV
-
-  ls -la .local/prep.md .local/prep.env >/dev/null
-
-  echo "prepare-push complete"
-  echo "prep_branch=$(git branch --show-current)"
-  echo "prep_head_sha=$prep_head_sha"
-  echo "pr_head_sha=$pr_head_sha_after"
-  echo "artifacts=.local/prep.md .local/prep.env"
-}
-
-prepare_sync_head() {
-  local pr="$1"
-  enter_worktree "$pr" false
-
-  require_artifact .local/pr-meta.env
-  require_artifact .local/prep-context.env
-
-  checkout_prep_branch "$pr"
-
-  # shellcheck disable=SC1091
-  source .local/pr-meta.env
-  # shellcheck disable=SC1091
-  source .local/prep-context.env
-
-  local prep_head_sha
-  prep_head_sha=$(git rev-parse HEAD)
-
-  local lease_sha
-  lease_sha=$(gh pr view "$pr" --json headRefOid --jq .headRefOid)
-  local push_result_env=".local/prepare-sync-result.env"
-
-  verify_pr_head_branch_matches_expected "$pr" "$PR_HEAD"
-  push_prep_head_to_pr_branch "$pr" "$PR_HEAD" "$prep_head_sha" "$lease_sha" false false "$push_result_env"
-  # shellcheck disable=SC1090
-  source "$push_result_env"
-  prep_head_sha="$PUSH_PREP_HEAD_SHA"
-  local pushed_from_sha="$PUSHED_FROM_SHA"
-  local pr_head_sha_after="$PR_HEAD_SHA_AFTER_PUSH"
-
-  local contrib="${PR_AUTHOR:-}"
-  if [ -z "$contrib" ]; then
-    contrib=$(gh pr view "$pr" --json author --jq .author.login)
-  fi
-  local contrib_id
-  contrib_id=$(gh api "users/$contrib" --jq .id)
-  local coauthor_email="${contrib_id}+${contrib}@users.noreply.github.com"
-
-  cat >> .local/prep.md <<EOF_PREP
-- Prep head sync completed to branch $PR_HEAD.
-- Verified PR head SHA matches local prep HEAD.
-- Verified PR head contains origin/main.
-- Note: prep sync flow does not re-run prepare gates.
-EOF_PREP
-
-  cat > .local/prep.env <<EOF_ENV
-PR_NUMBER=$PR_NUMBER
-PR_AUTHOR=$contrib
-PR_HEAD=$PR_HEAD
-PR_HEAD_SHA_BEFORE=$pushed_from_sha
-PREP_HEAD_SHA=$prep_head_sha
-COAUTHOR_EMAIL=$coauthor_email
-EOF_ENV
-
-  ls -la .local/prep.md .local/prep.env >/dev/null
-
-  echo "prepare-sync-head complete"
-  echo "prep_branch=$(git branch --show-current)"
-  echo "prep_head_sha=$prep_head_sha"
-  echo "pr_head_sha=$pr_head_sha_after"
-  echo "artifacts=.local/prep.md .local/prep.env"
-}
-
-prepare_run() {
-  local pr="$1"
-  prepare_init "$pr"
-  prepare_validate_commit "$pr"
-  prepare_gates "$pr"
-  prepare_push "$pr"
-  echo "prepare-run complete for PR #$pr"
-}
-
-is_mainline_drift_critical_path_for_merge() {
-  local path="$1"
-  case "$path" in
-    package.json|pnpm-lock.yaml|pnpm-workspace.yaml|.npmrc|.oxlintrc.json|.oxfmtrc.json|tsconfig.json|tsconfig.*.json|vitest.config.ts|vitest.*.config.ts|scripts/*|.github/workflows/*)
-      return 0
-      ;;
-  esac
-  return 1
-}
-
-print_file_list_with_limit() {
-  local label="$1"
-  local file_path="$2"
-  local limit="${3:-12}"
-
-  if [ ! -s "$file_path" ]; then
-    return 0
-  fi
-
-  local count
-  count=$(wc -l < "$file_path" | tr -d ' ')
-  echo "$label ($count):"
-  sed -n "1,${limit}p" "$file_path" | sed 's/^/  - /'
-  if [ "$count" -gt "$limit" ]; then
-    echo "  ... +$((count - limit)) more"
-  fi
-}
-
-mainline_drift_requires_sync() {
-  local prep_head_sha="$1"
-
-  require_artifact .local/pr-meta.json
-
-  if ! git cat-file -e "${prep_head_sha}^{commit}" 2>/dev/null; then
-    echo "Mainline drift relevance: prep head $prep_head_sha is missing locally; require sync."
-    return 0
-  fi
-
-  local delta_file
-  local pr_files_file
-  local overlap_file
-  local critical_file
-  delta_file=$(mktemp)
-  pr_files_file=$(mktemp)
-  overlap_file=$(mktemp)
-  critical_file=$(mktemp)
-
-  git diff --name-only "${prep_head_sha}..origin/main" | sed '/^$/d' | sort -u > "$delta_file"
-  jq -r '.files[]?.path // empty' .local/pr-meta.json | sed '/^$/d' | sort -u > "$pr_files_file"
-  comm -12 "$delta_file" "$pr_files_file" > "$overlap_file" || true
-
-  local path
-  while IFS= read -r path; do
-    [ -n "$path" ] || continue
-    if is_mainline_drift_critical_path_for_merge "$path"; then
-      printf '%s\n' "$path" >> "$critical_file"
-    fi
-  done < "$delta_file"
-
-  local delta_count
-  local overlap_count
-  local critical_count
-  delta_count=$(wc -l < "$delta_file" | tr -d ' ')
-  overlap_count=$(wc -l < "$overlap_file" | tr -d ' ')
-  critical_count=$(wc -l < "$critical_file" | tr -d ' ')
-
-  if [ "$delta_count" -eq 0 ]; then
-    echo "Mainline drift relevance: unable to enumerate drift files; require sync."
-    rm -f "$delta_file" "$pr_files_file" "$overlap_file" "$critical_file"
-    return 0
-  fi
-
-  if [ "$overlap_count" -gt 0 ] || [ "$critical_count" -gt 0 ]; then
-    echo "Mainline drift relevance: sync required before merge."
-    print_file_list_with_limit "Mainline files overlapping PR touched files" "$overlap_file"
-    print_file_list_with_limit "Mainline files touching merge-critical infrastructure" "$critical_file"
-    rm -f "$delta_file" "$pr_files_file" "$overlap_file" "$critical_file"
-    return 0
-  fi
-
-  echo "Mainline drift relevance: no overlap with PR files and no critical infra drift."
-  print_file_list_with_limit "Mainline-only drift files" "$delta_file"
-  rm -f "$delta_file" "$pr_files_file" "$overlap_file" "$critical_file"
-  return 1
-}
-
-merge_verify() {
-  local pr="$1"
-  enter_worktree "$pr" false
-
-  require_artifact .local/prep.env
-  # shellcheck disable=SC1091
-  source .local/prep.env
-  verify_prep_branch_matches_prepared_head "$pr" "$PREP_HEAD_SHA"
-
-  local json
-  json=$(pr_meta_json "$pr")
-  local is_draft
-  is_draft=$(printf '%s\n' "$json" | jq -r .isDraft)
-  if [ "$is_draft" = "true" ]; then
-    echo "PR is draft."
-    exit 1
-  fi
-  local pr_head_sha
-  pr_head_sha=$(printf '%s\n' "$json" | jq -r .headRefOid)
-
-  if [ "$pr_head_sha" != "$PREP_HEAD_SHA" ]; then
-    echo "PR head changed after prepare (expected $PREP_HEAD_SHA, got $pr_head_sha)."
-    echo "Re-run prepare to refresh prep artifacts and gates: scripts/pr-prepare run $pr"
-
-    # Best-effort delta summary to show exactly what changed since PREP_HEAD_SHA.
-    git fetch origin "pull/$pr/head" >/dev/null 2>&1 || true
-    if git cat-file -e "${PREP_HEAD_SHA}^{commit}" 2>/dev/null && git cat-file -e "${pr_head_sha}^{commit}" 2>/dev/null; then
-      echo "HEAD delta (expected...current):"
-      git log --oneline --left-right "${PREP_HEAD_SHA}...${pr_head_sha}" | sed 's/^/  /' || true
-    else
-      echo "HEAD delta unavailable locally (could not resolve one of the SHAs)."
+    echo "Missing required command(s): ${missing[*]}" >&2
+    if [[ " ${missing[*]} " = *" rg "* ]]; then
+      echo "Install ripgrep and retry: https://github.com/BurntSushi/ripgrep#installation" >&2
     fi
     exit 1
   fi
-
-  gh pr checks "$pr" --required --watch --fail-fast >.local/merge-checks-watch.log 2>&1 || true
-  local checks_json
-  local checks_err_file
-  checks_err_file=$(mktemp)
-  checks_json=$(gh pr checks "$pr" --required --json name,bucket,state 2>"$checks_err_file" || true)
-  rm -f "$checks_err_file"
-  if [ -z "$checks_json" ]; then
-    checks_json='[]'
-  fi
-  local required_count
-  required_count=$(printf '%s\n' "$checks_json" | jq 'length')
-  if [ "$required_count" -eq 0 ]; then
-    echo "No required checks configured for this PR."
-  fi
-  printf '%s\n' "$checks_json" | jq -r '.[] | "\(.bucket)\t\(.name)\t\(.state)"'
-
-  local failed_required
-  failed_required=$(printf '%s\n' "$checks_json" | jq '[.[] | select(.bucket=="fail")] | length')
-  local pending_required
-  pending_required=$(printf '%s\n' "$checks_json" | jq '[.[] | select(.bucket=="pending")] | length')
-
-  if [ "$failed_required" -gt 0 ]; then
-    echo "Required checks are failing."
-    exit 1
-  fi
-
-  if [ "$pending_required" -gt 0 ]; then
-    echo "Required checks are still pending."
-    exit 1
-  fi
-
-  git fetch origin main
-  git fetch origin "pull/$pr/head:pr-$pr" --force
-  if ! git merge-base --is-ancestor origin/main "pr-$pr"; then
-    echo "PR branch is behind main."
-    if mainline_drift_requires_sync "$PREP_HEAD_SHA"; then
-      echo "Merge verify failed: mainline drift is relevant to this PR; refresh prep head before merge."
-      exit 1
-    fi
-    echo "Merge verify: continuing without prep-head sync because behind-main drift is unrelated."
-  fi
-
-  echo "merge-verify passed for PR #$pr"
 }
 
-merge_run() {
+require_main_target_pr() {
   local pr="$1"
-  enter_worktree "$pr" false
-
-  local required
-  for required in .local/review.md .local/review.json .local/prep.md .local/prep.env; do
-    require_artifact "$required"
-  done
-
-  merge_verify "$pr"
-  # shellcheck disable=SC1091
-  source .local/prep.env
-
-  local pr_meta_json
-  pr_meta_json=$(gh pr view "$pr" --json number,title,state,isDraft,author)
-  local pr_title
-  pr_title=$(printf '%s\n' "$pr_meta_json" | jq -r .title)
-  local pr_number
-  pr_number=$(printf '%s\n' "$pr_meta_json" | jq -r .number)
-  local contrib
-  contrib=$(printf '%s\n' "$pr_meta_json" | jq -r .author.login)
-  local is_draft
-  is_draft=$(printf '%s\n' "$pr_meta_json" | jq -r .isDraft)
-  if [ "$is_draft" = "true" ]; then
-    echo "PR is draft; stop."
+  local base base_json
+  pr_observe "$pr" || exit 1
+  base_json="$PR_OBSERVATION"
+  base=$(pr_view_string_field "$base_json" "baseRefName" "$pr" "Retry the scripts/pr command.") || exit 1
+  if [ "$base" != "main" ]; then
+    echo "scripts/pr prepare and merge commands only support PRs targeting main; PR #$pr targets $base." >&2
+    echo "Use the reviewed release-branch landing flow for non-main PRs." >&2
     exit 1
   fi
-
-  local reviewer
-  reviewer=$(gh api user --jq .login)
-  local reviewer_id
-  reviewer_id=$(gh api user --jq .id)
-
-  local contrib_coauthor_email="${COAUTHOR_EMAIL:-}"
-  if [ -z "$contrib_coauthor_email" ] || [ "$contrib_coauthor_email" = "null" ]; then
-    local contrib_id
-    contrib_id=$(gh api "users/$contrib" --jq .id)
-    contrib_coauthor_email="${contrib_id}+${contrib}@users.noreply.github.com"
-  fi
-
-  local reviewer_email_candidates=()
-  local reviewer_email_candidate
-  while IFS= read -r reviewer_email_candidate; do
-    [ -n "$reviewer_email_candidate" ] || continue
-    reviewer_email_candidates+=("$reviewer_email_candidate")
-  done < <(merge_author_email_candidates "$reviewer" "$reviewer_id")
-  if [ "${#reviewer_email_candidates[@]}" -eq 0 ]; then
-    echo "Unable to resolve a candidate merge author email for reviewer $reviewer"
-    exit 1
-  fi
-
-  local reviewer_email="${reviewer_email_candidates[0]}"
-  local reviewer_coauthor_email="${reviewer_id}+${reviewer}@users.noreply.github.com"
-
-  cat > .local/merge-body.txt <<EOF_BODY
-Merged via squash.
-
-Prepared head SHA: $PREP_HEAD_SHA
-Co-authored-by: $contrib <$contrib_coauthor_email>
-Co-authored-by: $reviewer <$reviewer_coauthor_email>
-Reviewed-by: @$reviewer
-EOF_BODY
-
-  run_merge_with_email() {
-    local email="$1"
-    local merge_output_file
-    merge_output_file=$(mktemp)
-    if gh pr merge "$pr" \
-      --squash \
-      --delete-branch \
-      --match-head-commit "$PREP_HEAD_SHA" \
-      --author-email "$email" \
-      --subject "$pr_title (#$pr_number)" \
-      --body-file .local/merge-body.txt \
-      >"$merge_output_file" 2>&1
-    then
-      rm -f "$merge_output_file"
-      return 0
-    fi
-
-    MERGE_ERR_MSG=$(cat "$merge_output_file")
-    print_relevant_log_excerpt "$merge_output_file"
-    rm -f "$merge_output_file"
-    return 1
-  }
-
-  local MERGE_ERR_MSG=""
-  local selected_merge_author_email="$reviewer_email"
-  if ! run_merge_with_email "$selected_merge_author_email"; then
-    if is_author_email_merge_error "$MERGE_ERR_MSG" && [ "${#reviewer_email_candidates[@]}" -ge 2 ]; then
-      selected_merge_author_email="${reviewer_email_candidates[1]}"
-      echo "Retrying merge once with fallback author email: $selected_merge_author_email"
-      run_merge_with_email "$selected_merge_author_email" || {
-        echo "Merge failed after fallback retry."
-        exit 1
-      }
-    else
-      echo "Merge failed."
-      exit 1
-    fi
-  fi
-
-  local state
-  state=$(gh pr view "$pr" --json state --jq .state)
-  if [ "$state" != "MERGED" ]; then
-    echo "Merge not finalized yet (state=$state), waiting up to 15 minutes..."
-    local i
-    for i in $(seq 1 90); do
-      sleep 10
-      state=$(gh pr view "$pr" --json state --jq .state)
-      if [ "$state" = "MERGED" ]; then
-        break
-      fi
-    done
-  fi
-
-  if [ "$state" != "MERGED" ]; then
-    echo "PR state is $state after waiting."
-    exit 1
-  fi
-
-  local merge_sha
-  merge_sha=$(gh pr view "$pr" --json mergeCommit --jq '.mergeCommit.oid')
-  if [ -z "$merge_sha" ] || [ "$merge_sha" = "null" ]; then
-    echo "Merge commit SHA missing."
-    exit 1
-  fi
-  local repo_nwo
-  repo_nwo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
-
-  local merge_sha_url=""
-  if gh api repos/:owner/:repo/commits/"$merge_sha" >/dev/null 2>&1; then
-    merge_sha_url="https://github.com/$repo_nwo/commit/$merge_sha"
-  else
-    echo "Merge commit is not resolvable via repository commit endpoint: $merge_sha"
-    exit 1
-  fi
-
-  local prep_sha_url=""
-  if gh api repos/:owner/:repo/commits/"$PREP_HEAD_SHA" >/dev/null 2>&1; then
-    prep_sha_url="https://github.com/$repo_nwo/commit/$PREP_HEAD_SHA"
-  else
-    local pr_commit_count
-    pr_commit_count=$(gh pr view "$pr" --json commits --jq "[.commits[].oid | select(. == \"$PREP_HEAD_SHA\")] | length")
-    if [ "${pr_commit_count:-0}" -gt 0 ]; then
-      prep_sha_url="https://github.com/$repo_nwo/pull/$pr/commits/$PREP_HEAD_SHA"
-    fi
-  fi
-  if [ -z "$prep_sha_url" ]; then
-    echo "Prepared head SHA is not resolvable in repo commits or PR commit list: $PREP_HEAD_SHA"
-    exit 1
-  fi
-
-  local commit_body
-  commit_body=$(gh api repos/:owner/:repo/commits/"$merge_sha" --jq .commit.message)
-  printf '%s\n' "$commit_body" | rg -q "^Co-authored-by: $contrib <" || { echo "Missing PR author co-author trailer"; exit 1; }
-  printf '%s\n' "$commit_body" | rg -q "^Co-authored-by: $reviewer <" || { echo "Missing reviewer co-author trailer"; exit 1; }
-
-  local ok=0
-  local comment_output=""
-  local attempt
-  for attempt in 1 2 3; do
-    if comment_output=$(gh pr comment "$pr" -F - 2>&1 <<EOF_COMMENT
-Merged via squash.
-
-- Prepared head SHA: [$PREP_HEAD_SHA]($prep_sha_url)
-- Merge commit: [$merge_sha]($merge_sha_url)
-
-Thanks @$contrib!
-EOF_COMMENT
-); then
-      ok=1
-      break
-    fi
-    sleep 2
-  done
-  [ "$ok" -eq 1 ] || { echo "Failed to post PR comment after retries"; exit 1; }
-
-  local comment_url=""
-  comment_url=$(printf '%s\n' "$comment_output" | rg -o 'https://github.com/[^ ]+/pull/[0-9]+#issuecomment-[0-9]+' -m1 || true)
-  if [ -z "$comment_url" ]; then
-    comment_url="unresolved"
-  fi
-
-  local root
-  root=$(repo_root)
-  cd "$root"
-  git worktree remove ".worktrees/pr-$pr" --force
-  git branch -D "temp/pr-$pr" 2>/dev/null || true
-  git branch -D "pr-$pr" 2>/dev/null || true
-  git branch -D "pr-$pr-prep" 2>/dev/null || true
-
-  local pr_url
-  pr_url=$(gh pr view "$pr" --json url --jq .url)
-
-  echo "merge-run complete for PR #$pr"
-  echo "merge commit: $merge_sha"
-  echo "merge author email: $selected_merge_author_email"
-  echo "completion comment: $comment_url"
-  echo "$pr_url"
 }
+
+# shellcheck disable=SC1091
+source "$script_parent_dir/pr-lib/worktree.sh"
+# shellcheck disable=SC1091
+source "$script_parent_dir/pr-lib/operation-lock.sh"
+# shellcheck disable=SC1091
+source "$script_parent_dir/pr-lib/common.sh"
+# shellcheck disable=SC1091
+source "$script_parent_dir/pr-lib/changelog.sh"
+# shellcheck disable=SC1091
+source "$script_parent_dir/pr-lib/gates.sh"
+# shellcheck disable=SC1091
+source "$script_parent_dir/pr-lib/push.sh"
+# shellcheck disable=SC1091
+source "$script_parent_dir/pr-lib/review.sh"
+# shellcheck disable=SC1091
+source "$script_parent_dir/pr-lib/prepare-core.sh"
+# shellcheck disable=SC1091
+source "$script_parent_dir/pr-lib/merge.sh"
 
 main() {
-  if [ "$#" -lt 2 ]; then
+  if [ "$#" -lt 1 ]; then
     usage
     exit 2
   fi
-
-  require_cmds
 
   local cmd="${1-}"
   shift || true
-  local pr="${1-}"
-  shift || true
 
-  if [ -z "$cmd" ] || [ -z "$pr" ]; then
-    usage
-    exit 2
+  if [ "$cmd" = "lock-recover" ]; then
+    local pr="${1-}"
+    local owner_oid="${2-}"
+    local confirmation="${3-}"
+    [ -n "$pr" ] && [ -n "$owner_oid" ] && [ "$#" -eq 3 ] || { usage; exit 2; }
+    recover_pr_operation_lock "$pr" "$owner_oid" "$confirmation"
+    return
   fi
 
   case "$cmd" in
+    ls) ;;
+    workspace)
+      [ "$#" -eq 1 ] && is_canonical_pr_number "$1" || { usage; exit 2; }
+      # No GitHub tooling, dependency installation, or PR lock is needed to locate artifacts.
+      show_pr_workspace "$1"
+      return
+      ;;
+    gc)
+      local gc_dry_run=false gc_pr=""
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --dry-run)
+            [ "$gc_dry_run" = false ] || { usage; exit 2; }
+            gc_dry_run=true
+            shift
+            ;;
+          --pr)
+            [ -z "$gc_pr" ] && [ "$#" -ge 2 ] && is_canonical_pr_number "$2" || { usage; exit 2; }
+            gc_pr="$2"
+            shift 2
+            ;;
+          *) usage; exit 2 ;;
+        esac
+      done
+      ;;
+    tooling-recover)
+      [ "$#" -eq 5 ] && is_canonical_pr_number "$1" && [ "$3" = --plan-sha256 ] &&
+        [[ "$4" =~ ^[0-9a-f]{64}$ ]] && [ "$5" = --confirmed-quiescent ] || { usage; exit 2; }
+      ;;
+    review-tests)
+      [ "$#" -ge 2 ] || { usage; exit 2; }
+      ;;
+    merge-complete)
+      [ "$#" -eq 3 ] && is_canonical_pr_number "$1" &&
+        [[ "$2" =~ ^[0-9a-f]{40}$ ]] && [ "$3" = --confirmed-operator-completion ] || { usage; exit 2; }
+      ;;
+    merge-run | merge-recover)
+      local merge_pr="${1-}" auto_merge=false recovery_oid="" merged_head="" observed_head="" replacement_head="" body_path="" legacy_directory="" cancel_auto=false refusal_directory="" admin_evidence="" confirmed_admin=false
+      [ -n "$merge_pr" ] || { usage; exit 2; }
+      shift
+      if [ "$cmd" = merge-recover ]; then
+        [ "$#" -ge 2 ] && is_canonical_pr_number "$merge_pr" &&
+          [[ "$1" =~ ^[0-9a-f]{40}$ ]] && [ "$2" = --confirmed-operator-recovery ] || { usage; exit 2; }
+        recovery_oid="$1"
+        shift 2
+      fi
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --current-workflow)
+            [ "$cmd" = merge-recover ] && [ -n "$PR_WORKFLOW_RECOVERY_OUTCOME" ] || { usage; exit 2; }
+            shift
+            ;;
+          --cancel-auto)
+            [ "$cmd" = merge-recover ] && [ "$cancel_auto" = false ] || { usage; exit 2; }
+            cancel_auto=true
+            shift
+            ;;
+          --observed-head)
+            [ "$cmd" = merge-recover ] && [ "$#" -ge 2 ] &&
+              [[ "$2" =~ ^[0-9a-f]{40}$ ]] && [ -z "$observed_head" ] || { usage; exit 2; }
+            observed_head="$2"
+            shift 2
+            ;;
+          --admin-evidence)
+            [ "$#" -ge 2 ] && [ -n "$2" ] && [ -z "$admin_evidence" ] || { usage; exit 2; }
+            admin_evidence="$2"
+            shift 2
+            ;;
+          --confirmed-operator-admin)
+            [ "$confirmed_admin" = false ] || { usage; exit 2; }
+            confirmed_admin=true
+            shift
+            ;;
+          --auto-merge)
+            [ "$auto_merge" = false ] || { usage; exit 2; }
+            auto_merge=true
+            shift
+            ;;
+          --body-file)
+            [ "$#" -ge 2 ] && [ -n "$2" ] && [ -z "$body_path" ] || { usage; exit 2; }
+            body_path="$2"
+            shift 2
+            ;;
+          --pre-dispatch-refusal)
+            [ "$cmd" = merge-recover ] && [ "$#" -ge 2 ] && [ -n "$2" ] && [ -z "$refusal_directory" ] || { usage; exit 2; }
+            refusal_directory="$2"
+            shift 2
+            ;;
+          --legacy-refusal)
+            [ "$cmd" = merge-recover ] && [ "$#" -ge 2 ] && [ -n "$2" ] && [ -z "$legacy_directory" ] || { usage; exit 2; }
+            legacy_directory="$2"
+            shift 2
+            ;;
+          --merged-head)
+            [ "$cmd" = merge-recover ] && [ "$#" -ge 2 ] &&
+              [[ "$2" =~ ^[0-9a-f]{40}$ ]] && [ -z "$merged_head" ] || { usage; exit 2; }
+            merged_head="$2"
+            shift 2
+            ;;
+          --replacement-head)
+            [ "$cmd" = merge-recover ] && [ "$#" -ge 2 ] &&
+              [[ "$2" =~ ^[0-9a-f]{40}$ ]] && [ -z "$replacement_head" ] || { usage; exit 2; }
+            replacement_head="$2"
+            shift 2
+            ;;
+          *) usage; exit 2 ;;
+        esac
+      done
+      if [ "$cmd" = merge-run ] && [ "${OPENCLAW_PR_AUTO_MERGE:-}" = 1 ]; then
+        auto_merge=true
+      fi
+      if [ -n "$admin_evidence" ] || [ "$confirmed_admin" = true ]; then
+        [ -n "$admin_evidence" ] && [ "$confirmed_admin" = true ] && [ "$auto_merge" = false ] &&
+          [ -z "$legacy_directory$refusal_directory" ] && [ "$cancel_auto" = false ] &&
+          [ "${OPENCLAW_PR_MERGE_METHOD:-squash}" = squash ] || { usage; exit 2; }
+      fi
+      if [ "$cmd" = merge-recover ] && [ "$auto_merge" = true ]; then
+        [ -n "$replacement_head" ] && [ -z "$body_path$legacy_directory$refusal_directory$admin_evidence" ] &&
+          [ "$confirmed_admin" = false ] && [ "$cancel_auto" = false ] || { usage; exit 2; }
+      fi
+      if [ -n "$merged_head" ]; then
+        [ -z "$replacement_head$body_path$legacy_directory$refusal_directory$admin_evidence" ] &&
+          [ "$cancel_auto" = false ] && [ "$auto_merge" = false ] && [ "$confirmed_admin" = false ] || { usage; exit 2; }
+      fi
+      [ -z "$legacy_directory" ] || [ -n "$replacement_head" ] || { usage; exit 2; }
+      [ -z "$refusal_directory" ] || [ -z "$legacy_directory" ] || { usage; exit 2; }
+      [ "$cancel_auto" = false ] || [ -z "$replacement_head$body_path$legacy_directory$refusal_directory" ] || { usage; exit 2; }
+      [ -z "$observed_head" ] || [ "$cancel_auto" = true ] || { usage; exit 2; }
+      set -- "$merge_pr"
+      ;;
+    prepare-push)
+      if [ "$#" -ne 1 ]; then
+        [ "$#" -eq 3 ] && [ "$2" = --resume-crabbox-run ] &&
+          [[ "$3" =~ ^[1-9][0-9]*$ ]] &&
+          { [ "${#3}" -lt 16 ] || { [ "${#3}" -eq 16 ] && [[ "$3" < 9007199254740992 ]]; }; } || { usage; exit 2; }
+      fi
+      ;;
+    ci-dispatch)
+      [ "$#" -eq 1 ] || { [ "$#" -eq 3 ] && [ "$2" = --backend ] && [ "$3" = crabbox ]; } || { usage; exit 2; }
+      ;;
+    review-init | review-checkout-main | review-checkout-pr | review-claim | review-guard | review-artifacts-init | review-validate-artifacts | prepare-init | prepare-correction-init | prepare-correction-continue | prepare-correction-review-init | prepare-baseline-refresh | prepare-baseline-successor | prepare-baseline-signing-request | prepare-baseline-signing-continue | prepare-validate-commit | prepare-gates | prepare-sync-head | prepare-run | merge-verify)
+      [ "$#" -ge 1 ] || { usage; exit 2; }
+      ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+
+  # Reject contradictory instructions before PR reads, locks, or preparation can
+  # retire valid evidence. prepare-push can refresh a head and rerun gates too.
+  case "$cmd" in
+    prepare-run | prepare-gates | prepare-push)
+      resolve_pr_gates_remote_mode >/dev/null || return $?
+      ;;
+  esac
+
+  require_cmds
+
+  case "$cmd" in
+    review-validate-artifacts) review_artifact_preflight "${1-}" || return 1 ;;
+    prepare-init | prepare-run) review_artifact_preflight "${1-}" true || return 1 ;;
+    prepare-correction-init) review_artifact_preflight "${1-}" correction || return 1 ;;
+  esac
+
+  # merge-run reconciles retained outcomes before reading disposable artifacts or base guards.
+  if [ "$cmd" != merge-run ] && is_main_only_pr_command "$cmd"; then
+    require_main_target_pr "${1-}"
+  fi
+
+  if is_locked_pr_command "$cmd"; then
+    local locked_pr="${1-}"
+    acquire_pr_operation_lock "$locked_pr"
+    begin_pr_operation_validation_phase
+    # Temp-backed shell redirections must fail while the supervisor can auto-release.
+    validate_pr_temp_storage
+    if [ "$PR_WORKFLOW_BOOTSTRAP" = 1 ] && [ "$cmd" = prepare-push ] && [ "${2:-}" = --resume-crabbox-run ]; then
+      echo "Publisher resume requires an authenticated workflow source; restore its main tracking anchor before resuming. No acquisition attempted." >&2
+      return 1
+    fi
+    [ -z "$PR_WORKFLOW_PR" ] || ensure_gh_api_auth
+    admit_pr_workflow_binding "$locked_pr"
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 131' QUIT
+    trap 'exit 143' TERM
+  fi
+
+  case "$cmd" in
+    tooling-recover)
+      mark_pr_operation_side_effects_started
+      node "$script_parent_dir/pr-lib/materialize-dependencies.mjs" --recover "$1" "$2" "$4" \
+        "$(repo_root)" "$PR_OPERATION_LOCK_REF" "$PR_OPERATION_LOCK_OWNER_OID"
+      ;;
+    ls)
+      list_pr_worktrees
+      ;;
+    gc)
+      gc_pr_worktrees "$gc_dry_run" "$gc_pr"
+      ;;
     review-init)
+      local pr="${1-}"
+      [ -n "$pr" ] || { usage; exit 2; }
       review_init "$pr"
       ;;
     review-checkout-main)
+      local pr="${1-}"
+      [ -n "$pr" ] || { usage; exit 2; }
       review_checkout_main "$pr"
       ;;
     review-checkout-pr)
+      local pr="${1-}"
+      [ -n "$pr" ] || { usage; exit 2; }
       review_checkout_pr "$pr"
       ;;
     review-claim)
+      local pr="${1-}"
+      [ -n "$pr" ] || { usage; exit 2; }
       review_claim "$pr"
       ;;
     review-guard)
+      local pr="${1-}"
+      [ -n "$pr" ] || { usage; exit 2; }
       review_guard "$pr"
       ;;
     review-artifacts-init)
+      local pr="${1-}"
+      [ -n "$pr" ] || { usage; exit 2; }
       review_artifacts_init "$pr"
       ;;
     review-validate-artifacts)
+      local pr="${1-}"
+      [ -n "$pr" ] || { usage; exit 2; }
       review_validate_artifacts "$pr"
       ;;
     review-tests)
+      local pr="${1-}"
+      [ -n "$pr" ] || { usage; exit 2; }
+      shift || true
       review_tests "$pr" "$@"
       ;;
+    prepare-correction-init)
+      [ "$#" -eq 1 ] || { usage; exit 2; }
+      prepare_init "$1" "${PR_OBSERVATION:-}" correction
+      ;;
+    prepare-baseline-refresh)
+      prepare_baseline_refresh "$@"
+      ;;
+    prepare-baseline-successor)
+      prepare_baseline_successor "$@"
+      ;;
+    prepare-baseline-signing-request)
+      prepare_baseline_signing_request "$@"
+      ;;
+    prepare-baseline-signing-continue)
+      prepare_baseline_signing_continue "$@"
+      ;;
+    prepare-correction-continue)
+      prepare_correction_continue "$@"
+      ;;
+    prepare-correction-review-init)
+      [ "$#" -eq 1 ] || { usage; exit 2; }
+      prepare_correction_review_init "$1"
+      ;;
     prepare-init)
-      prepare_init "$pr"
+      local pr="${1-}"
+      [ -n "$pr" ] || { usage; exit 2; }
+      prepare_init "$pr" "${PR_OBSERVATION:-}"
       ;;
     prepare-validate-commit)
+      local pr="${1-}"
+      [ -n "$pr" ] || { usage; exit 2; }
       prepare_validate_commit "$pr"
       ;;
     prepare-gates)
+      local pr="${1-}"
+      [ -n "$pr" ] || { usage; exit 2; }
       prepare_gates "$pr"
       ;;
     prepare-push)
-      prepare_push "$pr"
+      local pr="${1-}"
+      [ -n "$pr" ] || { usage; exit 2; }
+      prepare_push "$pr" "" "${3:-}"
       ;;
     prepare-sync-head)
+      local pr="${1-}"
+      [ -n "$pr" ] || { usage; exit 2; }
       prepare_sync_head "$pr"
       ;;
     prepare-run)
-      prepare_run "$pr"
+      local pr="${1-}"
+      [ -n "$pr" ] || { usage; exit 2; }
+      prepare_run "$pr" "${PR_OBSERVATION:-}"
+      ;;
+    ci-dispatch)
+      local pr="${1-}"
+      [ -n "$pr" ] || { usage; exit 2; }
+      shift
+      ci_dispatch "$pr" "$@"
       ;;
     merge-verify)
-      merge_verify "$pr"
+      local pr="${1-}"
+      [ -n "$pr" ] || { usage; exit 2; }
+      merge_verify "$pr" '{"replacementHead":"","autoMergeRequested":false,"qualifiedRefusal":false,"observation":null}'
       ;;
-    merge-run)
-      merge_run "$pr"
+    merge-run | merge-recover)
+      merge_run "$merge_pr" "$auto_merge" "$recovery_oid" "$replacement_head" "$body_path" "$legacy_directory" "$cancel_auto" "$refusal_directory" "$admin_evidence" "$confirmed_admin" "$merged_head" "$observed_head"
+      ;;
+    merge-complete)
+      merge_complete "$1" "$2"
       ;;
     *)
       usage

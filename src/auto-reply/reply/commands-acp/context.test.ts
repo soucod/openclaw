@@ -1,326 +1,86 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import type { ChannelConfiguredBindingProvider } from "../../../channels/plugins/types.adapters.js";
 import {
-  __testing as feishuThreadBindingTesting,
-  createFeishuThreadBindingManager,
-} from "../../../../extensions/feishu/src/thread-bindings.js";
-import type { OpenClawConfig } from "../../../config/config.js";
+  resetPluginRuntimeStateForTest,
+  setActivePluginRegistry,
+} from "../../../plugins/runtime.js";
 import {
-  __testing as sessionBindingTesting,
-  getSessionBindingService,
-} from "../../../infra/outbound/session-binding-service.js";
+  createChannelTestPluginBase,
+  createTestRegistry,
+} from "../../../test-utils/channel-plugins.js";
 import { buildCommandTestParams } from "../commands-spawn.test-harness.js";
-import {
-  isAcpCommandDiscordChannel,
-  resolveAcpCommandBindingContext,
-  resolveAcpCommandConversationId,
-  resolveAcpCommandParentConversationId,
-} from "./context.js";
+import { resolveAcpCommandBindingContext } from "./context.js";
 
-const baseCfg = {
-  session: { mainKey: "main", scope: "per-sender" },
-} satisfies OpenClawConfig;
+const resolveCommandConversation =
+  vi.fn<NonNullable<ChannelConfiguredBindingProvider["resolveCommandConversation"]>>();
+const commandParams = (ctx: Parameters<typeof buildCommandTestParams>[2]) =>
+  buildCommandTestParams("/acp status", {}, ctx);
+const resolveContext = (ctx: Parameters<typeof commandParams>[0]) =>
+  resolveAcpCommandBindingContext(commandParams(ctx));
 
-describe("commands-acp context", () => {
-  beforeEach(() => {
-    feishuThreadBindingTesting.resetFeishuThreadBindingsForTests();
-    sessionBindingTesting.resetSessionBindingAdaptersForTests();
+const plugin = {
+  ...createChannelTestPluginBase({
+    id: "test-acp",
+    config: { listAccountIds: () => ["default", "work"], defaultAccountId: () => "work" },
+  }),
+  bindings: { resolveCommandConversation, selfParentConversationByDefault: true },
+};
+
+beforeEach(() => {
+  resolveCommandConversation.mockReset().mockReturnValue(null);
+  setActivePluginRegistry(createTestRegistry([{ pluginId: "test-acp", source: "test", plugin }]));
+});
+afterEach(() => resetPluginRuntimeStateForTest());
+
+it("passes authoritative command and message facts to the plugin resolver", () => {
+  const conversation = { conversationId: "peer", parentConversationId: "parent" };
+  resolveCommandConversation.mockReturnValue(conversation);
+  const params = commandParams({
+    OriginatingChannel: "test-acp",
+    OriginatingTo: "origin-target",
+    To: "fallback-target",
+    From: "source-sender",
+    ChatType: "group",
+    AccountId: "explicit-account",
+    MessageThreadId: 42,
+    ThreadParentId: "native-parent",
+    SenderId: "context-sender",
+    SessionKey: "context-session",
+    ParentSessionKey: "parent-session",
   });
+  params.command.senderId = "command-sender";
+  params.command.to = "command-target";
+  params.sessionKey = "command-session";
 
-  it("resolves channel/account/thread context from originating fields", () => {
-    const params = buildCommandTestParams("/acp sessions", baseCfg, {
-      Provider: "discord",
-      Surface: "discord",
-      OriginatingChannel: "discord",
-      OriginatingTo: "channel:parent-1",
-      AccountId: "work",
-      MessageThreadId: "thread-42",
-    });
-
-    expect(resolveAcpCommandBindingContext(params)).toEqual({
-      channel: "discord",
-      accountId: "work",
-      threadId: "thread-42",
-      conversationId: "thread-42",
-      parentConversationId: "parent-1",
-    });
-    expect(isAcpCommandDiscordChannel(params)).toBe(true);
+  expect(resolveAcpCommandBindingContext(params)).toEqual({
+    channel: "test-acp",
+    accountId: "explicit-account",
+    threadId: "42",
+    ...conversation,
   });
-
-  it("resolves discord thread parent from ParentSessionKey when targets point at the thread", () => {
-    const params = buildCommandTestParams("/acp sessions", baseCfg, {
-      Provider: "discord",
-      Surface: "discord",
-      OriginatingChannel: "discord",
-      OriginatingTo: "channel:thread-42",
-      AccountId: "work",
-      MessageThreadId: "thread-42",
-      ParentSessionKey: "agent:codex:discord:channel:parent-9",
-    });
-
-    expect(resolveAcpCommandBindingContext(params)).toEqual({
-      channel: "discord",
-      accountId: "work",
-      threadId: "thread-42",
-      conversationId: "thread-42",
-      parentConversationId: "parent-9",
-    });
+  expect(resolveCommandConversation).toHaveBeenCalledExactlyOnceWith({
+    accountId: "explicit-account",
+    threadId: "42",
+    threadParentId: "native-parent",
+    senderId: "command-sender",
+    sessionKey: "command-session",
+    parentSessionKey: "parent-session",
+    from: "source-sender",
+    chatType: "group",
+    originatingTo: "origin-target",
+    commandTo: "command-target",
+    fallbackTo: "fallback-target",
   });
+});
 
-  it("resolves discord thread parent from native context when ParentSessionKey is absent", () => {
-    const params = buildCommandTestParams("/acp sessions", baseCfg, {
-      Provider: "discord",
-      Surface: "discord",
-      OriginatingChannel: "discord",
-      OriginatingTo: "channel:thread-42",
-      AccountId: "work",
-      MessageThreadId: "thread-42",
-      ThreadParentId: "parent-11",
-    });
-
-    expect(resolveAcpCommandBindingContext(params)).toEqual({
-      channel: "discord",
-      accountId: "work",
-      threadId: "thread-42",
-      conversationId: "thread-42",
-      parentConversationId: "parent-11",
-    });
-  });
-
-  it("falls back to default account and target-derived conversation id", () => {
-    const params = buildCommandTestParams("/acp status", baseCfg, {
-      Provider: "slack",
-      Surface: "slack",
-      OriginatingChannel: "slack",
-      To: "<#123456789>",
-    });
-
-    expect(resolveAcpCommandBindingContext(params)).toEqual({
-      channel: "slack",
-      accountId: "default",
-      threadId: undefined,
-      conversationId: "123456789",
-    });
-    expect(resolveAcpCommandConversationId(params)).toBe("123456789");
-    expect(isAcpCommandDiscordChannel(params)).toBe(false);
-  });
-
-  it("builds canonical telegram topic conversation ids from originating chat + thread", () => {
-    const params = buildCommandTestParams("/acp status", baseCfg, {
-      Provider: "telegram",
-      Surface: "telegram",
-      OriginatingChannel: "telegram",
-      OriginatingTo: "telegram:-1001234567890",
-      MessageThreadId: "42",
-    });
-
-    expect(resolveAcpCommandBindingContext(params)).toEqual({
-      channel: "telegram",
-      accountId: "default",
-      threadId: "42",
-      conversationId: "-1001234567890:topic:42",
-      parentConversationId: "-1001234567890",
-    });
-    expect(resolveAcpCommandConversationId(params)).toBe("-1001234567890:topic:42");
-  });
-
-  it("resolves Telegram DM conversation ids from telegram targets", () => {
-    const params = buildCommandTestParams("/acp status", baseCfg, {
-      Provider: "telegram",
-      Surface: "telegram",
-      OriginatingChannel: "telegram",
-      OriginatingTo: "telegram:123456789",
-    });
-
-    expect(resolveAcpCommandBindingContext(params)).toEqual({
-      channel: "telegram",
-      accountId: "default",
-      threadId: undefined,
-      conversationId: "123456789",
-      parentConversationId: "123456789",
-    });
-    expect(resolveAcpCommandConversationId(params)).toBe("123456789");
-  });
-
-  it("resolves Matrix thread context from the current room and thread root", () => {
-    const params = buildCommandTestParams("/acp status", baseCfg, {
-      Provider: "matrix",
-      Surface: "matrix",
-      OriginatingChannel: "matrix",
-      OriginatingTo: "room:!room:example.org",
-      AccountId: "work",
-      MessageThreadId: "$thread-root",
-    });
-
-    expect(resolveAcpCommandBindingContext(params)).toEqual({
-      channel: "matrix",
-      accountId: "work",
-      threadId: "$thread-root",
-      conversationId: "$thread-root",
-      parentConversationId: "!room:example.org",
-    });
-    expect(resolveAcpCommandConversationId(params)).toBe("$thread-root");
-    expect(resolveAcpCommandParentConversationId(params)).toBe("!room:example.org");
-  });
-
-  it("builds Feishu topic conversation ids from chat target + root message id", () => {
-    const params = buildCommandTestParams("/acp status", baseCfg, {
-      Provider: "feishu",
-      Surface: "feishu",
-      OriginatingChannel: "feishu",
-      OriginatingTo: "chat:oc_group_chat",
-      MessageThreadId: "om_topic_root",
-      SenderId: "ou_topic_user",
-      AccountId: "work",
-    });
-
-    expect(resolveAcpCommandBindingContext(params)).toEqual({
-      channel: "feishu",
-      accountId: "work",
-      threadId: "om_topic_root",
-      conversationId: "oc_group_chat:topic:om_topic_root",
-      parentConversationId: "oc_group_chat",
-    });
-    expect(resolveAcpCommandConversationId(params)).toBe("oc_group_chat:topic:om_topic_root");
-  });
-
-  it("builds sender-scoped Feishu topic conversation ids when current session is sender-scoped", () => {
-    const params = buildCommandTestParams("/acp status", baseCfg, {
-      Provider: "feishu",
-      Surface: "feishu",
-      OriginatingChannel: "feishu",
-      OriginatingTo: "chat:oc_group_chat",
-      MessageThreadId: "om_topic_root",
-      SenderId: "ou_topic_user",
-      AccountId: "work",
-      SessionKey: "agent:main:feishu:group:oc_group_chat:topic:om_topic_root:sender:ou_topic_user",
-    });
-    params.sessionKey =
-      "agent:main:feishu:group:oc_group_chat:topic:om_topic_root:sender:ou_topic_user";
-
-    expect(resolveAcpCommandBindingContext(params)).toEqual({
-      channel: "feishu",
-      accountId: "work",
-      threadId: "om_topic_root",
-      conversationId: "oc_group_chat:topic:om_topic_root:sender:ou_topic_user",
-      parentConversationId: "oc_group_chat",
-    });
-    expect(resolveAcpCommandConversationId(params)).toBe(
-      "oc_group_chat:topic:om_topic_root:sender:ou_topic_user",
-    );
-  });
-
-  it("preserves sender-scoped Feishu topic ids after ACP route takeover via ParentSessionKey", () => {
-    const params = buildCommandTestParams("/acp status", baseCfg, {
-      Provider: "feishu",
-      Surface: "feishu",
-      OriginatingChannel: "feishu",
-      OriginatingTo: "chat:oc_group_chat",
-      MessageThreadId: "om_topic_root",
-      SenderId: "ou_topic_user",
-      AccountId: "work",
-      ParentSessionKey:
-        "agent:main:feishu:group:oc_group_chat:topic:om_topic_root:sender:ou_topic_user",
-    });
-    params.sessionKey = "agent:codex:acp:binding:feishu:work:abc123";
-
-    expect(resolveAcpCommandBindingContext(params)).toEqual({
-      channel: "feishu",
-      accountId: "work",
-      threadId: "om_topic_root",
-      conversationId: "oc_group_chat:topic:om_topic_root:sender:ou_topic_user",
-      parentConversationId: "oc_group_chat",
-    });
-  });
-
-  it("preserves sender-scoped Feishu topic ids after ACP takeover from the live binding record", async () => {
-    createFeishuThreadBindingManager({ cfg: baseCfg, accountId: "work" });
-    await getSessionBindingService().bind({
-      targetSessionKey: "agent:codex:acp:binding:feishu:work:abc123",
-      targetKind: "session",
-      conversation: {
-        channel: "feishu",
-        accountId: "work",
-        conversationId: "oc_group_chat:topic:om_topic_root:sender:ou_topic_user",
-        parentConversationId: "oc_group_chat",
-      },
-      placement: "current",
-      metadata: {
-        agentId: "codex",
-      },
-    });
-
-    const params = buildCommandTestParams("/acp status", baseCfg, {
-      Provider: "feishu",
-      Surface: "feishu",
-      OriginatingChannel: "feishu",
-      OriginatingTo: "chat:oc_group_chat",
-      MessageThreadId: "om_topic_root",
-      SenderId: "ou_topic_user",
-      AccountId: "work",
-    });
-    params.sessionKey = "agent:codex:acp:binding:feishu:work:abc123";
-
-    expect(resolveAcpCommandBindingContext(params)).toEqual({
-      channel: "feishu",
-      accountId: "work",
-      threadId: "om_topic_root",
-      conversationId: "oc_group_chat:topic:om_topic_root:sender:ou_topic_user",
-      parentConversationId: "oc_group_chat",
-    });
-  });
-
-  it("resolves Feishu DM conversation ids from user targets", () => {
-    const params = buildCommandTestParams("/acp status", baseCfg, {
-      Provider: "feishu",
-      Surface: "feishu",
-      OriginatingChannel: "feishu",
-      OriginatingTo: "user:ou_sender_1",
-    });
-
-    expect(resolveAcpCommandBindingContext(params)).toEqual({
-      channel: "feishu",
-      accountId: "default",
-      threadId: undefined,
-      conversationId: "ou_sender_1",
-      parentConversationId: undefined,
-    });
-    expect(resolveAcpCommandConversationId(params)).toBe("ou_sender_1");
-  });
-
-  it("resolves Feishu DM conversation ids from user_id fallback targets", () => {
-    const params = buildCommandTestParams("/acp status", baseCfg, {
-      Provider: "feishu",
-      Surface: "feishu",
-      OriginatingChannel: "feishu",
-      OriginatingTo: "user:user_123",
-    });
-
-    expect(resolveAcpCommandBindingContext(params)).toEqual({
-      channel: "feishu",
-      accountId: "default",
-      threadId: undefined,
-      conversationId: "user_123",
-      parentConversationId: undefined,
-    });
-    expect(resolveAcpCommandConversationId(params)).toBe("user_123");
-  });
-
-  it("does not infer a Feishu DM parent conversation id during fallback binding lookup", () => {
-    const params = buildCommandTestParams("/acp status", baseCfg, {
-      Provider: "feishu",
-      Surface: "feishu",
-      OriginatingChannel: "feishu",
-      OriginatingTo: "user:ou_sender_1",
-      AccountId: "work",
-    });
-
-    expect(resolveAcpCommandParentConversationId(params)).toBeUndefined();
-    expect(resolveAcpCommandBindingContext(params)).toEqual({
-      channel: "feishu",
-      accountId: "work",
-      threadId: undefined,
-      conversationId: "ou_sender_1",
-      parentConversationId: undefined,
-    });
+it.each([
+  [undefined, { conversationId: "peer" }, { accountId: "work", conversationId: "peer" }],
+  [undefined, null, { accountId: "work", threadId: undefined }],
+  ["personal", null, { accountId: "personal", threadId: undefined }],
+] as const)("resolves account %s / %j", (accountId, conversation, expected) => {
+  resolveCommandConversation.mockReturnValue(conversation);
+  expect(resolveContext({ OriginatingChannel: "test-acp", AccountId: accountId })).toEqual({
+    channel: "test-acp",
+    ...expected,
   });
 });

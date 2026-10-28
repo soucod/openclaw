@@ -1,3 +1,4 @@
+// Voice Call tests cover lookup plugin behavior.
 import { describe, expect, it } from "vitest";
 import { findCall, getCallByProviderCallId } from "./lookup.js";
 
@@ -18,20 +19,12 @@ describe("voice-call manager lookup", () => {
     ).toEqual({ id: "call-2", providerCallId: "prov-2" });
   });
 
-  it("falls back to scanning active calls and supports direct call ids", () => {
+  it("supports direct call ids and returns no match for an unknown id", () => {
     const activeCalls = new Map([
       ["call-1", { id: "call-1", providerCallId: "prov-1" }],
       ["call-2", { id: "call-2", providerCallId: "prov-2" }],
     ]);
     const providerCallIdMap = new Map<string, string>();
-
-    expect(
-      getCallByProviderCallId({
-        activeCalls: activeCalls as never,
-        providerCallIdMap,
-        providerCallId: "prov-1",
-      }),
-    ).toEqual({ id: "call-1", providerCallId: "prov-1" });
 
     expect(
       findCall({

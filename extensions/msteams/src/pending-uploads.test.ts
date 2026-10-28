@@ -1,84 +1,91 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  clearPendingUploads,
   getPendingUpload,
-  getPendingUploadCount,
   removePendingUpload,
+  setPendingUploadActivityId,
   storePendingUpload,
 } from "./pending-uploads.js";
 
-describe("msteams pending uploads", () => {
+const createdUploadIds = new Set<string>();
+
+function storePendingUploadForTest(
+  upload: Partial<Parameters<typeof storePendingUpload>[0]> = {},
+): string {
+  const id = storePendingUpload({
+    buffer: Buffer.from("data"),
+    filename: "file.txt",
+    conversationId: "conv-1",
+    ...upload,
+  });
+  createdUploadIds.add(id);
+  return id;
+}
+
+function requirePendingUpload(id: string) {
+  const upload = getPendingUpload(id);
+  if (!upload) {
+    throw new Error(`expected pending upload ${id}`);
+  }
+  return upload;
+}
+
+describe("pending-uploads", () => {
   beforeEach(() => {
     vi.useFakeTimers();
-    clearPendingUploads();
   });
 
   afterEach(() => {
-    clearPendingUploads();
+    for (const id of createdUploadIds) {
+      removePendingUpload(id);
+    }
+    createdUploadIds.clear();
     vi.useRealTimers();
   });
 
-  it("stores uploads, exposes them by id, and tracks count", () => {
-    const id = storePendingUpload({
-      buffer: Buffer.from("hello"),
-      filename: "hello.txt",
-      contentType: "text/plain",
-      conversationId: "conv-1",
-    });
+  describe("storePendingUpload", () => {
+    it("auto-removes entry after TTL expires", () => {
+      const id = storePendingUploadForTest();
 
-    expect(getPendingUploadCount()).toBe(1);
-    expect(getPendingUpload(id)).toEqual(
-      expect.objectContaining({
-        id,
-        filename: "hello.txt",
-        contentType: "text/plain",
-        conversationId: "conv-1",
-      }),
-    );
+      expect(requirePendingUpload(id).filename).toBe("file.txt");
+      vi.advanceTimersByTime(5 * 60 * 1000 + 1);
+      expect(getPendingUpload(id)).toBeUndefined();
+    });
   });
 
-  it("removes uploads explicitly and ignores empty ids", () => {
-    const id = storePendingUpload({
-      buffer: Buffer.from("hello"),
-      filename: "hello.txt",
-      conversationId: "conv-1",
+  describe("removePendingUpload", () => {
+    it("clears the TTL timer so it does not fire after explicit removal", () => {
+      const id = storePendingUploadForTest();
+
+      expect(getPendingUpload(id)).toBeDefined();
+      expect(vi.getTimerCount()).toBe(1);
+      removePendingUpload(id);
+      expect(getPendingUpload(id)).toBeUndefined();
+      expect(vi.getTimerCount()).toBe(0);
     });
-
-    removePendingUpload(undefined);
-    expect(getPendingUploadCount()).toBe(1);
-
-    removePendingUpload(id);
-    expect(getPendingUpload(id)).toBeUndefined();
-    expect(getPendingUploadCount()).toBe(0);
   });
 
-  it("expires uploads by ttl even if the timeout callback has not been observed yet", () => {
-    const id = storePendingUpload({
-      buffer: Buffer.from("hello"),
-      filename: "hello.txt",
-      conversationId: "conv-1",
+  describe("setPendingUploadActivityId", () => {
+    it("sets the consentCardActivityId on an existing upload", () => {
+      const id = storePendingUploadForTest();
+
+      expect(getPendingUpload(id)?.consentCardActivityId).toBeUndefined();
+
+      setPendingUploadActivityId(id, "activity-xyz");
+      expect(getPendingUpload(id)?.consentCardActivityId).toBe("activity-xyz");
     });
-
-    vi.advanceTimersByTime(5 * 60 * 1000 + 1);
-
-    expect(getPendingUpload(id)).toBeUndefined();
-    expect(getPendingUploadCount()).toBe(0);
   });
 
-  it("clears all uploads for test cleanup", () => {
-    storePendingUpload({
-      buffer: Buffer.from("a"),
-      filename: "a.txt",
-      conversationId: "conv-1",
-    });
-    storePendingUpload({
-      buffer: Buffer.from("b"),
-      filename: "b.txt",
-      conversationId: "conv-2",
+  describe("getPendingUpload", () => {
+    it("returns undefined for undefined id", () => {
+      expect(getPendingUpload(undefined)).toBeUndefined();
     });
 
-    clearPendingUploads();
+    it("returns undefined when entry is past TTL but timer has not yet fired", () => {
+      const id = storePendingUploadForTest();
 
-    expect(getPendingUploadCount()).toBe(0);
+      // Manually advance time without firing timers to simulate stale entry
+      vi.setSystemTime(Date.now() + 5 * 60 * 1000 + 1);
+      expect(getPendingUpload(id)).toBeUndefined();
+    });
   });
 });

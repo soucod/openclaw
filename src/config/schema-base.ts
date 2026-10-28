@@ -1,43 +1,83 @@
 import { VERSION } from "../version.js";
-import type { ConfigUiHints } from "./schema.hints.js";
-import { buildBaseHints, mapSensitivePaths } from "./schema.hints.js";
-import { applyDerivedTags } from "./schema.tags.js";
+import { FIELD_HELP } from "./schema.help.js";
+import { buildBaseHints, mapSensitivePaths, type ConfigUiHints } from "./schema.hints.js";
+import { FIELD_LABELS } from "./schema.labels.js";
+import {
+  asSchemaObject,
+  type ConfigJsonSchemaObject as JsonSchemaObject,
+  type ConfigSchemaResponse,
+} from "./schema.shared.js";
+import { applyResolvedConfigTierHints } from "./schema.tiers.js";
 import { OpenClawSchema } from "./zod-schema.js";
 
 type ConfigSchema = Record<string, unknown>;
 
-type JsonSchemaObject = Record<string, unknown> & {
-  properties?: Record<string, JsonSchemaObject>;
-  required?: string[];
-  additionalProperties?: JsonSchemaObject | boolean;
-};
-
-export type BaseConfigSchemaResponse = {
-  schema: ConfigSchema;
-  uiHints: ConfigUiHints;
-  version: string;
-  generatedAt: string;
-};
-
-function cloneSchema<T>(value: T): T {
-  if (typeof structuredClone === "function") {
-    return structuredClone(value);
+/**
+ * Recursively walk a JSON Schema object and apply field docs using dot-path
+ * matching. Existing titles/descriptions (for example from Zod metadata) are
+ * preserved.
+ */
+function applyFieldDocumentation(node: JsonSchemaObject, prefixes: readonly string[] = [""]): void {
+  for (const [key, child] of Object.entries(node.properties ?? {})) {
+    applyChildDocumentation(
+      child,
+      prefixes.map((prefix) => (prefix ? `${prefix}.${key}` : key)),
+    );
   }
-  return JSON.parse(JSON.stringify(value)) as T;
+  if (node.additionalProperties) {
+    applyChildDocumentation(
+      node.additionalProperties,
+      prefixes.map((prefix) => (prefix ? `${prefix}.*` : "*")),
+    );
+  }
+  // Array help/labels accept both bindings[].type and bindings.*.type.
+  if (node.items) {
+    applyChildDocumentation(node.items, [
+      ...new Set(
+        prefixes.flatMap((prefix) => (prefix ? [`${prefix}.*`, `${prefix}[]`] : ["*", "[]"])),
+      ),
+    ]);
+  }
+  // Recurse into composition branches (anyOf, oneOf, allOf) using the same
+  // path aliases so union/intersection variants inherit the same field docs.
+  for (const keyword of ["anyOf", "oneOf", "allOf"] as const) {
+    const branches = node[keyword];
+    if (Array.isArray(branches)) {
+      for (const branch of branches) {
+        const branchObj = asSchemaObject(branch);
+        if (branchObj) {
+          applyFieldDocumentation(branchObj, prefixes);
+        }
+      }
+    }
+  }
 }
 
-function asSchemaObject(value: unknown): JsonSchemaObject | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return null;
+function applyChildDocumentation(value: unknown, pathCandidates: readonly string[]): void {
+  const node = asSchemaObject(value);
+  if (!node) {
+    return;
   }
-  return value as JsonSchemaObject;
+  for (const path of pathCandidates) {
+    const title = FIELD_LABELS[path];
+    if (!node.title && title) {
+      node.title = title;
+    }
+    const description = FIELD_HELP[path];
+    if (!node.description && description) {
+      node.description = description;
+    }
+  }
+  applyFieldDocumentation(node, pathCandidates);
 }
 
-function stripChannelSchema(schema: ConfigSchema): ConfigSchema {
-  const next = cloneSchema(schema);
-  const root = asSchemaObject(next);
+type BaseConfigSchemaStablePayload = Omit<ConfigSchemaResponse, "generatedAt">;
+
+function preparePublicSchema(schema: ConfigSchema): ConfigSchema {
+  // Zod returns an independent JSON tree; prepare it before publishing the cache.
+  const root = asSchemaObject(schema);
   if (!root || !root.properties) {
-    return next;
+    return schema;
   }
   // Allow `$schema` in config files for editor tooling, but hide it from the
   // Control UI form schema so it does not show up as a configurable section.
@@ -47,26 +87,54 @@ function stripChannelSchema(schema: ConfigSchema): ConfigSchema {
   }
   const channelsNode = asSchemaObject(root.properties.channels);
   if (channelsNode) {
-    channelsNode.properties = {};
-    channelsNode.required = [];
+    // Keep plugin config permissive without advertising an untyped lookup wildcard.
     channelsNode.additionalProperties = true;
   }
-  return next;
+  return schema;
 }
 
-export function computeBaseConfigSchemaResponse(params?: {
-  generatedAt?: string;
-}): BaseConfigSchemaResponse {
+let baseConfigSchemaStablePayload: BaseConfigSchemaStablePayload | null = null;
+let baseConfigUiHints: ConfigUiHints | undefined;
+
+/** Core redaction needs sensitivity facts without materializing the JSON schema. */
+export function computeBaseConfigUiHints(): ConfigUiHints {
+  baseConfigUiHints ??= mapSensitivePaths(OpenClawSchema, "", buildBaseHints());
+  return structuredClone(baseConfigUiHints);
+}
+
+function computeBaseConfigSchemaStablePayload(): BaseConfigSchemaStablePayload {
+  if (baseConfigSchemaStablePayload) {
+    return baseConfigSchemaStablePayload;
+  }
   const schema = OpenClawSchema.toJSONSchema({
+    io: "input",
     target: "draft-07",
     unrepresentable: "any",
   });
   schema.title = "OpenClawConfig";
-  const hints = applyDerivedTags(mapSensitivePaths(OpenClawSchema, "", buildBaseHints()));
-  return {
-    schema: stripChannelSchema(schema),
-    uiHints: hints,
+  const schemaRoot = asSchemaObject(schema);
+  if (schemaRoot) {
+    applyFieldDocumentation(schemaRoot);
+  }
+  const baseHints = computeBaseConfigUiHints();
+  const publicSchema = preparePublicSchema(schema);
+  const stablePayload = {
+    schema: publicSchema,
+    uiHints: applyResolvedConfigTierHints(publicSchema, baseHints),
     version: VERSION,
+  } satisfies BaseConfigSchemaStablePayload;
+  baseConfigSchemaStablePayload = stablePayload;
+  return stablePayload;
+}
+
+export function computeBaseConfigSchemaResponse(params?: {
+  generatedAt?: string;
+}): ConfigSchemaResponse {
+  const stablePayload = computeBaseConfigSchemaStablePayload();
+  return {
+    schema: structuredClone(stablePayload.schema),
+    uiHints: structuredClone(stablePayload.uiHints),
+    version: stablePayload.version,
     generatedAt: params?.generatedAt ?? new Date().toISOString(),
   };
 }

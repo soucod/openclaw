@@ -1,238 +1,216 @@
-import { describe, expect, it } from "vitest";
-import {
-  extractElevatedDirective,
-  extractExecDirective,
-  extractQueueDirective,
-  extractReasoningDirective,
-  extractReplyToTag,
-  extractThinkDirective,
-  extractVerboseDirective,
-} from "./reply.js";
-import { extractFastDirective, extractStatusDirective } from "./reply/directives.js";
+import { expect, it } from "vitest";
+import type { ModelAliasIndex } from "../agents/model-selection-shared.js";
+import { withPluginMetadataSnapshotScope } from "../plugins/current-plugin-metadata-snapshot.js";
+import { createPluginMetadataSnapshotFixture } from "../plugins/plugin-metadata.test-support.js";
+import { parseInlineSessionDirectives as parse } from "./reply/directive-handling.parse.js";
+import { resolveModelDirectiveSelection } from "./reply/model-selection-directive.js";
 
-describe("directive parsing", () => {
-  it("ignores verbose directive inside URL", () => {
-    const body = "https://x.com/verioussmith/status/1997066835133669687";
-    const res = extractVerboseDirective(body);
-    expect(res.hasDirective).toBe(false);
-    expect(res.cleaned).toBe(body);
-  });
+it("preserves bytes without directives", () => {
+  const body = "  ordinary\t text\r\n    if ready:\r\n        run('a  b')  \r\n";
+  expect(parse(body).cleaned).toBe(body);
+});
+it.each(["/think high", "/status:"])("preserves surrounding code for %s", (directive) => {
+  const code = "\r\n```python\r\n    if ready:\r\n        run('a  b')\r\n\t\tfinish()  \r\n```\r\n";
+  expect(parse("  Keep\t spacing " + directive + " here  too" + code).cleaned).toBe(
+    "  Keep\t spacing here  too" + code,
+  );
+});
+it("preserves indentation after alias arguments", () => {
+  const code = "    if ready:\r\n        run()  \r\n";
+  expect(parse("/sample\r\n" + code, { modelAliases: ["sample"] }).cleaned).toBe(code);
+});
+it.each([
+  ["/exec\n host=auto\n security=deny\r\n", { execHost: "auto", execSecurity: "deny" }],
+  ["/queue\n collect\n cap:5\r\n", { queueMode: "collect", cap: 5 }],
+  ["/think\n high\r\n", { thinkLevel: "high" }],
+  [
+    "/model\n example/model\n -s\r\n",
+    { rawModelDirective: "example/model", modelScope: "session" },
+  ],
+])("preserves code after cross-line arguments: %j", (directive, fields) => {
+  const code = "    print('a  b')\r\n";
+  expect(parse(directive + code)).toMatchObject({ ...fields, cleaned: code });
+});
 
-  it("ignores typoed /verioussmith", () => {
-    const body = "/verioussmith";
-    const res = extractVerboseDirective(body);
-    expect(res.hasDirective).toBe(false);
-    expect(res.cleaned).toBe(body.trim());
+it.each([
+  [
+    "/think high /think low /verbose on\r\n    code  here",
+    { thinkLevel: "high", verboseLevel: "on", cleaned: "/think low\r\n    code  here" },
+  ],
+  [
+    "/think default",
+    {
+      hasThinkDirective: true,
+      thinkLevel: undefined,
+      rawThinkLevel: "default",
+      clearThinkLevel: true,
+    },
+  ],
+  [
+    "/fast inherit",
+    { hasFastDirective: true, fastMode: undefined, rawFastMode: "inherit", clearFastMode: true },
+  ],
+  ["/fast ultr", { hasFastDirective: true, fastMode: undefined }],
+  [
+    "/think:",
+    { hasThinkDirective: true, thinkLevel: undefined, rawThinkLevel: undefined, cleaned: "" },
+  ],
+  ["thats not /think high/tmp/hello", { hasThinkDirective: true, cleaned: "thats not /tmp/hello" }],
+  [
+    "please /exec host=auto security=allowlist ask=on-miss node=mac-mini now",
+    {
+      hasExecDirective: true,
+      execHost: "auto",
+      execSecurity: "allowlist",
+      execAsk: "on-miss",
+      execNode: "mac-mini",
+      cleaned: "please now",
+    },
+  ],
+  [
+    "please /queue collect debounce:2s cap:5 drop:summarize now",
+    {
+      hasQueueDirective: true,
+      queueMode: "collect",
+      debounceMs: 2000,
+      cap: 5,
+      dropPolicy: "summarize",
+      cleaned: "please now",
+    },
+  ],
+])("parses directive arguments and leaves prose intact: %s", (body, expected) => {
+  expect(parse(body)).toMatchObject(expected);
+});
+it("preserves prose after a thinking directive", () => {
+  const result = parse("/think about my deployment plan");
+  expect(result.rawThinkLevel).toBeUndefined();
+  expect(result.command).toBeUndefined();
+  expect(result.cleaned).toBe("about my deployment plan");
+});
+it.each([
+  ["/fast ultrafast", "ultrafast", ""],
+  ["/fast ultra", "ultra", ""],
+  ["/fast ULTRA please hurry", "ULTRA", "please hurry"],
+])("normalizes fast mode: %s", (body, rawFastMode, cleaned) => {
+  expect(parse(body)).toMatchObject({
+    hasFastDirective: true,
+    fastMode: "ultrafast",
+    rawFastMode,
+    cleaned,
   });
+});
+it.each([
+  ["host", "spaceship", "execHost", "rawExecHost", "invalidExecHost"],
+  ["security", "wide-open", "execSecurity", "rawExecSecurity", "invalidExecSecurity"],
+  ["ask", "sometimes", "execAsk", "rawExecAsk", "invalidExecAsk"],
+])("rejects invalid exec %s", (option, value, field, raw, invalid) => {
+  expect(parse("/exec " + option + "=" + value)).toMatchObject({
+    hasExecDirective: true,
+    [field]: undefined,
+    [raw]: value,
+    [invalid]: true,
+  });
+});
+it.each([
+  ["think", "think_hard", "thinkLevel", "low", ""],
+  ["reasoning", "0", "reasoningLevel", "off", ""],
+  ["reasoning", "streaming", "reasoningLevel", "stream", ""],
+  ["verbose", "3d printing tips", "verboseLevel", undefined, "3d printing tips"],
+] as const)("accepts digit/underscore aliases: /%s %s", (name, args, key, value, cleaned) => {
+  expect(parse("/" + name + " " + args, { command: { kind: "text", name } })).toMatchObject({
+    [key]: value,
+    cleaned,
+  });
+});
+it("parses native model runtime and session options", () => {
+  expect(
+    parse("/model openai/gpt-4.1-mini -s harness=codex", {
+      command: { kind: "native", name: "model" },
+    }),
+  ).toMatchObject({
+    cleaned: "",
+    rawModelDirective: "openai/gpt-4.1-mini",
+    rawModelRuntime: "codex",
+    modelScope: "session",
+    command: { name: "model" },
+  });
+});
+it.each([
+  ["trace", "rawTraceLevel", "banana", "please"],
+  ["elevated", "rawElevatedLevel", "perhaps", "explain"],
+] as const)("preserves invalid native arguments: /%s", (name, raw, invalid, trailing) => {
+  const parsed = parse("/" + name + " " + invalid + " " + trailing, {
+    command: { kind: "native", name },
+  });
+  expect(parsed).toMatchObject({ [raw]: invalid, cleaned: trailing });
+  expect(parsed.command).toEqual({ name, unconsumedArguments: trailing });
+});
+it("does not interpret a second directive inside native arguments", () => {
+  expect(parse("/queue /think high", { command: { kind: "native", name: "queue" } })).toMatchObject(
+    { hasQueueDirective: true, rawQueueMode: "/think", hasThinkDirective: false },
+  );
+});
 
-  it("ignores think directive inside URL", () => {
-    const body = "see https://example.com/path/thinkstuff";
-    const res = extractThinkDirective(body);
-    expect(res.hasDirective).toBe(false);
-  });
+const emptyAliasIndex: ModelAliasIndex = { byAlias: new Map(), byKey: new Map() };
+const kimi = { provider: "fixture-moonshot", model: "kimi-k2-0905-preview" };
+const kimiKey = "fixture-moonshot/kimi-k2-0905-preview";
+const defaultKey = "fixture-anthropic/claude-opus-4-6";
+const minimax = "fixture-minimax";
+// Keep ranking fixtures independent of bundled provider policy loading.
+const metadataSnapshot = createPluginMetadataSnapshotFixture();
 
-  it("matches verbose with leading space", () => {
-    const res = extractVerboseDirective(" please /verbose on now");
-    expect(res.hasDirective).toBe(true);
-    expect(res.verboseLevel).toBe("on");
-  });
+function resolveModel(
+  raw: string,
+  allowedModelKeys: string[],
+  overrides: {
+    aliasIndex?: ModelAliasIndex;
+    defaultProvider?: string;
+    defaultModel?: string;
+  } = {},
+) {
+  return withPluginMetadataSnapshotScope(metadataSnapshot, () =>
+    resolveModelDirectiveSelection({
+      raw,
+      defaultProvider: "fixture-anthropic",
+      defaultModel: "claude-opus-4-6",
+      aliasIndex: emptyAliasIndex,
+      ...overrides,
+      allowedModelKeys: new Set(allowedModelKeys),
+      cfg: { agents: { defaults: { modelPolicy: { allow: allowedModelKeys } } } },
+    }),
+  ).selection;
+}
 
-  it("matches reasoning directive", () => {
-    const res = extractReasoningDirective("/reasoning on please");
-    expect(res.hasDirective).toBe(true);
-    expect(res.reasoningLevel).toBe("on");
-  });
+it("picks the best fuzzy match for global and provider-scoped fixture-minimax queries", () => {
+  const defaults = { defaultProvider: minimax, defaultModel: "Fixture-Minimax-M2.7" };
+  const allowedModelKeys = [
+    "fixture-minimax/Fixture-Minimax-M2.7",
+    "fixture-minimax/Fixture-Minimax-M2.7-highspeed",
+  ];
+  expect(
+    resolveModel(
+      "fixture-minimax",
+      [...allowedModelKeys, "fixture-local/fixture-minimax-m2.5-gs32"],
+      defaults,
+    ),
+  ).toEqual({ provider: minimax, model: "Fixture-Minimax-M2.7", isDefault: true });
 
-  it("matches reasoning stream directive", () => {
-    const res = extractReasoningDirective("/reasoning stream please");
-    expect(res.hasDirective).toBe(true);
-    expect(res.reasoningLevel).toBe("stream");
+  expect(resolveModel("fixture-minimax/highspeed", allowedModelKeys, defaults)).toEqual({
+    provider: minimax,
+    model: "Fixture-Minimax-M2.7-highspeed",
+    isDefault: false,
   });
+});
 
-  it("matches fast directive", () => {
-    const res = extractFastDirective("/fast on please");
-    expect(res.hasDirective).toBe(true);
-    expect(res.fastMode).toBe(true);
-  });
+it("prefers alias matches when fuzzy selection is ambiguous", () => {
+  const aliasIndex: ModelAliasIndex = {
+    byAlias: new Map([["kimi", { alias: "Kimi", ref: kimi }]]),
+    byKey: new Map([[kimiKey, ["Kimi"]]]),
+  };
 
-  it("matches elevated with leading space", () => {
-    const res = extractElevatedDirective(" please /elevated on now");
-    expect(res.hasDirective).toBe(true);
-    expect(res.elevatedLevel).toBe("on");
-  });
-  it("matches elevated ask", () => {
-    const res = extractElevatedDirective("/elevated ask please");
-    expect(res.hasDirective).toBe(true);
-    expect(res.elevatedLevel).toBe("ask");
-  });
-  it("matches elevated full", () => {
-    const res = extractElevatedDirective("/elevated full please");
-    expect(res.hasDirective).toBe(true);
-    expect(res.elevatedLevel).toBe("full");
-  });
-
-  it("matches think at start of line", () => {
-    const res = extractThinkDirective("/think:high run slow");
-    expect(res.hasDirective).toBe(true);
-    expect(res.thinkLevel).toBe("high");
-  });
-
-  it("does not match /think followed by extra letters", () => {
-    // e.g. someone typing "/think" + extra letter "hink"
-    const res = extractThinkDirective("/thinkstuff");
-    expect(res.hasDirective).toBe(false);
-  });
-
-  it("matches /think with no argument", () => {
-    const res = extractThinkDirective("/think");
-    expect(res.hasDirective).toBe(true);
-    expect(res.thinkLevel).toBeUndefined();
-    expect(res.rawLevel).toBeUndefined();
-  });
-
-  it("matches /t with no argument", () => {
-    const res = extractThinkDirective("/t");
-    expect(res.hasDirective).toBe(true);
-    expect(res.thinkLevel).toBeUndefined();
-  });
-
-  it("matches think with no argument and consumes colon", () => {
-    const res = extractThinkDirective("/think:");
-    expect(res.hasDirective).toBe(true);
-    expect(res.thinkLevel).toBeUndefined();
-    expect(res.rawLevel).toBeUndefined();
-    expect(res.cleaned).toBe("");
-  });
-
-  it("matches verbose with no argument", () => {
-    const res = extractVerboseDirective("/verbose:");
-    expect(res.hasDirective).toBe(true);
-    expect(res.verboseLevel).toBeUndefined();
-    expect(res.rawLevel).toBeUndefined();
-    expect(res.cleaned).toBe("");
-  });
-
-  it("matches fast with no argument", () => {
-    const res = extractFastDirective("/fast:");
-    expect(res.hasDirective).toBe(true);
-    expect(res.fastMode).toBeUndefined();
-    expect(res.rawLevel).toBeUndefined();
-    expect(res.cleaned).toBe("");
-  });
-
-  it("matches reasoning with no argument", () => {
-    const res = extractReasoningDirective("/reasoning:");
-    expect(res.hasDirective).toBe(true);
-    expect(res.reasoningLevel).toBeUndefined();
-    expect(res.rawLevel).toBeUndefined();
-    expect(res.cleaned).toBe("");
-  });
-
-  it("matches elevated with no argument", () => {
-    const res = extractElevatedDirective("/elevated:");
-    expect(res.hasDirective).toBe(true);
-    expect(res.elevatedLevel).toBeUndefined();
-    expect(res.rawLevel).toBeUndefined();
-    expect(res.cleaned).toBe("");
-  });
-
-  it("matches exec directive with options", () => {
-    const res = extractExecDirective(
-      "please /exec host=gateway security=allowlist ask=on-miss node=mac-mini now",
-    );
-    expect(res.hasDirective).toBe(true);
-    expect(res.execHost).toBe("gateway");
-    expect(res.execSecurity).toBe("allowlist");
-    expect(res.execAsk).toBe("on-miss");
-    expect(res.execNode).toBe("mac-mini");
-    expect(res.cleaned).toBe("please now");
-  });
-
-  it("captures invalid exec host values", () => {
-    const res = extractExecDirective("/exec host=spaceship");
-    expect(res.hasDirective).toBe(true);
-    expect(res.execHost).toBeUndefined();
-    expect(res.rawExecHost).toBe("spaceship");
-    expect(res.invalidHost).toBe(true);
-  });
-
-  it("matches queue directive", () => {
-    const res = extractQueueDirective("please /queue interrupt now");
-    expect(res.hasDirective).toBe(true);
-    expect(res.queueMode).toBe("interrupt");
-    expect(res.queueReset).toBe(false);
-    expect(res.cleaned).toBe("please now");
-  });
-
-  it("preserves spacing when stripping think directives before paths", () => {
-    const res = extractThinkDirective("thats not /think high/tmp/hello");
-    expect(res.hasDirective).toBe(true);
-    expect(res.cleaned).toBe("thats not /tmp/hello");
-  });
-
-  it("preserves spacing when stripping verbose directives before paths", () => {
-    const res = extractVerboseDirective("thats not /verbose on/tmp/hello");
-    expect(res.hasDirective).toBe(true);
-    expect(res.cleaned).toBe("thats not /tmp/hello");
-  });
-
-  it("preserves spacing when stripping reasoning directives before paths", () => {
-    const res = extractReasoningDirective("thats not /reasoning on/tmp/hello");
-    expect(res.hasDirective).toBe(true);
-    expect(res.cleaned).toBe("thats not /tmp/hello");
-  });
-
-  it("preserves spacing when stripping status directives before paths", () => {
-    const res = extractStatusDirective("thats not /status:/tmp/hello");
-    expect(res.hasDirective).toBe(true);
-    expect(res.cleaned).toBe("thats not /tmp/hello");
-  });
-
-  it("does not treat /usage as a status directive", () => {
-    const res = extractStatusDirective("thats not /usage:/tmp/hello");
-    expect(res.hasDirective).toBe(false);
-    expect(res.cleaned).toBe("thats not /usage:/tmp/hello");
-  });
-
-  it("parses queue options and modes", () => {
-    const res = extractQueueDirective(
-      "please /queue steer+backlog debounce:2s cap:5 drop:summarize now",
-    );
-    expect(res.hasDirective).toBe(true);
-    expect(res.queueMode).toBe("steer-backlog");
-    expect(res.debounceMs).toBe(2000);
-    expect(res.cap).toBe(5);
-    expect(res.dropPolicy).toBe("summarize");
-    expect(res.cleaned).toBe("please now");
-  });
-
-  it("extracts reply_to_current tag", () => {
-    const res = extractReplyToTag("ok [[reply_to_current]]", "msg-1");
-    expect(res.replyToId).toBe("msg-1");
-    expect(res.cleaned).toBe("ok");
-  });
-
-  it("extracts reply_to_current tag with whitespace", () => {
-    const res = extractReplyToTag("ok [[ reply_to_current ]]", "msg-1");
-    expect(res.replyToId).toBe("msg-1");
-    expect(res.cleaned).toBe("ok");
-  });
-
-  it("extracts reply_to id tag", () => {
-    const res = extractReplyToTag("see [[reply_to:12345]] now", "msg-1");
-    expect(res.replyToId).toBe("12345");
-    expect(res.cleaned).toBe("see now");
-  });
-
-  it("extracts reply_to id tag with whitespace", () => {
-    const res = extractReplyToTag("see [[ reply_to : 12345 ]] now", "msg-1");
-    expect(res.replyToId).toBe("12345");
-    expect(res.cleaned).toBe("see now");
-  });
-
-  it("preserves newlines when stripping reply tags", () => {
-    const res = extractReplyToTag("line 1\nline 2 [[reply_to_current]]\n\nline 3", "msg-2");
-    expect(res.replyToId).toBe("msg-2");
-    expect(res.cleaned).toBe("line 1\nline 2\n\nline 3");
-  });
+  expect(
+    resolveModel("ki", [defaultKey, kimiKey, "fixture-local/kimi-k2-0905-preview"], {
+      aliasIndex,
+    }),
+  ).toEqual({ ...kimi, isDefault: false, alias: "Kimi" });
 });

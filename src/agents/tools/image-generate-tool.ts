@@ -1,463 +1,244 @@
-import { Type } from "@sinclair/typebox";
-import type { OpenClawConfig } from "../../config/config.js";
-import { loadConfig } from "../../config/config.js";
-import {
-  generateImage,
-  listRuntimeImageGenerationProviders,
-} from "../../image-generation/runtime.js";
+import { extnameFromAnyPath } from "@openclaw/media-core/file-name";
+import { extensionForMime } from "@openclaw/media-core/mime";
+import { Type } from "typebox";
+import { normalizeImageGenerationResolution } from "../../image-generation/resolution.js";
+import { generateImage } from "../../image-generation/runtime.js";
 import type {
-  ImageGenerationProvider,
+  ImageGenerationOpenAIOptions,
+  ImageGenerationProviderOptions,
   ImageGenerationResolution,
   ImageGenerationSourceImage,
 } from "../../image-generation/types.js";
-import { getImageMetadata } from "../../media/image-ops.js";
-import { saveMediaBuffer } from "../../media/store.js";
-import { loadWebMedia } from "../../media/web-media.js";
-import { getProviderEnvVars } from "../../secrets/provider-env-vars.js";
-import { resolveUserPath } from "../../utils.js";
-import { ToolInputError, readNumberParam, readStringParam } from "./common.js";
-import { decodeDataUrl } from "./image-tool.helpers.js";
+import { createSubsystemLogger } from "../../logging/subsystem.js";
+import { parseImageGenerationModelRef } from "../../media-generation/model-ref.js";
+import { withImageGenerationProviders } from "../../media-generation/registry.js";
+import { resolveGeneratedMediaMaxBytes } from "../../media/configured-max-bytes.js";
+import { encodeImageWithinBytes, getImageMetadata } from "../../media/media-services.js";
+import { formatMediaSize } from "../../media/store.shared.js";
+import { readSnakeCaseParamRaw } from "../../param-key.js";
+import { createEnumOptionParser } from "../../shared/enum-option.js";
+import { buildMediaGenerationRequestKey } from "../media-generation-task-status-shared.js";
+import { optionalStringEnum } from "../schema/string-enum.js";
 import {
-  applyImageGenerationModelConfigDefaults,
-  resolveMediaToolLocalRoots,
-} from "./media-tool-shared.js";
-import {
-  buildToolModelConfigFromCandidates,
-  coerceToolModelConfig,
-  hasToolModelConfig,
-  resolveDefaultModelRef,
-  type ToolModelConfig,
-} from "./model-config.helpers.js";
-import {
-  createSandboxBridgeReadFile,
-  resolveSandboxedBridgeMediaPath,
+  asToolParamsRecord,
+  ToolInputError,
+  readNonNegativeIntegerParam,
+  readPositiveIntegerParam,
+  readToolStringParam,
   type AnyAgentTool,
-  type SandboxFsBridge,
-  type ToolFsPolicy,
-} from "./tool-runtime.helpers.js";
+} from "./common.js";
+import { persistGeneratedMediaBuffers } from "./generated-media-batch-persistence.js";
+import {
+  createImageGenerateDuplicateGuardResult,
+  createImageGenerateListActionResult,
+  createImageGenerateStatusActionResult,
+} from "./image-generate-tool.actions.js";
+import type { MediaGenerationTaskHandle } from "./media-generate-background-shared.js";
+import {
+  imageGenerationTaskLifecycle,
+  prepareMediaGenerationTask,
+  resolveMediaGenerateToolContext,
+  type MediaGenerateToolOptions,
+} from "./media-generate-background.js";
+import {
+  buildMediaGenerateToolExecutionResult,
+  buildSavedMediaAttachment,
+  buildMediaGenerationGeometryDetails,
+} from "./media-generate-result-shared.js";
+import { createMediaGenerateExecute } from "./media-generate-tool-actions-shared.js";
+import { acquireMediaGenerationToolProviders } from "./media-generation-tool-providers.js";
+import {
+  buildMediaReferenceDetails,
+  createCapabilityProviderRuntimeDeps,
+  MEDIA_GENERATE_DESCRIPTIONS,
+  loadMediaToolReferences,
+  normalizeMediaReferenceInputs,
+  readGenerationTimeoutMs,
+  resolveSelectedCapabilityProvider,
+} from "./media-tool-shared.js";
 
 const DEFAULT_COUNT = 1;
 const MAX_COUNT = 4;
-const MAX_INPUT_IMAGES = 5;
+const MAX_REFERENCE_IMAGE_INPUTS = 16;
 const DEFAULT_RESOLUTION: ImageGenerationResolution = "1K";
-const SUPPORTED_ASPECT_RATIOS = new Set([
+const GENERATED_IMAGE_MEDIA_SUBDIR = "tool-image-generation";
+const SUPPORTED_QUALITIES = ["low", "medium", "high", "xhigh", "max", "auto"] as const;
+const SUPPORTED_OUTPUT_FORMATS = ["png", "jpeg", "webp"] as const;
+const SUPPORTED_BACKGROUNDS = ["transparent", "opaque", "auto"] as const;
+const SUPPORTED_OPENAI_MODERATIONS = ["low", "auto"] as const;
+const SUPPORTED_FAL_CREATIVITY = ["raw", "low", "medium", "high"] as const;
+const SUPPORTED_ASPECT_RATIOS = [
   "1:1",
+  "2:1",
+  "20:9",
+  "19.5:9",
   "2:3",
   "3:2",
+  "2.35:1",
   "3:4",
   "4:3",
   "4:5",
   "5:4",
   "9:16",
+  "9:19.5",
+  "9:20",
   "16:9",
   "21:9",
-]);
+  "1:2",
+  "4:1",
+  "1:4",
+  "8:1",
+  "1:8",
+] as const;
+
+const log = createSubsystemLogger("agents/tools/image-generate");
 
 const ImageGenerateToolSchema = Type.Object({
-  action: Type.Optional(
-    Type.String({
-      description:
-        'Optional action: "generate" (default) or "list" to inspect available providers/models.',
-    }),
-  ),
-  prompt: Type.Optional(Type.String({ description: "Image generation prompt." })),
+  action: Type.Optional(Type.String({ description: MEDIA_GENERATE_DESCRIPTIONS.action })),
+  prompt: Type.Optional(Type.String({ description: "Image prompt." })),
   image: Type.Optional(
     Type.String({
-      description: "Optional reference image path or URL for edit mode.",
+      description: "Reference image path/URL for edit.",
     }),
   ),
   images: Type.Optional(
     Type.Array(Type.String(), {
-      description: `Optional reference images for edit mode (up to ${MAX_INPUT_IMAGES}).`,
+      description: `Reference images for edit or style reference; max ${MAX_REFERENCE_IMAGE_INPUTS}.`,
     }),
   ),
   model: Type.Optional(
-    Type.String({ description: "Optional provider/model override, e.g. openai/gpt-image-1." }),
-  ),
-  filename: Type.Optional(
     Type.String({
       description:
-        "Optional output filename hint. OpenClaw preserves the basename and saves under its managed media directory.",
+        "Provider/model override, e.g. openai/gpt-image-2; transparent OpenAI: openai/gpt-image-1.5.",
     }),
   ),
+  filename: Type.Optional(Type.String({ description: MEDIA_GENERATE_DESCRIPTIONS.filename })),
   size: Type.Optional(
     Type.String({
-      description:
-        "Optional size hint like 1024x1024, 1536x1024, 1024x1536, 1024x1792, or 1792x1024.",
+      description: "Size hint: 1024x1024, 1536x1024, 1024x1536, 2048x2048, 3840x2160.",
     }),
   ),
   aspectRatio: Type.Optional(
     Type.String({
       description:
-        "Optional aspect ratio hint: 1:1, 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, or 21:9.",
+        "Aspect ratio: 1:1, 2:1, 20:9, 19.5:9, 2:3, 3:2, 2.35:1, 3:4, 4:3, 4:5, 5:4, 9:16, 9:19.5, 9:20, 16:9, 21:9, 1:2, 4:1, 1:4, 8:1, 1:8.",
     }),
   ),
   resolution: Type.Optional(
     Type.String({
-      description:
-        "Optional resolution hint: 1K, 2K, or 4K. Useful for Google edit/generation flows.",
+      description: "Resolution: 1K, 2K, 4K; useful for Google.",
+    }),
+  ),
+  quality: optionalStringEnum(SUPPORTED_QUALITIES, {
+    description: "Quality: low, medium, high, xhigh, max, auto; model-specific.",
+  }),
+  outputFormat: optionalStringEnum(SUPPORTED_OUTPUT_FORMATS, {
+    description: "Output format: png, jpeg, webp.",
+  }),
+  background: optionalStringEnum(SUPPORTED_BACKGROUNDS, {
+    description: "Background: transparent, opaque, auto. Transparent needs png/webp output.",
+  }),
+  openai: Type.Optional(
+    Type.Object({
+      background: optionalStringEnum(SUPPORTED_BACKGROUNDS, {
+        description:
+          "OpenAI background: transparent, opaque, auto. Transparent needs png/webp; default model routes to gpt-image-1.5.",
+      }),
+      moderation: optionalStringEnum(SUPPORTED_OPENAI_MODERATIONS, {
+        description: "OpenAI moderation: low, auto.",
+      }),
+      outputCompression: Type.Optional(
+        Type.Integer({
+          description: "OpenAI jpeg/webp compression 0-100.",
+          minimum: 0,
+          maximum: 100,
+        }),
+      ),
+      user: Type.Optional(
+        Type.String({
+          description: "OpenAI stable end-user id.",
+        }),
+      ),
+    }),
+  ),
+  fal: Type.Optional(
+    Type.Object({
+      creativity: optionalStringEnum(SUPPORTED_FAL_CREATIVITY, {
+        description: "fal Krea creativity: raw, low, medium, high.",
+      }),
     }),
   ),
   count: Type.Optional(
-    Type.Number({
-      description: `Optional number of images to request (1-${MAX_COUNT}).`,
+    Type.Integer({
+      description: `Image count 1-${MAX_COUNT}.`,
       minimum: 1,
       maximum: MAX_COUNT,
     }),
   ),
+  timeoutMs: Type.Optional(
+    Type.Integer({
+      description: "Provider timeout ms (300000 tends to be a safe amount).",
+      minimum: 1,
+    }),
+  ),
 });
 
-function getImageGenerationProviderAuthEnvVars(providerId: string): string[] {
-  return getProviderEnvVars(providerId);
-}
+const parseImageOption = createEnumOptionParser(ToolInputError);
 
-function resolveImageGenerationModelCandidates(
-  cfg: OpenClawConfig | undefined,
-): Array<string | undefined> {
-  const providerDefaults = new Map<string, string>();
-  for (const provider of listRuntimeImageGenerationProviders({ config: cfg })) {
-    const providerId = provider.id.trim();
-    const modelId = provider.defaultModel?.trim();
-    if (!providerId || !modelId || providerDefaults.has(providerId)) {
+/**
+ * Re-encodes provider images that exceed the media store cap so a paid generation is kept.
+ * Fails only when no encoding fits, naming the generated image, its size and the cap.
+ */
+async function fitGeneratedImagesToMaxBytes<
+  T extends { buffer: Buffer; mimeType: string; fileName?: string },
+>(images: readonly T[], maxBytes: number): Promise<{ images: T[]; messages: string[] }> {
+  const fitted: T[] = [];
+  const messages: string[] = [];
+  const limit = formatMediaSize(maxBytes);
+  for (const [index, image] of images.entries()) {
+    if (image.buffer.byteLength <= maxBytes) {
+      fitted.push(image);
       continue;
     }
-    providerDefaults.set(providerId, `${providerId}/${modelId}`);
-  }
-
-  const orderedProviders = [
-    resolveDefaultModelRef(cfg).provider,
-    "openai",
-    "google",
-    ...providerDefaults.keys(),
-  ];
-  const orderedRefs: string[] = [];
-  const seen = new Set<string>();
-  for (const providerId of orderedProviders) {
-    const ref = providerDefaults.get(providerId);
-    if (!ref || seen.has(ref)) {
-      continue;
+    const label = `Generated image ${index + 1} (${image.mimeType}, ${formatMediaSize(image.buffer.byteLength)})`;
+    let encoded: Awaited<ReturnType<typeof encodeImageWithinBytes>>;
+    try {
+      encoded = await encodeImageWithinBytes(image.buffer, maxBytes);
+    } catch (error) {
+      throw new Error(`${label} exceeds the ${limit} media limit and could not be re-encoded`, {
+        cause: error,
+      });
     }
-    seen.add(ref);
-    orderedRefs.push(ref);
-  }
-  return orderedRefs;
-}
-
-export function resolveImageGenerationModelConfigForTool(params: {
-  cfg?: OpenClawConfig;
-  agentDir?: string;
-}): ToolModelConfig | null {
-  const explicit = coerceToolModelConfig(params.cfg?.agents?.defaults?.imageGenerationModel);
-  if (hasToolModelConfig(explicit)) {
-    return explicit;
-  }
-  return buildToolModelConfigFromCandidates({
-    explicit,
-    agentDir: params.agentDir,
-    candidates: resolveImageGenerationModelCandidates(params.cfg),
-  });
-}
-
-function resolveAction(args: Record<string, unknown>): "generate" | "list" {
-  const raw = readStringParam(args, "action");
-  if (!raw) {
-    return "generate";
-  }
-  const normalized = raw.trim().toLowerCase();
-  if (normalized === "generate" || normalized === "list") {
-    return normalized;
-  }
-  throw new ToolInputError('action must be "generate" or "list"');
-}
-
-function resolveRequestedCount(args: Record<string, unknown>): number {
-  const count = readNumberParam(args, "count", { integer: true });
-  if (count === undefined) {
-    return DEFAULT_COUNT;
-  }
-  if (count < 1 || count > MAX_COUNT) {
-    throw new ToolInputError(`count must be between 1 and ${MAX_COUNT}`);
-  }
-  return count;
-}
-
-function normalizeResolution(raw: string | undefined): ImageGenerationResolution | undefined {
-  const normalized = raw?.trim().toUpperCase();
-  if (!normalized) {
-    return undefined;
-  }
-  if (normalized === "1K" || normalized === "2K" || normalized === "4K") {
-    return normalized;
-  }
-  throw new ToolInputError("resolution must be one of 1K, 2K, or 4K");
-}
-
-function normalizeAspectRatio(raw: string | undefined): string | undefined {
-  const normalized = raw?.trim();
-  if (!normalized) {
-    return undefined;
-  }
-  if (SUPPORTED_ASPECT_RATIOS.has(normalized)) {
-    return normalized;
-  }
-  throw new ToolInputError(
-    "aspectRatio must be one of 1:1, 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, or 21:9",
-  );
-}
-
-function normalizeReferenceImages(args: Record<string, unknown>): string[] {
-  const imageCandidates: string[] = [];
-  if (typeof args.image === "string") {
-    imageCandidates.push(args.image);
-  }
-  if (Array.isArray(args.images)) {
-    imageCandidates.push(
-      ...args.images.filter((value): value is string => typeof value === "string"),
-    );
-  }
-
-  const seen = new Set<string>();
-  const normalized: string[] = [];
-  for (const candidate of imageCandidates) {
-    const trimmed = candidate.trim();
-    const dedupe = trimmed.startsWith("@") ? trimmed.slice(1).trim() : trimmed;
-    if (!dedupe || seen.has(dedupe)) {
-      continue;
-    }
-    seen.add(dedupe);
-    normalized.push(trimmed);
-  }
-  if (normalized.length > MAX_INPUT_IMAGES) {
-    throw new ToolInputError(
-      `Too many reference images: ${normalized.length} provided, maximum is ${MAX_INPUT_IMAGES}.`,
-    );
-  }
-  return normalized;
-}
-
-function parseImageGenerationModelRef(
-  raw: string | undefined,
-): { provider: string; model: string } | null {
-  const trimmed = raw?.trim();
-  if (!trimmed) {
-    return null;
-  }
-  const slashIndex = trimmed.indexOf("/");
-  if (slashIndex <= 0 || slashIndex === trimmed.length - 1) {
-    return null;
-  }
-  return {
-    provider: trimmed.slice(0, slashIndex).trim(),
-    model: trimmed.slice(slashIndex + 1).trim(),
-  };
-}
-
-function resolveSelectedImageGenerationProvider(params: {
-  config?: OpenClawConfig;
-  imageGenerationModelConfig: ToolModelConfig;
-  modelOverride?: string;
-}): ImageGenerationProvider | undefined {
-  const selectedRef =
-    parseImageGenerationModelRef(params.modelOverride) ??
-    parseImageGenerationModelRef(params.imageGenerationModelConfig.primary);
-  if (!selectedRef) {
-    return undefined;
-  }
-  return listRuntimeImageGenerationProviders({ config: params.config }).find(
-    (provider) =>
-      provider.id === selectedRef.provider ||
-      (provider.aliases ?? []).includes(selectedRef.provider),
-  );
-}
-
-function validateImageGenerationCapabilities(params: {
-  provider: ImageGenerationProvider | undefined;
-  count: number;
-  inputImageCount: number;
-  size?: string;
-  aspectRatio?: string;
-  resolution?: ImageGenerationResolution;
-}) {
-  const provider = params.provider;
-  if (!provider) {
-    return;
-  }
-  const isEdit = params.inputImageCount > 0;
-  const modeCaps = isEdit ? provider.capabilities.edit : provider.capabilities.generate;
-  const geometry = provider.capabilities.geometry;
-  const maxCount = modeCaps.maxCount ?? MAX_COUNT;
-  if (params.count > maxCount) {
-    throw new ToolInputError(
-      `${provider.id} ${isEdit ? "edit" : "generate"} supports at most ${maxCount} output image${maxCount === 1 ? "" : "s"}.`,
-    );
-  }
-
-  if (isEdit) {
-    if (!provider.capabilities.edit.enabled) {
-      throw new ToolInputError(`${provider.id} does not support reference-image edits.`);
-    }
-    const maxInputImages = provider.capabilities.edit.maxInputImages ?? MAX_INPUT_IMAGES;
-    if (params.inputImageCount > maxInputImages) {
-      throw new ToolInputError(
-        `${provider.id} edit supports at most ${maxInputImages} reference image${maxInputImages === 1 ? "" : "s"}.`,
+    if (encoded.bytes > maxBytes) {
+      throw new Error(
+        `${label} exceeds the ${limit} media limit; the smallest re-encoding is ${formatMediaSize(encoded.bytes)} (${encoded.mimeType}, ${encoded.width}x${encoded.height})`,
       );
     }
-  }
-
-  if (params.size) {
-    if (!modeCaps.supportsSize) {
-      throw new ToolInputError(
-        `${provider.id} ${isEdit ? "edit" : "generate"} does not support size overrides.`,
-      );
-    }
-    if ((geometry?.sizes?.length ?? 0) > 0 && !geometry?.sizes?.includes(params.size)) {
-      throw new ToolInputError(
-        `${provider.id} ${isEdit ? "edit" : "generate"} size must be one of ${geometry?.sizes?.join(", ")}.`,
-      );
-    }
-  }
-
-  if (params.aspectRatio) {
-    if (!modeCaps.supportsAspectRatio) {
-      throw new ToolInputError(
-        `${provider.id} ${isEdit ? "edit" : "generate"} does not support aspectRatio overrides.`,
-      );
-    }
-    if (
-      (geometry?.aspectRatios?.length ?? 0) > 0 &&
-      !geometry?.aspectRatios?.includes(params.aspectRatio)
-    ) {
-      throw new ToolInputError(
-        `${provider.id} ${isEdit ? "edit" : "generate"} aspectRatio must be one of ${geometry?.aspectRatios?.join(", ")}.`,
-      );
-    }
-  }
-
-  if (params.resolution) {
-    if (!modeCaps.supportsResolution) {
-      throw new ToolInputError(
-        `${provider.id} ${isEdit ? "edit" : "generate"} does not support resolution overrides.`,
-      );
-    }
-    if (
-      (geometry?.resolutions?.length ?? 0) > 0 &&
-      !geometry?.resolutions?.includes(params.resolution)
-    ) {
-      throw new ToolInputError(
-        `${provider.id} ${isEdit ? "edit" : "generate"} resolution must be one of ${geometry?.resolutions?.join("/")}.`,
-      );
-    }
-  }
-}
-
-type ImageGenerateSandboxConfig = {
-  root: string;
-  bridge: SandboxFsBridge;
-};
-
-async function loadReferenceImages(params: {
-  imageInputs: string[];
-  maxBytes?: number;
-  localRoots: string[];
-  sandboxConfig: { root: string; bridge: SandboxFsBridge; workspaceOnly: boolean } | null;
-}): Promise<
-  Array<{
-    sourceImage: ImageGenerationSourceImage;
-    resolvedImage: string;
-    rewrittenFrom?: string;
-  }>
-> {
-  const loaded: Array<{
-    sourceImage: ImageGenerationSourceImage;
-    resolvedImage: string;
-    rewrittenFrom?: string;
-  }> = [];
-
-  for (const imageRawInput of params.imageInputs) {
-    const trimmed = imageRawInput.trim();
-    const imageRaw = trimmed.startsWith("@") ? trimmed.slice(1).trim() : trimmed;
-    if (!imageRaw) {
-      throw new ToolInputError("image required (empty string in array)");
-    }
-    const looksLikeWindowsDrivePath = /^[a-zA-Z]:[\\/]/.test(imageRaw);
-    const hasScheme = /^[a-z][a-z0-9+.-]*:/i.test(imageRaw);
-    const isFileUrl = /^file:/i.test(imageRaw);
-    const isHttpUrl = /^https?:\/\//i.test(imageRaw);
-    const isDataUrl = /^data:/i.test(imageRaw);
-    if (hasScheme && !looksLikeWindowsDrivePath && !isFileUrl && !isHttpUrl && !isDataUrl) {
-      throw new ToolInputError(
-        `Unsupported image reference: ${imageRawInput}. Use a file path, a file:// URL, a data: URL, or an http(s) URL.`,
-      );
-    }
-    if (params.sandboxConfig && isHttpUrl) {
-      throw new ToolInputError("Sandboxed image_generate does not allow remote URLs.");
-    }
-
-    const resolvedImage = (() => {
-      if (params.sandboxConfig) {
-        return imageRaw;
-      }
-      if (imageRaw.startsWith("~")) {
-        return resolveUserPath(imageRaw);
-      }
-      return imageRaw;
-    })();
-
-    const resolvedPathInfo: { resolved: string; rewrittenFrom?: string } = isDataUrl
-      ? { resolved: "" }
-      : params.sandboxConfig
-        ? await resolveSandboxedBridgeMediaPath({
-            sandbox: params.sandboxConfig,
-            mediaPath: resolvedImage,
-            inboundFallbackDir: "media/inbound",
-          })
-        : {
-            resolved: resolvedImage.startsWith("file://")
-              ? resolvedImage.slice("file://".length)
-              : resolvedImage,
-          };
-    const resolvedPath = isDataUrl ? null : resolvedPathInfo.resolved;
-
-    const media = isDataUrl
-      ? decodeDataUrl(resolvedImage)
-      : params.sandboxConfig
-        ? await loadWebMedia(resolvedPath ?? resolvedImage, {
-            maxBytes: params.maxBytes,
-            sandboxValidated: true,
-            readFile: createSandboxBridgeReadFile({ sandbox: params.sandboxConfig }),
-          })
-        : await loadWebMedia(resolvedPath ?? resolvedImage, {
-            maxBytes: params.maxBytes,
-            localRoots: params.localRoots,
-          });
-    if (media.kind !== "image") {
-      throw new ToolInputError(`Unsupported media type: ${media.kind}`);
-    }
-
-    const mimeType =
-      ("contentType" in media && media.contentType) ||
-      ("mimeType" in media && media.mimeType) ||
-      "image/png";
-
-    loaded.push({
-      sourceImage: {
-        buffer: media.buffer,
-        mimeType,
-      },
-      resolvedImage,
-      ...(resolvedPathInfo.rewrittenFrom ? { rewrittenFrom: resolvedPathInfo.rewrittenFrom } : {}),
+    const fileName =
+      image.fileName &&
+      `${image.fileName.slice(0, image.fileName.length - extnameFromAnyPath(image.fileName).length)}${extensionForMime(encoded.mimeType) ?? ""}`;
+    fitted.push({
+      ...image,
+      buffer: encoded.data,
+      mimeType: encoded.mimeType,
+      ...(fileName ? { fileName } : {}),
     });
+    messages.push(
+      `${label} exceeded the ${limit} media limit; saved as ${encoded.mimeType}, ${formatMediaSize(encoded.bytes)}, ${encoded.width}x${encoded.height}.`,
+    );
   }
-
-  return loaded;
+  return { images: fitted, messages };
 }
 
-async function inferResolutionFromInputImages(
+async function inferImageGenerationResolution(
   images: ImageGenerationSourceImage[],
+  signal?: AbortSignal,
 ): Promise<ImageGenerationResolution> {
   let maxDimension = 0;
   for (const image of images) {
+    signal?.throwIfAborted();
     const meta = await getImageMetadata(image.buffer);
+    signal?.throwIfAborted();
     const dimension = Math.max(meta?.width ?? 0, meta?.height ?? 0);
     maxDimension = Math.max(maxDimension, dimension);
   }
@@ -470,191 +251,356 @@ async function inferResolutionFromInputImages(
   return DEFAULT_RESOLUTION;
 }
 
-export function createImageGenerateTool(options?: {
-  config?: OpenClawConfig;
-  agentDir?: string;
-  workspaceDir?: string;
-  sandbox?: ImageGenerateSandboxConfig;
-  fsPolicy?: ToolFsPolicy;
-}): AnyAgentTool | null {
-  const cfg = options?.config ?? loadConfig();
-  const imageGenerationModelConfig = resolveImageGenerationModelConfigForTool({
-    cfg,
-    agentDir: options?.agentDir,
+function normalizeOpenAIOptions(args: Record<string, unknown>): ImageGenerationOpenAIOptions {
+  const raw = asToolParamsRecord(args.openai);
+  const background = parseImageOption(
+    readToolStringParam(raw, "background"),
+    SUPPORTED_BACKGROUNDS,
+    "openai.background",
+  );
+  const moderation = parseImageOption(
+    readToolStringParam(raw, "moderation"),
+    SUPPORTED_OPENAI_MODERATIONS,
+    "openai.moderation",
+  );
+  if (readSnakeCaseParamRaw(raw, "outputCompression") === null) {
+    throw new ToolInputError("openai.outputCompression must be between 0 and 100");
+  }
+  const outputCompression = readNonNegativeIntegerParam(raw, "outputCompression", {
+    message: "openai.outputCompression must be between 0 and 100",
+    max: 100,
   });
-  if (!imageGenerationModelConfig) {
+  const user = readToolStringParam(raw, "user");
+  return {
+    ...(background ? { background } : {}),
+    ...(moderation ? { moderation } : {}),
+    ...(outputCompression !== undefined ? { outputCompression } : {}),
+    ...(user ? { user } : {}),
+  };
+}
+
+function normalizeProviderOptions(
+  args: Record<string, unknown>,
+): ImageGenerationProviderOptions | undefined {
+  const falRaw = asToolParamsRecord(args.fal);
+  const falCreativity = parseImageOption(
+    readToolStringParam(falRaw, "creativity"),
+    SUPPORTED_FAL_CREATIVITY,
+    "fal.creativity",
+  );
+  const openai = normalizeOpenAIOptions(args);
+  const fal = falCreativity ? { creativity: falCreativity } : undefined;
+  return fal || Object.keys(openai).length > 0
+    ? { ...(fal ? { fal } : {}), ...(Object.keys(openai).length > 0 ? { openai } : {}) }
+    : undefined;
+}
+
+export function createImageGenerateTool(
+  options?: MediaGenerateToolOptions,
+  preparedAvailability?: boolean,
+): AnyAgentTool | null {
+  const context = resolveMediaGenerateToolContext(
+    "imageGenerationProviders",
+    options,
+    log,
+    preparedAvailability,
+  );
+  if (!context) {
     return null;
   }
-  const effectiveCfg =
-    applyImageGenerationModelConfigDefaults(cfg, imageGenerationModelConfig) ?? cfg;
-  const localRoots = resolveMediaToolLocalRoots(options?.workspaceDir, {
-    workspaceOnly: options?.fsPolicy?.workspaceOnly === true,
-  });
-  const sandboxConfig =
-    options?.sandbox && options.sandbox.root.trim()
-      ? {
-          root: options.sandbox.root.trim(),
-          bridge: options.sandbox.bridge,
-          workspaceOnly: options.fsPolicy?.workspaceOnly === true,
-        }
-      : null;
+  const { cfg, sandboxConfig, taskOptions } = context;
 
   return {
     label: "Image Generation",
     name: "image_generate",
     description:
-      'Generate new images or edit reference images with the configured or inferred image-generation model. Set agents.defaults.imageGenerationModel.primary to pick a provider/model. If you want openai/*, google/*, fal/*, or another provider, configure that provider auth/API key first. Use action="list" to inspect available providers, models, and auth hints. Generated images are delivered automatically from the tool result as MEDIA paths.',
+      'Create/edit images. Batch via count; aspectRatio and resolution up to 4K. Session chat runs in background: call once/request; the result returns as a later turn that sends the media. This turn: short ack at most, then end; no poll/yield. Transparent: outputFormat png|webp + background="transparent"; OpenAI also openai.background, default gpt-image-1.5. action=list providers/models/readiness/auth; status active task.',
     parameters: ImageGenerateToolSchema,
-    execute: async (_toolCallId, args) => {
-      const params = args as Record<string, unknown>;
-      const action = resolveAction(params);
-      if (action === "list") {
-        const providers = listRuntimeImageGenerationProviders({ config: effectiveCfg }).map(
-          (provider) => ({
-            id: provider.id,
-            ...(provider.label ? { label: provider.label } : {}),
-            ...(provider.defaultModel ? { defaultModel: provider.defaultModel } : {}),
-            models: provider.models ?? (provider.defaultModel ? [provider.defaultModel] : []),
-            authEnvVars: getImageGenerationProviderAuthEnvVars(provider.id),
-            capabilities: provider.capabilities,
-          }),
-        );
-        const lines = providers.flatMap((provider) => {
-          const caps: string[] = [];
-          if (provider.capabilities.edit.enabled) {
-            const maxRefs = provider.capabilities.edit.maxInputImages;
-            caps.push(
-              `editing${typeof maxRefs === "number" ? ` up to ${maxRefs} ref${maxRefs === 1 ? "" : "s"}` : ""}`,
-            );
-          }
-          if ((provider.capabilities.geometry?.resolutions?.length ?? 0) > 0) {
-            caps.push(`resolutions ${provider.capabilities.geometry?.resolutions?.join("/")}`);
-          }
-          if ((provider.capabilities.geometry?.sizes?.length ?? 0) > 0) {
-            caps.push(`sizes ${provider.capabilities.geometry?.sizes?.join(", ")}`);
-          }
-          if ((provider.capabilities.geometry?.aspectRatios?.length ?? 0) > 0) {
-            caps.push(`aspect ratios ${provider.capabilities.geometry?.aspectRatios?.join(", ")}`);
-          }
-          const modelLine =
-            provider.models.length > 0
-              ? `models: ${provider.models.join(", ")}`
-              : "models: unknown";
-          return [
-            `${provider.id}${provider.defaultModel ? ` (default ${provider.defaultModel})` : ""}`,
-            `  ${modelLine}`,
-            ...(provider.authEnvVars.length > 0
-              ? [`  auth: set ${provider.authEnvVars.join(" / ")} to use ${provider.id}/*`]
-              : []),
-            ...(caps.length > 0 ? [`  capabilities: ${caps.join("; ")}`] : []),
-          ];
-        });
-        return {
-          content: [{ type: "text", text: lines.join("\n") }],
-          details: { providers },
-        };
-      }
-
-      const prompt = readStringParam(params, "prompt", { required: true });
-      const imageInputs = normalizeReferenceImages(params);
-      const model = readStringParam(params, "model");
-      const filename = readStringParam(params, "filename");
-      const size = readStringParam(params, "size");
-      const aspectRatio = normalizeAspectRatio(readStringParam(params, "aspectRatio"));
-      const explicitResolution = normalizeResolution(readStringParam(params, "resolution"));
-      const count = resolveRequestedCount(params);
-      const loadedReferenceImages = await loadReferenceImages({
-        imageInputs,
-        localRoots,
-        sandboxConfig,
-      });
-      const inputImages = loadedReferenceImages.map((entry) => entry.sourceImage);
-      const resolution =
-        explicitResolution ??
-        (size
-          ? undefined
-          : inputImages.length > 0
-            ? await inferResolutionFromInputImages(inputImages)
-            : undefined);
-      const selectedProvider = resolveSelectedImageGenerationProvider({
-        config: effectiveCfg,
-        imageGenerationModelConfig,
-        modelOverride: model,
-      });
-      validateImageGenerationCapabilities({
-        provider: selectedProvider,
-        count,
-        inputImageCount: inputImages.length,
-        size,
-        aspectRatio,
-        resolution,
-      });
-
-      const result = await generateImage({
-        cfg: effectiveCfg,
-        prompt,
-        agentDir: options?.agentDir,
-        modelOverride: model,
-        size,
-        aspectRatio,
-        resolution,
-        count,
-        inputImages,
-      });
-
-      const savedImages = await Promise.all(
-        result.images.map((image) =>
-          saveMediaBuffer(
-            image.buffer,
-            image.mimeType,
-            "tool-image-generation",
-            undefined,
-            filename || image.fileName,
-          ),
+    execute: createMediaGenerateExecute({
+      options,
+      list: (auth) =>
+        withImageGenerationProviders(cfg, (providers) =>
+          createImageGenerateListActionResult({ cfg, providers, ...auth }),
         ),
-      );
+      status: createImageGenerateStatusActionResult,
+      generate: (params, signal) => {
+        const model = readToolStringParam(params, "model");
+        return prepareMediaGenerationTask({
+          generationLabel: "image",
+          cfg,
+          args: params,
+          model,
+          options,
+          signal,
+          findDuplicate: createImageGenerateDuplicateGuardResult,
+          acquire: (config) =>
+            acquireMediaGenerationToolProviders("imageGenerationProviders", {
+              cfg: config,
+              prepared: options?.preparedModelRuntime,
+            }),
+          resolveProviders: (acquired) => acquired.providers,
+          prepare: async ({
+            resources: acquired,
+            modelConfig: imageGenerationModelConfig,
+            effectiveCfg,
+            prompt,
+            explicitModelConfig,
+          }) => {
+            const imageGenerationProviders = acquired.providers;
+            const remoteMediaSsrfPolicy = effectiveCfg.tools?.web?.fetch?.ssrfPolicy;
 
-      const revisedPrompts = result.images
-        .map((image) => image.revisedPrompt?.trim())
-        .filter((entry): entry is string => Boolean(entry));
-      const lines = [
-        `Generated ${savedImages.length} image${savedImages.length === 1 ? "" : "s"} with ${result.provider}/${result.model}.`,
-      ];
-
-      return {
-        content: [{ type: "text", text: lines.join("\n") }],
-        details: {
-          provider: result.provider,
-          model: result.model,
-          count: savedImages.length,
-          media: {
-            mediaUrls: savedImages.map((image) => image.path),
-          },
-          paths: savedImages.map((image) => image.path),
-          ...(imageInputs.length === 1
-            ? {
-                image: loadedReferenceImages[0]?.resolvedImage,
-                ...(loadedReferenceImages[0]?.rewrittenFrom
-                  ? { rewrittenFrom: loadedReferenceImages[0].rewrittenFrom }
-                  : {}),
+            const imageInputs = normalizeMediaReferenceInputs({
+              args: params,
+              singularKey: "image",
+              pluralKey: "images",
+              maxCount: MAX_REFERENCE_IMAGE_INPUTS,
+              label: "reference images",
+            });
+            const filename = readToolStringParam(params, "filename");
+            const size = readToolStringParam(params, "size");
+            const aspectRatio = parseImageOption(
+              readToolStringParam(params, "aspectRatio"),
+              SUPPORTED_ASPECT_RATIOS,
+              "aspectRatio",
+            );
+            const explicitResolution = normalizeImageGenerationResolution(
+              readToolStringParam(params, "resolution"),
+            );
+            const timeoutMs =
+              readGenerationTimeoutMs(params) ?? imageGenerationModelConfig.timeoutMs;
+            const quality = parseImageOption(
+              readToolStringParam(params, "quality"),
+              SUPPORTED_QUALITIES,
+              "quality",
+            );
+            const outputFormat = parseImageOption(
+              readToolStringParam(params, "outputFormat"),
+              SUPPORTED_OUTPUT_FORMATS,
+              "outputFormat",
+            );
+            const background = parseImageOption(
+              readToolStringParam(params, "background"),
+              SUPPORTED_BACKGROUNDS,
+              "background",
+            );
+            const providerOptions = normalizeProviderOptions(params);
+            const selectedProvider = resolveSelectedCapabilityProvider({
+              providers: imageGenerationProviders,
+              modelConfig: imageGenerationModelConfig,
+              modelOverride: model,
+            });
+            const explicitModelRef = parseImageGenerationModelRef(model);
+            const primaryModelRef = parseImageGenerationModelRef(
+              imageGenerationModelConfig.primary,
+            );
+            const selectedProviderId = selectedProvider?.id;
+            const selectedModelId =
+              model !== undefined
+                ? explicitModelRef && explicitModelRef.provider === selectedProviderId
+                  ? explicitModelRef.model
+                  : selectedProvider?.models?.includes(model)
+                    ? model
+                    : (explicitModelRef?.model ?? model)
+                : primaryModelRef && primaryModelRef.provider === selectedProviderId
+                  ? primaryModelRef.model
+                  : (imageGenerationModelConfig.primary ?? selectedProvider?.defaultModel);
+            if (readSnakeCaseParamRaw(params, "count") === null) {
+              throw new ToolInputError(`count must be between 1 and ${MAX_COUNT}`);
+            }
+            const count =
+              readPositiveIntegerParam(params, "count", {
+                message: `count must be between 1 and ${MAX_COUNT}`,
+                max: MAX_COUNT,
+              }) ?? DEFAULT_COUNT;
+            const requestKey = buildMediaGenerationRequestKey({
+              tool: "image_generate",
+              prompt,
+              provider:
+                selectedProvider?.id ?? explicitModelRef?.provider ?? primaryModelRef?.provider,
+              model:
+                model !== undefined
+                  ? (explicitModelRef?.model ?? model)
+                  : (primaryModelRef?.model ??
+                    imageGenerationModelConfig.primary ??
+                    selectedProvider?.defaultModel),
+              count,
+              imageInputs,
+              size,
+              aspectRatio,
+              resolution: explicitResolution,
+              quality,
+              outputFormat,
+              background,
+              filename,
+              providerOptions,
+            });
+            const duplicateGuardResult = await createImageGenerateDuplicateGuardResult(
+              options?.agentSessionKey,
+              { prompt, requestKey, agentId: options?.requesterAgentId },
+            );
+            if (duplicateGuardResult) {
+              return { kind: "result" as const, result: duplicateGuardResult };
+            }
+            signal?.throwIfAborted();
+            acquired.assertOpen();
+            if (selectedProvider) {
+              const isEdit = imageInputs.length > 0;
+              const modeCaps = isEdit
+                ? selectedProvider.capabilities.edit
+                : selectedProvider.capabilities.generate;
+              const maxCount = modeCaps.maxCount ?? MAX_COUNT;
+              if (count > maxCount) {
+                throw new ToolInputError(
+                  `${selectedProvider.id} ${isEdit ? "edit" : "generate"} supports at most ${maxCount} output image${maxCount === 1 ? "" : "s"}.`,
+                );
               }
-            : imageInputs.length > 1
-              ? {
-                  images: loadedReferenceImages.map((entry) => ({
-                    image: entry.resolvedImage,
-                    ...(entry.rewrittenFrom ? { rewrittenFrom: entry.rewrittenFrom } : {}),
-                  })),
-                }
-              : {}),
-          ...(resolution ? { resolution } : {}),
-          ...(size ? { size } : {}),
-          ...(aspectRatio ? { aspectRatio } : {}),
-          ...(filename ? { filename } : {}),
-          attempts: result.attempts,
-          metadata: result.metadata,
-          ...(revisedPrompts.length > 0 ? { revisedPrompts } : {}),
-        },
-      };
-    },
+            }
+            const referenceMaxBytes = resolveGeneratedMediaMaxBytes(effectiveCfg, "image");
+            const loadedReferenceImages = await loadMediaToolReferences({
+              workspaceReadiness: context.workspaceReadiness,
+              inputs: imageInputs,
+              toolName: "image_generate",
+              expectedKind: "image",
+              maxBytes: referenceMaxBytes,
+              workspaceDir: options?.workspaceDir,
+              cwd: options?.cwd,
+              fsPolicy: options?.fsPolicy,
+              sandbox: sandboxConfig,
+              ssrfPolicy: remoteMediaSsrfPolicy,
+              signal,
+              mapMedia: (media) => ({
+                buffer: media.buffer,
+                mimeType:
+                  ("contentType" in media && media.contentType) ||
+                  ("mimeType" in media && media.mimeType) ||
+                  "image/png",
+              }),
+            });
+            const inputImages = loadedReferenceImages.map((entry) => entry.source);
+            const modeCaps =
+              inputImages.length > 0
+                ? selectedProvider?.capabilities.edit
+                : selectedProvider?.capabilities.generate;
+            const inferredResolution =
+              size || explicitResolution
+                ? undefined
+                : inputImages.length > 0
+                  ? await inferImageGenerationResolution(inputImages, signal)
+                  : undefined;
+            const resolution =
+              explicitResolution ??
+              (modeCaps?.supportsResolution === false ||
+              (selectedModelId &&
+                selectedProvider?.capabilities.geometry?.resolutionsByModel?.[selectedModelId]
+                  ?.length === 0)
+                ? undefined
+                : inferredResolution);
+            return {
+              kind: "task" as const,
+              params: {
+                lifecycle: imageGenerationTaskLifecycle,
+                ...taskOptions(),
+                prompt,
+                requestKey,
+                providerId: selectedProvider?.id,
+
+                detailExtras: {
+                  ...buildMediaReferenceDetails(loadedReferenceImages, "image"),
+                  ...(model ? { model } : {}),
+                  ...(resolution ? { resolution } : {}),
+                  ...(size ? { size } : {}),
+                  ...(aspectRatio ? { aspectRatio } : {}),
+                  ...(quality ? { quality } : {}),
+                  ...(outputFormat ? { outputFormat } : {}),
+                  ...(background ? { background } : {}),
+                  ...(filename ? { filename } : {}),
+                  ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+                },
+                run: async (taskHandle: MediaGenerationTaskHandle | null) => {
+                  imageGenerationTaskLifecycle.recordTaskProgress({
+                    handle: taskHandle,
+                    progressSummary: "Generating image",
+                  });
+                  const result = await generateImage(
+                    {
+                      cfg: effectiveCfg,
+                      prompt,
+                      agentDir: options?.agentDir,
+                      modelOverride: model,
+                      autoProviderFallback: explicitModelConfig ? false : undefined,
+                      size,
+                      aspectRatio,
+                      resolution: explicitResolution,
+                      inferredResolution,
+                      quality,
+                      outputFormat,
+                      background,
+                      count,
+                      inputImages,
+                      timeoutMs,
+                      providerOptions,
+                      ssrfPolicy: remoteMediaSsrfPolicy,
+                    },
+                    createCapabilityProviderRuntimeDeps(imageGenerationProviders),
+                  );
+                  imageGenerationTaskLifecycle.recordTaskProgress({
+                    handle: taskHandle,
+                    progressSummary: "Saving generated image",
+                    provider: result.provider,
+                    model: result.model,
+                  });
+                  const geometryDetails = buildMediaGenerationGeometryDetails("image", result, {
+                    size,
+                    aspectRatio,
+                  });
+                  const maxBytes = resolveGeneratedMediaMaxBytes(effectiveCfg, "image");
+                  const fitted = await fitGeneratedImagesToMaxBytes(
+                    result.images.map((image) => ({
+                      ...image,
+                      fileName: filename || image.fileName,
+                    })),
+                    maxBytes,
+                  );
+                  const savedImages = await persistGeneratedMediaBuffers({
+                    assets: fitted.images,
+                    subdir: GENERATED_IMAGE_MEDIA_SUBDIR,
+                    maxBytes,
+                  });
+                  const revisedPrompts = result.images
+                    .map((image) => image.revisedPrompt?.trim())
+                    .filter((entry): entry is string => Boolean(entry));
+                  const attachments = savedImages.map((image) =>
+                    buildSavedMediaAttachment("image", image),
+                  );
+                  const execution = await buildMediaGenerateToolExecutionResult({
+                    kind: "image",
+                    result,
+                    attachments,
+                    mediaUrls: savedImages.map((media) => media.path),
+                    sandbox: context.acquireOutputSandbox,
+                    maxBytes,
+                    messages: fitted.messages,
+                    taskHandle,
+                    details: {
+                      ...buildMediaReferenceDetails(loadedReferenceImages, "image"),
+                      ...geometryDetails,
+                      ...(quality ? { quality } : {}),
+                      ...(outputFormat ? { outputFormat } : {}),
+                      ...(background ? { background } : {}),
+                      ...(filename ? { filename } : {}),
+                      ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+                    },
+                  });
+                  if (revisedPrompts.length > 0) {
+                    execution.details.revisedPrompts = revisedPrompts;
+                  }
+                  return execution;
+                },
+              },
+            };
+          },
+        });
+      },
+    }),
   };
 }

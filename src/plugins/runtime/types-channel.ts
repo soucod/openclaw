@@ -1,24 +1,44 @@
 /**
  * Runtime helpers for native channel plugins.
  *
- * This surface exposes core and channel-specific helpers used by bundled
- * plugins. Prefer hooks unless you need tight in-process coupling with the
- * OpenClaw messaging/runtime stack.
+ * This surface exposes generic core helpers only. Plugin-owned behavior stays
+ * inside the owning plugin package instead of hanging off core runtime slots
+ * keyed by plugin id.
  */
-type ReadChannelAllowFromStore =
-  typeof import("../../pairing/pairing-store.js").readChannelAllowFromStore;
-type UpsertChannelPairingRequest =
-  typeof import("../../pairing/pairing-store.js").upsertChannelPairingRequest;
+import type { DispatchReplyFromConfig as CoreDispatchReplyFromConfig } from "../../auto-reply/reply/dispatch-from-config.types.js";
+import type {
+  BuildMentionRegexes,
+  MatchesMentionPatterns,
+  MatchesMentionWithExplicit,
+} from "../../auto-reply/reply/mentions.types.js";
+import type { ChannelRuntimeContextRegistry } from "../../channels/plugins/channel-runtime-surface.types.js";
+import type { ResolveMarkdownTableMode } from "../../config/markdown-tables.types.js";
+import type {
+  ReadSessionUpdatedAt,
+  RecordSessionMetaFromInbound,
+} from "../../config/sessions/runtime-types.js";
+import type {
+  ReadChannelAllowFromStoreForAccount,
+  RemoveChannelAllowFromStoreEntryForAccount,
+  UpsertChannelPairingRequestForAccount,
+} from "../../pairing/pairing-store.types.js";
+import type { PublicReplyParams } from "../../plugin-sdk/reply-options.js";
 
-type ReadChannelAllowFromStoreForAccount = (params: {
-  channel: Parameters<ReadChannelAllowFromStore>[0];
-  accountId: string;
-  env?: Parameters<ReadChannelAllowFromStore>[1];
-}) => ReturnType<ReadChannelAllowFromStore>;
+type DispatchReplyWithBufferedBlockDispatcher =
+  import("../../plugin-sdk/reply-dispatch-runtime.js").DispatchReplyWithBufferedBlockDispatcher;
+type DispatchReplyFromConfig = (
+  params: PublicReplyParams<Parameters<CoreDispatchReplyFromConfig>[0]>,
+) => ReturnType<CoreDispatchReplyFromConfig>;
+type RecordInboundSession = import("../../channels/session.types.js").RecordInboundSession;
 
-type UpsertChannelPairingRequestForAccount = (
-  params: Omit<Parameters<UpsertChannelPairingRequest>[0], "accountId"> & { accountId: string },
-) => ReturnType<UpsertChannelPairingRequest>;
+type RuntimeThreadBindingLifecycleRecord =
+  | import("../../infra/outbound/session-binding.types.js").SessionBindingRecord
+  | {
+      boundAt: number;
+      lastActivityAt: number;
+      idleTimeoutMs?: number;
+      maxAgeMs?: number;
+    };
 
 export type PluginRuntimeChannel = {
   text: {
@@ -30,20 +50,39 @@ export type PluginRuntimeChannel = {
     resolveChunkMode: typeof import("../../auto-reply/chunk.js").resolveChunkMode;
     resolveTextChunkLimit: typeof import("../../auto-reply/chunk.js").resolveTextChunkLimit;
     hasControlCommand: typeof import("../../auto-reply/command-detection.js").hasControlCommand;
-    resolveMarkdownTableMode: typeof import("../../config/markdown-tables.js").resolveMarkdownTableMode;
-    convertMarkdownTables: typeof import("../../markdown/tables.js").convertMarkdownTables;
+    resolveMarkdownTableMode: ResolveMarkdownTableMode;
+    convertMarkdownTables: typeof import("../../../packages/markdown-core/src/tables.js").convertMarkdownTables;
   };
   reply: {
-    dispatchReplyWithBufferedBlockDispatcher: typeof import("../../auto-reply/reply/provider-dispatcher.js").dispatchReplyWithBufferedBlockDispatcher;
+    dispatchReplyWithBufferedBlockDispatcher: DispatchReplyWithBufferedBlockDispatcher;
+    /**
+     * @deprecated Prefer `openclaw/plugin-sdk/channel-outbound` adapters plus
+     * `dispatchReplyWithBufferedBlockDispatcher` or channel turn helpers.
+     * This is a low-level legacy dispatcher escape hatch.
+     */
     createReplyDispatcherWithTyping: typeof import("../../auto-reply/reply/reply-dispatcher.js").createReplyDispatcherWithTyping;
     resolveEffectiveMessagesConfig: typeof import("../../agents/identity.js").resolveEffectiveMessagesConfig;
+    /**
+     * @deprecated Prefer the channel-message reply pipeline helpers. This is
+     * tied to the low-level legacy dispatcher path.
+     */
     resolveHumanDelayConfig: typeof import("../../agents/identity.js").resolveHumanDelayConfig;
-    dispatchReplyFromConfig: typeof import("../../auto-reply/reply/dispatch-from-config.js").dispatchReplyFromConfig;
-    withReplyDispatcher: typeof import("../../auto-reply/dispatch.js").withReplyDispatcher;
+    /**
+     * @deprecated Prefer `dispatchReplyWithBufferedBlockDispatcher` with a
+     * channel-message adapter or the channel turn helpers. Direct use must
+     * manually preserve source reply delivery metadata such as
+     * `sourceReplyDeliveryMode`.
+     */
+    dispatchReplyFromConfig: DispatchReplyFromConfig;
+    withReplyDispatcher: typeof import("../../auto-reply/dispatch-dispatcher.js").withReplyDispatcher;
+    settleReplyDispatcher: typeof import("../../auto-reply/dispatch-dispatcher.js").settleReplyDispatcher;
+    /**
+     * @deprecated Prefer `buildChannelInboundEventContext` from
+     * `openclaw/plugin-sdk/channel-inbound` so inbound event metadata is
+     * carried into reply dispatch.
+     */
     finalizeInboundContext: typeof import("../../auto-reply/reply/inbound-context.js").finalizeInboundContext;
     formatAgentEnvelope: typeof import("../../auto-reply/envelope.js").formatAgentEnvelope;
-    /** @deprecated Prefer `BodyForAgent` + structured user-context blocks (do not build plaintext envelopes for prompts). */
-    formatInboundEnvelope: typeof import("../../auto-reply/envelope.js").formatInboundEnvelope;
     resolveEnvelopeFormatOptions: typeof import("../../auto-reply/envelope.js").resolveEnvelopeFormatOptions;
   };
   routing: {
@@ -53,31 +92,48 @@ export type PluginRuntimeChannel = {
   pairing: {
     buildPairingReply: typeof import("../../pairing/pairing-messages.js").buildPairingReply;
     readAllowFromStore: ReadChannelAllowFromStoreForAccount;
+    removeAllowFromStoreEntry: RemoveChannelAllowFromStoreEntryForAccount;
     upsertPairingRequest: UpsertChannelPairingRequestForAccount;
   };
   media: {
+    readRemoteMediaBuffer: typeof import("../../media/fetch.js").readRemoteMediaBuffer;
+    /** @deprecated Use `readRemoteMediaBuffer`. */
     fetchRemoteMedia: typeof import("../../media/fetch.js").fetchRemoteMedia;
+    saveRemoteMedia: typeof import("../../media/fetch.js").saveRemoteMedia;
+    saveResponseMedia: typeof import("../../media/fetch.js").saveResponseMedia;
     saveMediaBuffer: typeof import("../../media/store.js").saveMediaBuffer;
+    deleteMediaBuffer: typeof import("../../media/store.js").deleteMediaBuffer;
   };
   activity: {
     record: typeof import("../../infra/channel-activity.js").recordChannelActivity;
     get: typeof import("../../infra/channel-activity.js").getChannelActivity;
   };
   session: {
-    resolveStorePath: typeof import("../../config/sessions.js").resolveStorePath;
-    readSessionUpdatedAt: typeof import("../../config/sessions.js").readSessionUpdatedAt;
-    recordSessionMetaFromInbound: typeof import("../../config/sessions.js").recordSessionMetaFromInbound;
-    recordInboundSession: typeof import("../../channels/session.js").recordInboundSession;
-    updateLastRoute: typeof import("../../config/sessions.js").updateLastRoute;
+    /** @deprecated Prefer channel turn helpers that record inbound sessions as part of dispatch. */
+    resolveStorePath: typeof import("../../config/sessions/paths.js").resolveSessionStorePathCore;
+    /** @deprecated Await readSessionUpdatedAtAsync. Final compatibility day: 2026-12-31. Removal in the first January 2027 stable release. */
+    readSessionUpdatedAt: ReadSessionUpdatedAt;
+    readSessionUpdatedAtAsync: (
+      ...params: Parameters<ReadSessionUpdatedAt>
+    ) => Promise<ReturnType<ReadSessionUpdatedAt>>;
+    recordSessionMetaFromInbound: RecordSessionMetaFromInbound;
+    /** @deprecated Prefer channel turn helpers that record inbound sessions as part of dispatch. */
+    recordInboundSession: RecordInboundSession;
+    updateLastRoute: typeof import("../../plugin-sdk/session-store-runtime.js").updateLastRoute;
+    updateLastRouteWithAuthority: typeof import("../../plugin-sdk/session-store-runtime.js").updateLastRouteWithAuthority;
   };
   mentions: {
-    buildMentionRegexes: typeof import("../../auto-reply/reply/mentions.js").buildMentionRegexes;
-    matchesMentionPatterns: typeof import("../../auto-reply/reply/mentions.js").matchesMentionPatterns;
-    matchesMentionWithExplicit: typeof import("../../auto-reply/reply/mentions.js").matchesMentionWithExplicit;
+    buildMentionRegexes: BuildMentionRegexes;
+    matchesMentionPatterns: MatchesMentionPatterns;
+    matchesMentionWithExplicit: MatchesMentionWithExplicit;
+    implicitMentionKindWhen: typeof import("../../channels/mention-gating.js").implicitMentionKindWhen;
+    resolveInboundMentionDecision: typeof import("../../channels/mention-gating.js").resolveInboundMentionDecision;
   };
   reactions: {
+    createAckReactionHandle: typeof import("../../channels/ack-reactions.js").createAckReactionHandle;
     shouldAckReaction: typeof import("../../channels/ack-reactions.js").shouldAckReaction;
     removeAckReactionAfterReply: typeof import("../../channels/ack-reactions.js").removeAckReactionAfterReply;
+    removeAckReactionHandleAfterReply: typeof import("../../channels/ack-reactions.js").removeAckReactionHandleAfterReply;
   };
   groups: {
     resolveGroupPolicy: typeof import("../../config/group-policy.js").resolveChannelGroupPolicy;
@@ -91,156 +147,49 @@ export type PluginRuntimeChannel = {
     resolveCommandAuthorizedFromAuthorizers: typeof import("../../channels/command-gating.js").resolveCommandAuthorizedFromAuthorizers;
     isControlCommandMessage: typeof import("../../auto-reply/command-detection.js").isControlCommandMessage;
     shouldComputeCommandAuthorized: typeof import("../../auto-reply/command-detection.js").shouldComputeCommandAuthorized;
-    shouldHandleTextCommands: typeof import("../../auto-reply/commands-registry.js").shouldHandleTextCommands;
+    shouldHandleTextCommands: typeof import("../../auto-reply/commands-text-routing.js").shouldHandleTextCommands;
   };
-  discord: {
-    messageActions: typeof import("../../plugin-sdk/discord.js").discordMessageActions;
-    auditChannelPermissions: typeof import("../../plugin-sdk/discord.js").auditDiscordChannelPermissions;
-    listDirectoryGroupsLive: typeof import("../../plugin-sdk/discord.js").listDiscordDirectoryGroupsLive;
-    listDirectoryPeersLive: typeof import("../../plugin-sdk/discord.js").listDiscordDirectoryPeersLive;
-    probeDiscord: typeof import("../../plugin-sdk/discord.js").probeDiscord;
-    resolveChannelAllowlist: typeof import("../../plugin-sdk/discord.js").resolveDiscordChannelAllowlist;
-    resolveUserAllowlist: typeof import("../../plugin-sdk/discord.js").resolveDiscordUserAllowlist;
-    sendComponentMessage: typeof import("../../plugin-sdk/discord.js").sendDiscordComponentMessage;
-    sendMessageDiscord: typeof import("../../plugin-sdk/discord.js").sendMessageDiscord;
-    sendPollDiscord: typeof import("../../plugin-sdk/discord.js").sendPollDiscord;
-    monitorDiscordProvider: typeof import("../../plugin-sdk/discord.js").monitorDiscordProvider;
-    threadBindings: {
-      getManager: typeof import("../../plugin-sdk/discord.js").getThreadBindingManager;
-      resolveIdleTimeoutMs: typeof import("../../plugin-sdk/discord.js").resolveThreadBindingIdleTimeoutMs;
-      resolveInactivityExpiresAt: typeof import("../../plugin-sdk/discord.js").resolveThreadBindingInactivityExpiresAt;
-      resolveMaxAgeMs: typeof import("../../plugin-sdk/discord.js").resolveThreadBindingMaxAgeMs;
-      resolveMaxAgeExpiresAt: typeof import("../../plugin-sdk/discord.js").resolveThreadBindingMaxAgeExpiresAt;
-      setIdleTimeoutBySessionKey: typeof import("../../plugin-sdk/discord.js").setThreadBindingIdleTimeoutBySessionKey;
-      setMaxAgeBySessionKey: typeof import("../../plugin-sdk/discord.js").setThreadBindingMaxAgeBySessionKey;
-      unbindBySessionKey: typeof import("../../plugin-sdk/discord.js").unbindThreadBindingsBySessionKey;
+  outbound: {
+    loadAdapter: typeof import("../../channels/plugins/outbound/load.js").loadChannelOutboundAdapter;
+  };
+  inbound: {
+    /** Ingress policy and identity handoff bound to this channel's host instance. */
+    ingress: {
+      createResolver: typeof import("../../channels/message-access/runtime.js").createChannelIngressPolicyResolver;
+      resolve: typeof import("../../channels/message-access/runtime.js").resolveChannelIngressPolicy;
+      resolveStable: typeof import("../../channels/message-access/runtime.js").resolveStableChannelIngressPolicy;
     };
-    typing: {
-      pulse: typeof import("../../plugin-sdk/discord.js").sendTypingDiscord;
-      start: (params: {
-        channelId: string;
-        accountId?: string;
-        cfg?: ReturnType<typeof import("../../config/config.js").loadConfig>;
-        intervalMs?: number;
-      }) => Promise<{
-        refresh: () => Promise<void>;
-        stop: () => void;
-      }>;
-    };
-    conversationActions: {
-      editMessage: typeof import("../../plugin-sdk/discord.js").editMessageDiscord;
-      deleteMessage: typeof import("../../plugin-sdk/discord.js").deleteMessageDiscord;
-      pinMessage: typeof import("../../plugin-sdk/discord.js").pinMessageDiscord;
-      unpinMessage: typeof import("../../plugin-sdk/discord.js").unpinMessageDiscord;
-      createThread: typeof import("../../plugin-sdk/discord.js").createThreadDiscord;
-      editChannel: typeof import("../../plugin-sdk/discord.js").editChannelDiscord;
-    };
+    buildContext: typeof import("../../channels/inbound-event/context.js").buildChannelInboundEventContext;
+    run: typeof import("../../plugin-sdk/channel-inbound.js").runChannelInboundEvent;
+    /** @deprecated Prefer `run` for raw inbound events or `dispatchReply` for assembled contexts. */
+    runPreparedReply: typeof import("../../channels/turn/execution.js").runPreparedChannelTurn;
+    dispatch: typeof import("../../plugin-sdk/channel-inbound.js").dispatchChannelInboundTurn;
+    /** Compatibility escape hatch; prefer `dispatch`, which keeps session wiring in core. */
+    dispatchReply: typeof import("../../plugin-sdk/channel-inbound.js").dispatchChannelInboundReply;
   };
-  slack: {
-    listDirectoryGroupsLive: typeof import("../../plugin-sdk/slack.js").listSlackDirectoryGroupsLive;
-    listDirectoryPeersLive: typeof import("../../plugin-sdk/slack.js").listSlackDirectoryPeersLive;
-    probeSlack: typeof import("../../plugin-sdk/slack.js").probeSlack;
-    resolveChannelAllowlist: typeof import("../../plugin-sdk/slack.js").resolveSlackChannelAllowlist;
-    resolveUserAllowlist: typeof import("../../plugin-sdk/slack.js").resolveSlackUserAllowlist;
-    sendMessageSlack: typeof import("../../plugin-sdk/slack.js").sendMessageSlack;
-    monitorSlackProvider: typeof import("../../plugin-sdk/slack.js").monitorSlackProvider;
-    handleSlackAction: typeof import("../../plugin-sdk/slack.js").handleSlackAction;
+  /** @deprecated Compatibility for shipped plugins; use `channel.inbound`. */
+  turn: PluginRuntimeChannel["inbound"];
+  threadBindings: {
+    setIdleTimeoutBySessionKeyAsync: (
+      params: Parameters<PluginRuntimeChannel["threadBindings"]["setIdleTimeoutBySessionKey"]>[0],
+    ) => Promise<RuntimeThreadBindingLifecycleRecord[]>;
+    setMaxAgeBySessionKeyAsync: (
+      params: Parameters<PluginRuntimeChannel["threadBindings"]["setMaxAgeBySessionKey"]>[0],
+    ) => Promise<RuntimeThreadBindingLifecycleRecord[]>;
+    /** @deprecated Use setIdleTimeoutBySessionKeyAsync; final compatibility day: 2026-12-31. Removal in the first January 2027 stable release. */
+    setIdleTimeoutBySessionKey: (params: {
+      channelId: string;
+      targetSessionKey: string;
+      accountId?: string;
+      idleTimeoutMs: number;
+    }) => RuntimeThreadBindingLifecycleRecord[];
+    /** @deprecated Use setMaxAgeBySessionKeyAsync; final compatibility day: 2026-12-31. Removal in the first January 2027 stable release. */
+    setMaxAgeBySessionKey: (params: {
+      channelId: string;
+      targetSessionKey: string;
+      accountId?: string;
+      maxAgeMs: number;
+    }) => RuntimeThreadBindingLifecycleRecord[];
   };
-  telegram: {
-    auditGroupMembership: typeof import("../../plugin-sdk/telegram.js").auditTelegramGroupMembership;
-    collectUnmentionedGroupIds: typeof import("../../plugin-sdk/telegram.js").collectTelegramUnmentionedGroupIds;
-    probeTelegram: typeof import("../../plugin-sdk/telegram.js").probeTelegram;
-    resolveTelegramToken: typeof import("../../plugin-sdk/telegram.js").resolveTelegramToken;
-    sendMessageTelegram: typeof import("../../plugin-sdk/telegram.js").sendMessageTelegram;
-    sendPollTelegram: typeof import("../../plugin-sdk/telegram.js").sendPollTelegram;
-    monitorTelegramProvider: typeof import("../../plugin-sdk/telegram.js").monitorTelegramProvider;
-    messageActions: typeof import("../../plugin-sdk/telegram.js").telegramMessageActions;
-    threadBindings: {
-      setIdleTimeoutBySessionKey: typeof import("../../plugin-sdk/telegram.js").setTelegramThreadBindingIdleTimeoutBySessionKey;
-      setMaxAgeBySessionKey: typeof import("../../plugin-sdk/telegram.js").setTelegramThreadBindingMaxAgeBySessionKey;
-    };
-    typing: {
-      pulse: typeof import("../../plugin-sdk/telegram.js").sendTypingTelegram;
-      start: (params: {
-        to: string;
-        accountId?: string;
-        cfg?: ReturnType<typeof import("../../config/config.js").loadConfig>;
-        intervalMs?: number;
-        messageThreadId?: number;
-      }) => Promise<{
-        refresh: () => Promise<void>;
-        stop: () => void;
-      }>;
-    };
-    conversationActions: {
-      editMessage: typeof import("../../plugin-sdk/telegram.js").editMessageTelegram;
-      editReplyMarkup: typeof import("../../plugin-sdk/telegram.js").editMessageReplyMarkupTelegram;
-      clearReplyMarkup: (
-        chatIdInput: string | number,
-        messageIdInput: string | number,
-        opts?: {
-          token?: string;
-          accountId?: string;
-          verbose?: boolean;
-          api?: import("../../plugin-sdk/telegram.js").TelegramApiOverride;
-          retry?: import("../../infra/retry.js").RetryConfig;
-          cfg?: ReturnType<typeof import("../../config/config.js").loadConfig>;
-        },
-      ) => Promise<{ ok: true; messageId: string; chatId: string }>;
-      deleteMessage: typeof import("../../plugin-sdk/telegram.js").deleteMessageTelegram;
-      renameTopic: typeof import("../../plugin-sdk/telegram.js").renameForumTopicTelegram;
-      pinMessage: typeof import("../../plugin-sdk/telegram.js").pinMessageTelegram;
-      unpinMessage: typeof import("../../plugin-sdk/telegram.js").unpinMessageTelegram;
-    };
-  };
-  matrix: {
-    threadBindings: {
-      setIdleTimeoutBySessionKey: typeof import("../../plugin-sdk/matrix.js").setMatrixThreadBindingIdleTimeoutBySessionKey;
-      setMaxAgeBySessionKey: typeof import("../../plugin-sdk/matrix.js").setMatrixThreadBindingMaxAgeBySessionKey;
-    };
-  };
-  signal: {
-    probeSignal: typeof import("../../plugin-sdk/signal.js").probeSignal;
-    sendMessageSignal: typeof import("../../plugin-sdk/signal.js").sendMessageSignal;
-    monitorSignalProvider: typeof import("../../plugin-sdk/signal.js").monitorSignalProvider;
-    messageActions: typeof import("../../plugin-sdk/signal.js").signalMessageActions;
-  };
-  imessage: {
-    monitorIMessageProvider: typeof import("../../plugin-sdk/imessage.js").monitorIMessageProvider;
-    probeIMessage: typeof import("../../plugin-sdk/imessage.js").probeIMessage;
-    sendMessageIMessage: typeof import("../../plugin-sdk/imessage.js").sendMessageIMessage;
-  };
-  whatsapp: {
-    getActiveWebListener: typeof import("./runtime-whatsapp-boundary.js").getActiveWebListener;
-    getWebAuthAgeMs: typeof import("./runtime-whatsapp-boundary.js").getWebAuthAgeMs;
-    logoutWeb: typeof import("./runtime-whatsapp-boundary.js").logoutWeb;
-    logWebSelfId: typeof import("./runtime-whatsapp-boundary.js").logWebSelfId;
-    readWebSelfId: typeof import("./runtime-whatsapp-boundary.js").readWebSelfId;
-    webAuthExists: typeof import("./runtime-whatsapp-boundary.js").webAuthExists;
-    sendMessageWhatsApp: typeof import("./runtime-whatsapp-boundary.js").sendMessageWhatsApp;
-    sendPollWhatsApp: typeof import("./runtime-whatsapp-boundary.js").sendPollWhatsApp;
-    loginWeb: typeof import("./runtime-whatsapp-boundary.js").loginWeb;
-    startWebLoginWithQr: typeof import("./runtime-whatsapp-boundary.js").startWebLoginWithQr;
-    waitForWebLogin: typeof import("./runtime-whatsapp-boundary.js").waitForWebLogin;
-    monitorWebChannel: typeof import("./runtime-whatsapp-boundary.js").monitorWebChannel;
-    handleWhatsAppAction: typeof import("./runtime-whatsapp-boundary.js").handleWhatsAppAction;
-    createLoginTool: typeof import("./runtime-whatsapp-login-tool.js").createRuntimeWhatsAppLoginTool;
-  };
-  line: {
-    listLineAccountIds: typeof import("../../plugin-sdk/line.js").listLineAccountIds;
-    resolveDefaultLineAccountId: typeof import("../../plugin-sdk/line.js").resolveDefaultLineAccountId;
-    resolveLineAccount: typeof import("../../plugin-sdk/line.js").resolveLineAccount;
-    normalizeAccountId: typeof import("../../plugin-sdk/line.js").normalizeAccountId;
-    probeLineBot: typeof import("../../plugin-sdk/line-runtime.js").probeLineBot;
-    sendMessageLine: typeof import("../../plugin-sdk/line-runtime.js").sendMessageLine;
-    pushMessageLine: typeof import("../../plugin-sdk/line-runtime.js").pushMessageLine;
-    pushMessagesLine: typeof import("../../plugin-sdk/line-runtime.js").pushMessagesLine;
-    pushFlexMessage: typeof import("../../plugin-sdk/line-runtime.js").pushFlexMessage;
-    pushTemplateMessage: typeof import("../../plugin-sdk/line-runtime.js").pushTemplateMessage;
-    pushLocationMessage: typeof import("../../plugin-sdk/line-runtime.js").pushLocationMessage;
-    pushTextMessageWithQuickReplies: typeof import("../../plugin-sdk/line-runtime.js").pushTextMessageWithQuickReplies;
-    createQuickReplyItems: typeof import("../../plugin-sdk/line-runtime.js").createQuickReplyItems;
-    buildTemplateMessageFromPayload: typeof import("../../plugin-sdk/line-runtime.js").buildTemplateMessageFromPayload;
-    monitorLineProvider: typeof import("../../plugin-sdk/line-runtime.js").monitorLineProvider;
-  };
+  runtimeContexts: ChannelRuntimeContextRegistry;
 };

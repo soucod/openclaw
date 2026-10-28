@@ -4,142 +4,89 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { setTimeout as delay } from "node:timers/promises";
+import { afterAll, beforeAll, describe, it } from "vitest";
+import { withTimeout } from "../infra/fs-safe.js";
 import {
   installLaunchAgent,
   readLaunchAgentRuntime,
-  restartLaunchAgent,
   resolveLaunchAgentPlistPath,
   uninstallLaunchAgent,
 } from "./launchd.js";
 import type { GatewayServiceEnv } from "./service-types.js";
 
-const WAIT_INTERVAL_MS = 200;
-const WAIT_TIMEOUT_MS = 30_000;
 const STARTUP_TIMEOUT_MS = 45_000;
+const GUI_DOMAIN = `gui/${process.getuid?.() ?? 501}`;
 
 function canRunLaunchdIntegration(): boolean {
-  if (process.platform !== "darwin") {
+  if (process.platform !== "darwin" || typeof process.getuid !== "function") {
     return false;
   }
-  if (typeof process.getuid !== "function") {
-    return false;
-  }
-  const domain = `gui/${process.getuid()}`;
-  const probe = spawnSync("launchctl", ["print", domain], { encoding: "utf8" });
-  if (probe.error) {
-    return false;
-  }
-  return probe.status === 0;
+  const probe = spawnSync("launchctl", ["print", GUI_DOMAIN], { encoding: "utf8" });
+  return !probe.error && probe.status === 0;
 }
 
 const describeLaunchdIntegration = canRunLaunchdIntegration() ? describe : describe.skip;
 
-async function withTimeout<T>(params: {
-  run: () => Promise<T>;
-  timeoutMs: number;
-  message: string;
-}): Promise<T> {
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    return await Promise.race([
-      params.run(),
-      new Promise<T>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(params.message)), params.timeoutMs);
-      }),
-    ]);
-  } finally {
-    if (timer) {
-      clearTimeout(timer);
-    }
-  }
-}
-
-async function waitForRunningRuntime(params: {
-  env: GatewayServiceEnv;
-  pidNot?: number;
-  timeoutMs?: number;
-}): Promise<{ pid: number }> {
-  const timeoutMs = params.timeoutMs ?? WAIT_TIMEOUT_MS;
-  const deadline = Date.now() + timeoutMs;
-  let lastStatus = "unknown";
-  let lastPid: number | undefined;
+async function waitForRunningRuntime(env: GatewayServiceEnv, previousPid?: number) {
+  const deadline = Date.now() + 30_000;
+  let runtime: Awaited<ReturnType<typeof readLaunchAgentRuntime>> | undefined;
   while (Date.now() < deadline) {
-    const runtime = await readLaunchAgentRuntime(params.env);
-    lastStatus = runtime.status ?? "unknown";
-    lastPid = runtime.pid;
+    runtime = await readLaunchAgentRuntime(env);
     if (
       runtime.status === "running" &&
       typeof runtime.pid === "number" &&
       runtime.pid > 1 &&
-      (params.pidNot === undefined || runtime.pid !== params.pidNot)
+      runtime.pid !== previousPid
     ) {
-      return { pid: runtime.pid };
+      return runtime.pid;
     }
-    await new Promise((resolve) => {
-      setTimeout(resolve, WAIT_INTERVAL_MS);
-    });
+    await delay(200);
   }
   throw new Error(
-    `Timed out waiting for launchd runtime (status=${lastStatus}, pid=${lastPid ?? "none"})`,
+    `Timed out waiting for launchd runtime (status=${runtime?.status ?? "unknown"}, pid=${runtime?.pid ?? "none"})`,
   );
 }
 
 describeLaunchdIntegration("launchd integration", () => {
-  let env: GatewayServiceEnv | undefined;
+  let env: GatewayServiceEnv;
   let homeDir = "";
   const stdout = new PassThrough();
 
   beforeAll(async () => {
-    const testId = randomUUID().slice(0, 8);
-    homeDir = await fs.mkdtemp(path.join(os.tmpdir(), `openclaw-launchd-int-${testId}-`));
+    const id = `launchd-int-${randomUUID().slice(0, 8)}`;
+    homeDir = await fs.mkdtemp(path.join(os.tmpdir(), `openclaw-${id}-`));
     env = {
       HOME: homeDir,
-      OPENCLAW_LAUNCHD_LABEL: `ai.openclaw.launchd-int-${testId}`,
-      OPENCLAW_LOG_PREFIX: `gateway-launchd-int-${testId}`,
+      OPENCLAW_LAUNCHD_LABEL: `ai.openclaw.${id}`,
+      OPENCLAW_LOG_PREFIX: `gateway-${id}`,
     };
   });
 
   afterAll(async () => {
     if (env) {
-      try {
-        await uninstallLaunchAgent({ env, stdout });
-      } catch {
-        // Best-effort cleanup in case launchctl state already changed.
-      }
+      await uninstallLaunchAgent({ env, stdout }).catch(() => {});
     }
     if (homeDir) {
       await fs.rm(homeDir, { recursive: true, force: true });
     }
   }, 60_000);
 
-  it("restarts launchd service and keeps it running with a new pid", async () => {
-    if (!env) {
-      throw new Error("launchd integration env was not initialized");
-    }
-    const launchEnv = env;
-    try {
-      await withTimeout({
-        run: async () => {
-          await installLaunchAgent({
-            env: launchEnv,
-            stdout,
-            programArguments: [process.execPath, "-e", "setInterval(() => {}, 1000);"],
-          });
-          await waitForRunningRuntime({ env: launchEnv });
-        },
-        timeoutMs: STARTUP_TIMEOUT_MS,
-        message: "Timed out initializing launchd integration runtime",
-      });
-    } catch {
-      // Best-effort integration check only; skip when launchctl is unstable in CI.
-      return;
-    }
-    const before = await waitForRunningRuntime({ env: launchEnv });
-    await restartLaunchAgent({ env: launchEnv, stdout });
-    const after = await waitForRunningRuntime({ env: launchEnv, pidNot: before.pid });
-    expect(after.pid).toBeGreaterThan(1);
-    expect(after.pid).not.toBe(before.pid);
-    await fs.access(resolveLaunchAgentPlistPath(launchEnv));
+  it("keeps launchd supervision and replaces the PID after SIGTERM", async () => {
+    const before = await withTimeout(
+      (async () => {
+        await installLaunchAgent({
+          env,
+          stdout,
+          programArguments: [process.execPath, "-e", "setInterval(() => {}, 1000);"],
+        });
+        return waitForRunningRuntime(env);
+      })(),
+      STARTUP_TIMEOUT_MS,
+      { message: "Timed out initializing launchd integration runtime" },
+    );
+    process.kill(before, "SIGTERM");
+    await waitForRunningRuntime(env, before);
+    await fs.access(resolveLaunchAgentPlistPath(env));
   }, 60_000);
 });

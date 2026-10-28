@@ -22,7 +22,13 @@ enum ExecApprovalCommandDisplaySanitizer {
     }
 
     private static func shouldEscape(_ scalar: UnicodeScalar) -> Bool {
-        scalar.properties.generalCategory == .format || self.invisibleCodePoints.contains(scalar.value)
+        let category = scalar.properties.generalCategory
+        // Escape non-ASCII space separators (NBSP, narrow NBSP, ideographic space, etc.) so
+        // attackers cannot spoof token boundaries in the approval UI with spaces that render
+        // like a plain space but are handled differently by shells/parsers.
+        return category == .control || category == .format || category == .lineSeparator ||
+            category == .paragraphSeparator || (category == .spaceSeparator && scalar.value != 0x20) ||
+            self.invisibleCodePoints.contains(scalar.value)
     }
 
     private static func escape(_ scalar: UnicodeScalar) -> String {

@@ -1,266 +1,99 @@
-import fs from "node:fs";
-import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { setImmediate } from "node:timers/promises";
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
+import { resetPluginStateStoreForTests } from "openclaw/plugin-sdk/plugin-state-test-runtime";
+import { expect, it } from "vitest";
+import { useTelegramKeyedState } from "./keyed-state.test-support.js";
+import * as stickerCache from "./sticker-cache-store.js";
 
-vi.mock("openclaw/plugin-sdk/agent-runtime", () => ({
-  resolveApiKeyForProvider: vi.fn(),
-  findModelInCatalog: vi.fn(),
-  loadModelCatalog: vi.fn(async () => []),
-  modelSupportsVision: vi.fn(() => false),
-  resolveDefaultModelForAgent: vi.fn(() => ({ provider: "openai", model: "gpt-5.2" })),
-}));
+type StickerEntry = stickerCache.CachedSticker;
+const fixture = useTelegramKeyedState<StickerEntry>({
+  namespace: "telegram.sticker-cache",
+  maxEntries: 10_000,
+});
+const sticker = (fileId: string, overrides: Partial<StickerEntry> = {}): StickerEntry => ({
+  fileId,
+  fileUniqueId: `${fileId}-unique`,
+  description: `${fileId} sticker`,
+  cachedAt: "2026-01-26T10:00:00.000Z",
+  ...overrides,
+});
 
-vi.mock("openclaw/plugin-sdk/media-runtime", () => ({
-  AUTO_IMAGE_KEY_PROVIDERS: ["openai"],
-  DEFAULT_IMAGE_MODELS: { openai: "gpt-4.1-mini" },
-  resolveAutoImageModel: vi.fn(async () => null),
-}));
-
-vi.mock("openclaw/plugin-sdk/media-understanding-runtime", () => ({
-  describeImageFileWithModel: vi.fn(),
-}));
-
-const TEST_CACHE_DIR = "/tmp/openclaw-test-sticker-cache/telegram";
-const TEST_CACHE_FILE = path.join(TEST_CACHE_DIR, "sticker-cache.json");
-
-type StickerCacheModule = typeof import("./sticker-cache.js");
-
-let stickerCache: StickerCacheModule;
-
-describe("sticker-cache", () => {
-  beforeEach(async () => {
-    process.env.OPENCLAW_STATE_DIR = "/tmp/openclaw-test-sticker-cache";
-    fs.rmSync("/tmp/openclaw-test-sticker-cache", { recursive: true, force: true });
-    fs.mkdirSync(TEST_CACHE_DIR, { recursive: true });
-    vi.resetModules();
-    stickerCache = await import("./sticker-cache.js");
+it("returns the best-effort fallback when plugin-state register rejects", async () => {
+  fixture.install({
+    ...fixture.store,
+    async register() {
+      throw new Error("register failed");
+    },
   });
+  await expect(stickerCache.cacheSticker(sticker("file-failure"))).resolves.toBeUndefined();
+});
 
-  afterEach(() => {
-    fs.rmSync("/tmp/openclaw-test-sticker-cache", { recursive: true, force: true });
-    delete process.env.OPENCLAW_STATE_DIR;
+it("settles only after the backing write commits", async () => {
+  const backingStore = fixture.store;
+  const expected = sticker("delayed-file");
+  const original = {
+    ...expected,
+    fileId: "original-file",
+    description: "Original sticker",
+    cachedAt: "2026-01-26T11:00:00.000Z",
+    setName: "OriginalSet",
+  };
+  await stickerCache.cacheSticker(original);
+  const entered = createDeferred<void>();
+  const release = createDeferred<void>();
+  fixture.install({
+    ...backingStore,
+    async register(key, value, options) {
+      entered.resolve();
+      await release.promise;
+      await backingStore.register(key, value, options);
+    },
   });
-
-  describe("getCachedSticker", () => {
-    it("returns null for unknown ID", () => {
-      const result = stickerCache.getCachedSticker("unknown-id");
-      expect(result).toBeNull();
-    });
-
-    it("returns cached sticker after cacheSticker", () => {
-      const sticker = {
-        fileId: "file123",
-        fileUniqueId: "unique123",
-        emoji: "🎉",
-        setName: "TestPack",
-        description: "A party popper emoji sticker",
-        cachedAt: "2026-01-26T12:00:00.000Z",
-      };
-
-      stickerCache.cacheSticker(sticker);
-      const result = stickerCache.getCachedSticker("unique123");
-
-      expect(result).toEqual(sticker);
-    });
-
-    it("returns null after cache is cleared", () => {
-      const sticker = {
-        fileId: "file123",
-        fileUniqueId: "unique123",
-        description: "test",
-        cachedAt: "2026-01-26T12:00:00.000Z",
-      };
-
-      stickerCache.cacheSticker(sticker);
-      expect(stickerCache.getCachedSticker("unique123")).not.toBeNull();
-
-      // Manually clear the cache file
-      fs.rmSync(TEST_CACHE_FILE, { force: true });
-
-      expect(stickerCache.getCachedSticker("unique123")).toBeNull();
-    });
+  const pending = stickerCache.cacheSticker({
+    ...expected,
+    emoji: undefined,
+    setName: undefined,
+    receivedFrom: undefined,
   });
+  try {
+    await entered.promise;
+    expect(await Promise.race([pending.then(() => true), setImmediate(false)])).toBe(false);
+    expect(await stickerCache.getCachedSticker(expected.fileUniqueId)).toMatchObject(original);
+  } finally {
+    release.resolve();
+    await pending;
+  }
+  resetPluginStateStoreForTests();
+  fixture.install(fixture.open());
+  expect(await stickerCache.getCachedSticker(expected.fileUniqueId)).toStrictEqual(expected);
+});
 
-  describe("cacheSticker", () => {
-    it("adds entry to cache", () => {
-      const sticker = {
-        fileId: "file456",
-        fileUniqueId: "unique456",
-        description: "A cute fox waving",
-        cachedAt: "2026-01-26T12:00:00.000Z",
-      };
+it.each([
+  { query: "🦊", limit: undefined, ids: ["fox1-unique", "fox2-unique"] },
+  { query: "FOX", limit: 1, ids: ["fox1-unique"] },
+])("finds $query with limit $limit", async ({ query, limit, ids }) => {
+  for (const [fileId, emoji, setName, description] of [
+    ["fox1", "🦊", "CuteFoxes", "A fox waving"],
+    ["fox2", "🦊", "CuteFoxes", "A fox sleeping"],
+    ["cat1", "🐱", "FunnyCats", "A cat sitting"],
+  ] as const) {
+    await stickerCache.cacheSticker(sticker(fileId, { emoji, setName, description }));
+  }
+  const results = await stickerCache.searchStickers(query, limit);
+  expect(results.map((entry) => entry.fileUniqueId)).toEqual(ids);
+});
 
-      stickerCache.cacheSticker(sticker);
+it("reports empty and populated cache stats with timestamp bounds", async () => {
+  expect(await stickerCache.getCacheStats()).toEqual({ count: 0 });
+  for (const day of [20, 26, 23]) {
+    await stickerCache.cacheSticker(
+      sticker(String(day), { cachedAt: `2026-01-${day}T10:00:00.000Z` }),
+    );
+  }
 
-      const all = stickerCache.getAllCachedStickers();
-      expect(all).toHaveLength(1);
-      expect(all[0]).toEqual(sticker);
-    });
-
-    it("updates existing entry", () => {
-      const original = {
-        fileId: "file789",
-        fileUniqueId: "unique789",
-        description: "Original description",
-        cachedAt: "2026-01-26T12:00:00.000Z",
-      };
-      const updated = {
-        fileId: "file789-new",
-        fileUniqueId: "unique789",
-        description: "Updated description",
-        cachedAt: "2026-01-26T13:00:00.000Z",
-      };
-
-      stickerCache.cacheSticker(original);
-      stickerCache.cacheSticker(updated);
-
-      const result = stickerCache.getCachedSticker("unique789");
-      expect(result?.description).toBe("Updated description");
-      expect(result?.fileId).toBe("file789-new");
-    });
-  });
-
-  describe("searchStickers", () => {
-    beforeEach(() => {
-      // Seed cache with test stickers
-      stickerCache.cacheSticker({
-        fileId: "fox1",
-        fileUniqueId: "fox-unique-1",
-        emoji: "🦊",
-        setName: "CuteFoxes",
-        description: "A cute orange fox waving hello",
-        cachedAt: "2026-01-26T10:00:00.000Z",
-      });
-      stickerCache.cacheSticker({
-        fileId: "fox2",
-        fileUniqueId: "fox-unique-2",
-        emoji: "🦊",
-        setName: "CuteFoxes",
-        description: "A fox sleeping peacefully",
-        cachedAt: "2026-01-26T11:00:00.000Z",
-      });
-      stickerCache.cacheSticker({
-        fileId: "cat1",
-        fileUniqueId: "cat-unique-1",
-        emoji: "🐱",
-        setName: "FunnyCats",
-        description: "A cat sitting on a keyboard",
-        cachedAt: "2026-01-26T12:00:00.000Z",
-      });
-      stickerCache.cacheSticker({
-        fileId: "dog1",
-        fileUniqueId: "dog-unique-1",
-        emoji: "🐶",
-        setName: "GoodBoys",
-        description: "A golden retriever playing fetch",
-        cachedAt: "2026-01-26T13:00:00.000Z",
-      });
-    });
-
-    it("finds stickers by description substring", () => {
-      const results = stickerCache.searchStickers("fox");
-      expect(results).toHaveLength(2);
-      expect(results.every((s) => s.description.toLowerCase().includes("fox"))).toBe(true);
-    });
-
-    it("finds stickers by emoji", () => {
-      const results = stickerCache.searchStickers("🦊");
-      expect(results).toHaveLength(2);
-      expect(results.every((s) => s.emoji === "🦊")).toBe(true);
-    });
-
-    it("finds stickers by set name", () => {
-      const results = stickerCache.searchStickers("CuteFoxes");
-      expect(results).toHaveLength(2);
-      expect(results.every((s) => s.setName === "CuteFoxes")).toBe(true);
-    });
-
-    it("respects limit parameter", () => {
-      const results = stickerCache.searchStickers("fox", 1);
-      expect(results).toHaveLength(1);
-    });
-
-    it("ranks exact matches higher", () => {
-      // "waving" appears in "fox waving hello" - should be ranked first
-      const results = stickerCache.searchStickers("waving");
-      expect(results).toHaveLength(1);
-      expect(results[0]?.fileUniqueId).toBe("fox-unique-1");
-    });
-
-    it("returns empty array for no matches", () => {
-      const results = stickerCache.searchStickers("elephant");
-      expect(results).toHaveLength(0);
-    });
-
-    it("is case insensitive", () => {
-      const results = stickerCache.searchStickers("FOX");
-      expect(results).toHaveLength(2);
-    });
-
-    it("matches multiple words", () => {
-      const results = stickerCache.searchStickers("cat keyboard");
-      expect(results).toHaveLength(1);
-      expect(results[0]?.fileUniqueId).toBe("cat-unique-1");
-    });
-  });
-
-  describe("getAllCachedStickers", () => {
-    it("returns empty array when cache is empty", () => {
-      const result = stickerCache.getAllCachedStickers();
-      expect(result).toEqual([]);
-    });
-
-    it("returns all cached stickers", () => {
-      stickerCache.cacheSticker({
-        fileId: "a",
-        fileUniqueId: "a-unique",
-        description: "Sticker A",
-        cachedAt: "2026-01-26T10:00:00.000Z",
-      });
-      stickerCache.cacheSticker({
-        fileId: "b",
-        fileUniqueId: "b-unique",
-        description: "Sticker B",
-        cachedAt: "2026-01-26T11:00:00.000Z",
-      });
-
-      const result = stickerCache.getAllCachedStickers();
-      expect(result).toHaveLength(2);
-    });
-  });
-
-  describe("getCacheStats", () => {
-    it("returns count 0 when cache is empty", () => {
-      const stats = stickerCache.getCacheStats();
-      expect(stats.count).toBe(0);
-      expect(stats.oldestAt).toBeUndefined();
-      expect(stats.newestAt).toBeUndefined();
-    });
-
-    it("returns correct stats with cached stickers", () => {
-      stickerCache.cacheSticker({
-        fileId: "old",
-        fileUniqueId: "old-unique",
-        description: "Old sticker",
-        cachedAt: "2026-01-20T10:00:00.000Z",
-      });
-      stickerCache.cacheSticker({
-        fileId: "new",
-        fileUniqueId: "new-unique",
-        description: "New sticker",
-        cachedAt: "2026-01-26T10:00:00.000Z",
-      });
-      stickerCache.cacheSticker({
-        fileId: "mid",
-        fileUniqueId: "mid-unique",
-        description: "Middle sticker",
-        cachedAt: "2026-01-23T10:00:00.000Z",
-      });
-
-      const stats = stickerCache.getCacheStats();
-      expect(stats.count).toBe(3);
-      expect(stats.oldestAt).toBe("2026-01-20T10:00:00.000Z");
-      expect(stats.newestAt).toBe("2026-01-26T10:00:00.000Z");
-    });
+  expect(await stickerCache.getCacheStats()).toEqual({
+    count: 3,
+    oldestAt: "2026-01-20T10:00:00.000Z",
+    newestAt: "2026-01-26T10:00:00.000Z",
   });
 });

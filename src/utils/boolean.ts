@@ -1,35 +1,40 @@
-export type BooleanParseOptions = {
-  truthy?: string[];
-  falsy?: string[];
-};
+import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
 
-const DEFAULT_TRUTHY = ["true", "1", "yes", "on"] as const;
-const DEFAULT_FALSY = ["false", "0", "no", "off"] as const;
-const DEFAULT_TRUTHY_SET = new Set<string>(DEFAULT_TRUTHY);
-const DEFAULT_FALSY_SET = new Set<string>(DEFAULT_FALSY);
+/**
+ * Shared boolean coercion helpers for config, env, and plugin SDK runtime inputs.
+ *
+ * `asBoolean` is intentionally strict; string parsing is opt-in through
+ * `parseBooleanValue` so schema callers do not silently accept ambiguous text.
+ */
+
+const DEFAULT_TRUTHY: readonly string[] = ["true", "1", "yes", "on"];
+const DEFAULT_FALSY: readonly string[] = ["false", "0", "no", "off"];
+
+export function asBoolean(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
+}
 
 export function parseBooleanValue(
   value: unknown,
-  options: BooleanParseOptions = {},
+  options: {
+    /** Lowercase string values that should parse as true. */
+    truthy?: string[];
+    /** Lowercase string values that should parse as false. */
+    falsy?: string[];
+  } = {},
 ): boolean | undefined {
-  if (typeof value === "boolean") {
-    return value;
+  const booleanValue = asBoolean(value);
+  if (booleanValue !== undefined) {
+    return booleanValue;
   }
-  if (typeof value !== "string") {
-    return undefined;
-  }
-  const normalized = value.trim().toLowerCase();
+  const normalized = normalizeOptionalLowercaseString(value);
   if (!normalized) {
     return undefined;
   }
-  const truthy = options.truthy ?? DEFAULT_TRUTHY;
-  const falsy = options.falsy ?? DEFAULT_FALSY;
-  const truthySet = truthy === DEFAULT_TRUTHY ? DEFAULT_TRUTHY_SET : new Set(truthy);
-  const falsySet = falsy === DEFAULT_FALSY ? DEFAULT_FALSY_SET : new Set(falsy);
-  if (truthySet.has(normalized)) {
+  if ((options.truthy ?? DEFAULT_TRUTHY).includes(normalized)) {
     return true;
   }
-  if (falsySet.has(normalized)) {
+  if ((options.falsy ?? DEFAULT_FALSY).includes(normalized)) {
     return false;
   }
   return undefined;

@@ -1,35 +1,19 @@
 import path from "node:path";
-import type { OpenClawPluginConfigSchema } from "openclaw/plugin-sdk/core";
+import { buildPluginConfigSchema, type OpenClawPluginConfigSchema } from "openclaw/plugin-sdk/core";
+import {
+  formatPluginConfigIssue,
+  mapPluginConfigIssues,
+} from "openclaw/plugin-sdk/extension-shared";
+import { MAX_TIMER_TIMEOUT_SECONDS } from "openclaw/plugin-sdk/number-runtime";
+import { z } from "zod";
 
-export type OpenShellPluginConfig = {
-  mode?: string;
-  command?: string;
-  gateway?: string;
-  gatewayEndpoint?: string;
-  from?: string;
-  policy?: string;
-  providers?: string[];
-  gpu?: boolean;
-  autoProviders?: boolean;
-  remoteWorkspaceDir?: string;
-  remoteAgentWorkspaceDir?: string;
-  timeoutSeconds?: number;
-};
-
-export type ResolvedOpenShellPluginConfig = {
-  mode: "mirror" | "remote";
-  command: string;
-  gateway?: string;
-  gatewayEndpoint?: string;
-  from: string;
-  policy?: string;
-  providers: string[];
-  gpu: boolean;
-  autoProviders: boolean;
-  remoteWorkspaceDir: string;
-  remoteAgentWorkspaceDir: string;
-  timeoutMs: number;
-};
+type ProducedOpenShellPluginConfig = ReturnType<typeof resolveOpenShellPluginConfig>;
+type OptionalOpenShellFields = "gateway" | "gatewayEndpoint" | "workspace" | "policy";
+export type ResolvedOpenShellPluginConfig = Omit<
+  ProducedOpenShellPluginConfig,
+  OptionalOpenShellFields
+> &
+  Partial<Pick<ProducedOpenShellPluginConfig, OptionalOpenShellFields>>;
 
 const DEFAULT_COMMAND = "openshell";
 const DEFAULT_MODE = "mirror";
@@ -37,196 +21,174 @@ const DEFAULT_SOURCE = "openclaw";
 const DEFAULT_REMOTE_WORKSPACE_DIR = "/sandbox";
 const DEFAULT_REMOTE_AGENT_WORKSPACE_DIR = "/agent";
 const DEFAULT_TIMEOUT_MS = 120_000;
+const OPEN_SHELL_MANAGED_REMOTE_PATH = /^\/(?:sandbox|agent)(?:\/|$)/;
 
-type ParseSuccess = { success: true; data?: OpenShellPluginConfig };
-type ParseFailure = {
-  success: false;
-  error: {
-    issues: Array<{ path: Array<string | number>; message: string }>;
-  };
-};
+const nonEmptyTrimmedString = (message: string) =>
+  z.string({ error: message }).trim().min(1, { error: message });
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
+const openShellManagedRemotePath = (fieldName: string) =>
+  nonEmptyTrimmedString(`${fieldName} must be a non-empty string`)
+    .regex(OPEN_SHELL_MANAGED_REMOTE_PATH, {
+      error: (issue) =>
+        String(issue.input).startsWith("/")
+          ? `OpenShell ${fieldName} must stay under /sandbox or /agent`
+          : `OpenShell ${fieldName} must be absolute`,
+    })
+    .refine((value) => OPEN_SHELL_MANAGED_REMOTE_PATH.test(path.posix.normalize(value)), {
+      error: `OpenShell ${fieldName} must stay under /sandbox or /agent`,
+    });
 
-function trimString(value: unknown): string | undefined {
-  if (typeof value !== "string") {
-    return undefined;
-  }
-  const trimmed = value.trim();
-  return trimmed || undefined;
-}
+const openShellWorkspaceName = z
+  .string({ error: "workspace must be a valid OpenShell workspace name" })
+  .trim()
+  .min(1, { error: "workspace must be a valid OpenShell workspace name" })
+  .max(19, { error: "workspace must be at most 19 characters" })
+  .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, {
+    error:
+      "workspace must contain lowercase alphanumeric characters or single hyphens and must not start or end with a hyphen",
+  });
 
-function normalizeProviders(value: unknown): string[] | null {
-  if (value === undefined) {
-    return [];
-  }
-  if (!Array.isArray(value)) {
-    return null;
-  }
-  const seen = new Set<string>();
-  const providers: string[] = [];
-  for (const entry of value) {
-    if (typeof entry !== "string" || !entry.trim()) {
-      return null;
-    }
-    const normalized = entry.trim();
-    if (seen.has(normalized)) {
-      continue;
-    }
-    seen.add(normalized);
-    providers.push(normalized);
-  }
-  return providers;
-}
+const OpenShellWorkerConfigSchema = z.strictObject({
+  agentWorkspace: z
+    .strictObject({
+      agentId: z
+        .string()
+        .trim()
+        .regex(/^[a-z0-9][a-z0-9_-]{0,63}$/),
+      remoteRoot: openShellManagedRemotePath("worker.agentWorkspace.remoteRoot").refine(
+        (value) =>
+          path.posix.normalize(value) === value &&
+          !["/sandbox", "/agent"].includes(value) &&
+          !["\\", "\0", "*", "?", "[", "]", "{", "}", "!", "(", ")"].some((part) =>
+            value.includes(part),
+          ),
+        "worker.agentWorkspace.remoteRoot must be a normalized directory below /sandbox or /agent without glob characters",
+      ),
+    })
+    .optional(),
+  nodeCommand: nonEmptyTrimmedString("worker.nodeCommand must be a non-empty string").default(
+    "openclaw",
+  ),
+  nodeExecutable: nonEmptyTrimmedString("worker.nodeExecutable must be a non-empty string").default(
+    "node",
+  ),
+  stateDir: openShellManagedRemotePath("worker.stateDir").default("/sandbox/.openclaw-node"),
+  model: z.strictObject({
+    provider: z
+      .string()
+      .trim()
+      .min(1)
+      .regex(/^[a-z0-9][a-z0-9_-]*$/),
+    id: z.string().trim().min(1),
+    api: z.enum(["openai-completions", "openai-responses", "anthropic-messages"]),
+    baseUrl: z.url().refine((value) => {
+      const url = new URL(value);
+      return (
+        url.protocol === "https:" && !url.username && !url.password && !url.search && !url.hash
+      );
+    }, "worker.model.baseUrl must be an HTTPS endpoint without credentials, query, or fragment"),
+    credentialEnv: z
+      .string()
+      .regex(
+        /^(?!NODE_|OPENCLAW_|OPENSHELL_|PATH$|HOME$|TMPDIR$|TMP$|TEMP$|LANG$|TZ$)[A-Z][A-Z0-9_]*$/,
+        "Use a dedicated model credential environment variable, not a runtime control variable",
+      ),
+    contextWindow: z.number().int().positive(),
+    maxTokens: z.number().int().positive(),
+    reasoning: z.boolean().default(false),
+    input: z
+      .array(z.enum(["text", "image"]))
+      .min(1)
+      .default(["text"]),
+  }),
+});
 
-function normalizeRemotePath(value: string | undefined, fallback: string): string {
-  const candidate = value ?? fallback;
-  const normalized = path.posix.normalize(candidate.trim() || fallback);
-  if (!normalized.startsWith("/")) {
-    throw new Error(`OpenShell remote path must be absolute: ${candidate}`);
+const OpenShellPluginConfigSchema = z.strictObject({
+  worker: OpenShellWorkerConfigSchema.optional(),
+  mode: z.enum(["mirror", "remote"], { error: "mode must be one of mirror, remote" }).optional(),
+  command: nonEmptyTrimmedString("command must be a non-empty string").optional(),
+  gateway: nonEmptyTrimmedString("gateway must be a non-empty string").optional(),
+  gatewayEndpoint: nonEmptyTrimmedString("gatewayEndpoint must be a non-empty string").optional(),
+  workspace: openShellWorkspaceName.optional(),
+  from: nonEmptyTrimmedString("from must be a non-empty string").optional(),
+  policy: nonEmptyTrimmedString("policy must be a non-empty string").optional(),
+  providers: z
+    .array(
+      z.string({ error: "providers must be an array of strings" }).trim().min(1, {
+        error: "providers must be an array of strings",
+      }),
+      {
+        error: "providers must be an array of strings",
+      },
+    )
+    .optional(),
+  gpu: z.boolean({ error: "gpu must be a boolean" }).optional(),
+  autoProviders: z.boolean({ error: "autoProviders must be a boolean" }).optional(),
+  remoteWorkspaceDir: openShellManagedRemotePath("remoteWorkspaceDir").optional(),
+  remoteAgentWorkspaceDir: openShellManagedRemotePath("remoteAgentWorkspaceDir").optional(),
+  timeoutSeconds: z
+    .number({
+      error: `timeoutSeconds must be a number between 1 and ${MAX_TIMER_TIMEOUT_SECONDS}`,
+    })
+    .min(1, { error: "timeoutSeconds must be a number >= 1" })
+    .max(MAX_TIMER_TIMEOUT_SECONDS, {
+      error: `timeoutSeconds must be a number <= ${MAX_TIMER_TIMEOUT_SECONDS}`,
+    })
+    .optional(),
+});
+
+function normalizeOpenShellRemotePath(value: string): string {
+  const normalized = path.posix.normalize(value);
+  if (!OPEN_SHELL_MANAGED_REMOTE_PATH.test(normalized)) {
+    throw new Error(`OpenShell remote path must stay under /sandbox or /agent: ${value}`);
   }
   return normalized;
 }
 
 export function createOpenShellPluginConfigSchema(): OpenClawPluginConfigSchema {
-  const safeParse = (value: unknown): ParseSuccess | ParseFailure => {
-    if (value === undefined) {
-      return { success: true, data: undefined };
-    }
-    if (!isRecord(value)) {
-      return {
-        success: false,
-        error: { issues: [{ path: [], message: "expected config object" }] },
-      };
-    }
-    const allowedKeys = new Set([
-      "mode",
-      "command",
-      "gateway",
-      "gatewayEndpoint",
-      "from",
-      "policy",
-      "providers",
-      "gpu",
-      "autoProviders",
-      "remoteWorkspaceDir",
-      "remoteAgentWorkspaceDir",
-      "timeoutSeconds",
-    ]);
-    for (const key of Object.keys(value)) {
-      if (!allowedKeys.has(key)) {
-        return {
-          success: false,
-          error: { issues: [{ path: [key], message: `unknown config key: ${key}` }] },
-        };
+  return buildPluginConfigSchema(OpenShellPluginConfigSchema, {
+    safeParse(value) {
+      if (value === undefined) {
+        return { success: true, data: undefined };
       }
-    }
-
-    const providers = normalizeProviders(value.providers);
-    if (providers === null) {
+      const parsed = OpenShellPluginConfigSchema.safeParse(value);
+      if (parsed.success) {
+        return { success: true, data: parsed.data };
+      }
       return {
         success: false,
         error: {
-          issues: [{ path: ["providers"], message: "providers must be an array of strings" }],
+          issues: mapPluginConfigIssues(parsed.error.issues),
         },
       };
-    }
-
-    const timeoutSeconds = value.timeoutSeconds;
-    if (
-      timeoutSeconds !== undefined &&
-      (typeof timeoutSeconds !== "number" || !Number.isFinite(timeoutSeconds) || timeoutSeconds < 1)
-    ) {
-      return {
-        success: false,
-        error: {
-          issues: [{ path: ["timeoutSeconds"], message: "timeoutSeconds must be a number >= 1" }],
-        },
-      };
-    }
-
-    for (const key of ["gpu", "autoProviders"] as const) {
-      const candidate = value[key];
-      if (candidate !== undefined && typeof candidate !== "boolean") {
-        return {
-          success: false,
-          error: { issues: [{ path: [key], message: `${key} must be a boolean` }] },
-        };
-      }
-    }
-
-    return {
-      success: true,
-      data: {
-        mode: trimString(value.mode),
-        command: trimString(value.command),
-        gateway: trimString(value.gateway),
-        gatewayEndpoint: trimString(value.gatewayEndpoint),
-        from: trimString(value.from),
-        policy: trimString(value.policy),
-        providers,
-        gpu: value.gpu as boolean | undefined,
-        autoProviders: value.autoProviders as boolean | undefined,
-        remoteWorkspaceDir: trimString(value.remoteWorkspaceDir),
-        remoteAgentWorkspaceDir: trimString(value.remoteAgentWorkspaceDir),
-        timeoutSeconds: timeoutSeconds as number | undefined,
-      },
-    };
-  };
-
-  return {
-    safeParse,
-    jsonSchema: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        command: { type: "string" },
-        mode: { type: "string", enum: ["mirror", "remote"] },
-        gateway: { type: "string" },
-        gatewayEndpoint: { type: "string" },
-        from: { type: "string" },
-        policy: { type: "string" },
-        providers: { type: "array", items: { type: "string" } },
-        gpu: { type: "boolean" },
-        autoProviders: { type: "boolean" },
-        remoteWorkspaceDir: { type: "string" },
-        remoteAgentWorkspaceDir: { type: "string" },
-        timeoutSeconds: { type: "number", minimum: 1 },
-      },
     },
-  };
+  });
 }
 
-export function resolveOpenShellPluginConfig(value: unknown): ResolvedOpenShellPluginConfig {
-  const parsed = createOpenShellPluginConfigSchema().safeParse?.(value);
-  if (!parsed || !parsed.success) {
-    const issues = parsed && !parsed.success ? parsed.error?.issues : undefined;
-    const message =
-      issues?.map((issue: { message: string }) => issue.message).join(", ") || "invalid config";
+export function resolveOpenShellPluginConfig(value: unknown) {
+  const parsed = OpenShellPluginConfigSchema.safeParse(value === undefined ? {} : value);
+  if (!parsed.success) {
+    const message = formatPluginConfigIssue(parsed.error.issues[0]);
     throw new Error(`Invalid openshell plugin config: ${message}`);
   }
-  const raw = parsed.data ?? {};
-  const cfg = (raw ?? {}) as OpenShellPluginConfig;
-  const mode = cfg.mode ?? DEFAULT_MODE;
-  if (mode !== "mirror" && mode !== "remote") {
-    throw new Error(`Invalid openshell plugin config: mode must be one of mirror, remote`);
-  }
+  const cfg = parsed.data;
   return {
-    mode,
+    ...(cfg.worker ? { worker: cfg.worker } : {}),
+    mode: cfg.mode ?? DEFAULT_MODE,
     command: cfg.command ?? DEFAULT_COMMAND,
     gateway: cfg.gateway,
     gatewayEndpoint: cfg.gatewayEndpoint,
+    workspace: cfg.workspace,
     from: cfg.from ?? DEFAULT_SOURCE,
     policy: cfg.policy,
-    providers: cfg.providers ?? [],
+    providers: [...new Set(cfg.providers ?? [])],
     gpu: cfg.gpu ?? false,
     autoProviders: cfg.autoProviders ?? true,
-    remoteWorkspaceDir: normalizeRemotePath(cfg.remoteWorkspaceDir, DEFAULT_REMOTE_WORKSPACE_DIR),
-    remoteAgentWorkspaceDir: normalizeRemotePath(
-      cfg.remoteAgentWorkspaceDir,
-      DEFAULT_REMOTE_AGENT_WORKSPACE_DIR,
+    remoteWorkspaceDir: normalizeOpenShellRemotePath(
+      cfg.remoteWorkspaceDir ?? DEFAULT_REMOTE_WORKSPACE_DIR,
+    ),
+    remoteAgentWorkspaceDir: normalizeOpenShellRemotePath(
+      cfg.remoteAgentWorkspaceDir ?? DEFAULT_REMOTE_AGENT_WORKSPACE_DIR,
     ),
     timeoutMs:
       typeof cfg.timeoutSeconds === "number"

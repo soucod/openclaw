@@ -1,100 +1,85 @@
 import { beforeEach, describe, expect, it } from "vitest";
+import type { ChannelMessagingAdapter } from "../../channels/plugins/types.public.js";
 import { setActivePluginRegistry } from "../../plugins/runtime.js";
-import { createTestRegistry } from "../../test-utils/channel-plugins.js";
-import { resolveAnnounceTargetFromKey } from "./sessions-send-helpers.js";
+import {
+  createChannelTestPluginBase,
+  createTestRegistry,
+} from "../../test-utils/channel-plugins.js";
+import { createSessionConversationTestRegistry } from "../../test-utils/session-conversation-registry.js";
+import { resolveSessionDeliveryTargetFromKey } from "./sessions-send-helpers.js";
 
-describe("resolveAnnounceTargetFromKey", () => {
+function expectTarget(
+  key: string,
+  expected: NonNullable<ReturnType<typeof resolveSessionDeliveryTargetFromKey>>,
+) {
+  expect(resolveSessionDeliveryTargetFromKey(key)).toEqual({ threadId: undefined, ...expected });
+}
+function useMessaging(id: string, messaging: ChannelMessagingAdapter) {
+  setActivePluginRegistry(
+    createTestRegistry([
+      {
+        pluginId: id,
+        source: "test",
+        plugin: { ...createChannelTestPluginBase({ id }), messaging },
+      },
+    ]),
+  );
+}
+
+describe("resolveSessionDeliveryTargetFromKey", () => {
   beforeEach(() => {
-    setActivePluginRegistry(
-      createTestRegistry([
-        {
-          pluginId: "discord",
-          source: "test",
-          plugin: {
-            id: "discord",
-            meta: {
-              id: "discord",
-              label: "Discord",
-              selectionLabel: "Discord",
-              docsPath: "/channels/discord",
-              blurb: "Discord test stub.",
-            },
-            capabilities: { chatTypes: ["direct", "channel", "thread"] },
-            messaging: {
-              resolveSessionTarget: ({ id }: { id: string }) => `channel:${id}`,
-            },
-            config: {
-              listAccountIds: () => ["default"],
-              resolveAccount: () => ({}),
-            },
-          },
-        },
-        {
-          pluginId: "slack",
-          source: "test",
-          plugin: {
-            id: "slack",
-            meta: {
-              id: "slack",
-              label: "Slack",
-              selectionLabel: "Slack",
-              docsPath: "/channels/slack",
-              blurb: "Slack test stub.",
-            },
-            capabilities: { chatTypes: ["direct", "channel", "thread"] },
-            messaging: {
-              resolveSessionTarget: ({ id }: { id: string }) => `channel:${id}`,
-            },
-            config: {
-              listAccountIds: () => ["default"],
-              resolveAccount: () => ({}),
-            },
-          },
-        },
-        {
-          pluginId: "telegram",
-          source: "test",
-          plugin: {
-            id: "telegram",
-            meta: {
-              id: "telegram",
-              label: "Telegram",
-              selectionLabel: "Telegram",
-              docsPath: "/channels/telegram",
-              blurb: "Telegram test stub.",
-            },
-            capabilities: { chatTypes: ["direct", "group", "thread"] },
-            messaging: {
-              normalizeTarget: (raw: string) => raw.replace(/^group:/, ""),
-            },
-            config: {
-              listAccountIds: () => ["default"],
-              resolveAccount: () => ({}),
-            },
-          },
-        },
-      ]),
-    );
+    setActivePluginRegistry(createSessionConversationTestRegistry());
   });
 
-  it("lets plugins own session-derived target shapes", () => {
-    expect(resolveAnnounceTargetFromKey("agent:main:discord:group:dev")).toEqual({
-      channel: "discord",
-      to: "channel:dev",
-      threadId: undefined,
+  it.each([
+    ["discord:group:dev", { channel: "discord", to: "channel:dev" }],
+    ["slack:group:C123", { channel: "slack", to: "channel:C123" }],
+    [
+      "slack:channel:general:thread:1699999999.0001",
+      { channel: "slack", to: "channel:general", threadId: "1699999999.0001" },
+    ],
+    [
+      "feishu:group:oc_group_chat:topic:om_topic_root:sender:ou_topic_user",
+      { channel: "feishu", to: "oc_group_chat:topic:om_topic_root:sender:ou_topic_user" },
+    ],
+    [
+      "feishu:work:dm:ou_recipient",
+      { channel: "feishu", to: "user:ou_recipient", accountId: "work" },
+    ],
+    ["wecom:direct:opaque-recipient", { channel: "wecom", to: "user:opaque-recipient" }],
+  ] as const)("resolves the plugin-owned target for %s", (suffix, expected) => {
+    expectTarget(`agent:main:${suffix}`, expected);
+  });
+
+  it("does not reinterpret a nested agent session as an external direct target", () => {
+    expect(
+      resolveSessionDeliveryTargetFromKey("agent:main:agent:other:feishu:direct:ou_recipient"),
+    ).toBeNull();
+  });
+
+  it("keeps a safe user target when a direct delivery resolver returns null", () => {
+    useMessaging("feishu", {
+      normalizeTarget: (target: string) => target,
+      resolveDeliveryTarget: () => null,
     });
-    expect(resolveAnnounceTargetFromKey("agent:main:slack:group:C123")).toEqual({
+    expectTarget("agent:main:feishu:direct:ou_recipient", {
+      channel: "feishu",
+      to: "user:ou_recipient",
+    });
+  });
+
+  it("does not let a room delivery resolver convert a direct user into a channel", () => {
+    useMessaging("slack", {
+      directTargetStyle: "user-prefixed",
+      targetIdComparison: "lowercase",
+      normalizeTarget: (target: string) => target.toLowerCase(),
+      resolveDeliveryTarget: ({ conversationId }: { conversationId: string }) => ({
+        to: `channel:${conversationId}`,
+      }),
+    });
+    expectTarget("agent:main:slack:direct:U09G2DJ0275", {
       channel: "slack",
-      to: "channel:C123",
-      threadId: undefined,
-    });
-  });
-
-  it("keeps generic topic extraction and plugin normalization for other channels", () => {
-    expect(resolveAnnounceTargetFromKey("agent:main:telegram:group:-100123:topic:99")).toEqual({
-      channel: "telegram",
-      to: "-100123",
-      threadId: "99",
+      to: "user:u09g2dj0275",
     });
   });
 });

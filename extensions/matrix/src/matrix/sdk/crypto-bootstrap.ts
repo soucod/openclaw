@@ -1,4 +1,7 @@
+import { setTimeout as sleep } from "node:timers/promises";
 import { CryptoEvent } from "matrix-js-sdk/lib/crypto-api/CryptoEvent.js";
+import type { VerificationRequest } from "matrix-js-sdk/lib/crypto-api/verification.js";
+import { toStringifiedError } from "openclaw/plugin-sdk/error-runtime";
 import type { MatrixDecryptBridge } from "./decrypt-bridge.js";
 import { LogService } from "./logger.js";
 import type { MatrixRecoveryKeyStore } from "./recovery-key-store.js";
@@ -9,15 +12,13 @@ import type {
   MatrixRawEvent,
   MatrixUiAuthCallback,
 } from "./types.js";
-import type {
-  MatrixVerificationManager,
-  MatrixVerificationRequestLike,
-} from "./verification-manager.js";
-import { isMatrixDeviceOwnerVerified } from "./verification-status.js";
+import type { MatrixVerificationManager } from "./verification-manager.js";
+import { isMatrixDeviceOwnerVerified, trustMatrixOwnIdentity } from "./verification-status.js";
 
-export type MatrixCryptoBootstrapperDeps<TRawEvent extends MatrixRawEvent> = {
+type MatrixCryptoBootstrapperDeps<TRawEvent extends MatrixRawEvent> = {
   getUserId: () => Promise<string>;
   getPassword?: () => string | undefined;
+  canUnlockSecretStorage: () => Promise<boolean>;
   getDeviceId: () => string | null | undefined;
   verificationManager: MatrixVerificationManager;
   recoveryKeyStore: MatrixRecoveryKeyStore;
@@ -37,6 +38,8 @@ export type MatrixCryptoBootstrapResult = {
   ownDeviceVerified: boolean | null;
 };
 
+const CROSS_SIGNING_PUBLICATION_WAIT_MS = 5_000;
+
 export class MatrixCryptoBootstrapper<TRawEvent extends MatrixRawEvent> {
   private verificationHandlerRegistered = false;
 
@@ -47,58 +50,55 @@ export class MatrixCryptoBootstrapper<TRawEvent extends MatrixRawEvent> {
     options: MatrixCryptoBootstrapOptions = {},
   ): Promise<MatrixCryptoBootstrapResult> {
     const strict = options.strict === true;
+    const forceReset = options.forceResetCrossSigning === true;
+    if (forceReset && !(await this.deps.canUnlockSecretStorage())) {
+      throw new Error(
+        "Forced cross-signing reset requires the active Matrix recovery key; supply it before retrying",
+      );
+    }
     // Register verification listeners before expensive bootstrap work so incoming requests
     // are not missed during startup.
     this.registerVerificationRequestHandler(crypto);
-    await this.bootstrapSecretStorage(crypto, {
-      strict,
-      allowSecretStorageRecreateWithoutRecoveryKey:
-        options.allowSecretStorageRecreateWithoutRecoveryKey === true,
-    });
+
+    if (!forceReset) {
+      await this.bootstrapSecretStorage(crypto, {
+        strict,
+        allowSecretStorageRecreateWithoutRecoveryKey:
+          options.allowSecretStorageRecreateWithoutRecoveryKey === true,
+      });
+    }
+
     const crossSigning = await this.bootstrapCrossSigning(crypto, {
-      forceResetCrossSigning: options.forceResetCrossSigning === true,
+      forceResetCrossSigning: forceReset,
       allowAutomaticCrossSigningReset: options.allowAutomaticCrossSigningReset !== false,
-      allowSecretStorageRecreateWithoutRecoveryKey:
-        options.allowSecretStorageRecreateWithoutRecoveryKey === true,
+      allowSecretStorageRecreateWithoutRecoveryKey: forceReset
+        ? false
+        : options.allowSecretStorageRecreateWithoutRecoveryKey === true,
       strict,
     });
+
+    if (forceReset && (!crossSigning.ready || !crossSigning.published)) {
+      return {
+        crossSigningReady: crossSigning.ready,
+        crossSigningPublished: crossSigning.published,
+        ownDeviceVerified: null,
+      };
+    }
+
+    // Second SSSS pass to pick up cross-signing keys published during bootstrap.
     await this.bootstrapSecretStorage(crypto, {
       strict,
       allowSecretStorageRecreateWithoutRecoveryKey:
         options.allowSecretStorageRecreateWithoutRecoveryKey === true,
     });
-    const ownDeviceVerified = await this.ensureOwnDeviceTrust(crypto, strict);
+
+    const ownDeviceVerified = await this.ensureOwnDeviceTrust(crypto, {
+      strict,
+    });
     return {
       crossSigningReady: crossSigning.ready,
       crossSigningPublished: crossSigning.published,
       ownDeviceVerified,
-    };
-  }
-
-  private createSigningKeysUiAuthCallback(params: {
-    userId: string;
-    password?: string;
-  }): MatrixUiAuthCallback {
-    return async <T>(makeRequest: (authData: MatrixAuthDict | null) => Promise<T>): Promise<T> => {
-      try {
-        return await makeRequest(null);
-      } catch {
-        // Some homeservers require an explicit dummy UIA stage even when no user interaction is needed.
-        try {
-          return await makeRequest({ type: "m.login.dummy" });
-        } catch {
-          if (!params.password?.trim()) {
-            throw new Error(
-              "Matrix cross-signing key upload requires UIA; provide matrix.password for m.login.password fallback",
-            );
-          }
-          return await makeRequest({
-            type: "m.login.password",
-            identifier: { type: "m.id.user", user: params.userId },
-            password: params.password,
-          });
-        }
-      }
     };
   }
 
@@ -112,34 +112,39 @@ export class MatrixCryptoBootstrapper<TRawEvent extends MatrixRawEvent> {
     },
   ): Promise<{ ready: boolean; published: boolean }> {
     const userId = await this.deps.getUserId();
-    const authUploadDeviceSigningKeys = this.createSigningKeysUiAuthCallback({
-      userId,
-      password: this.deps.getPassword?.(),
-    });
-    const hasPublishedCrossSigningKeys = async (): Promise<boolean> => {
-      if (typeof crypto.userHasCrossSigningKeys !== "function") {
-        return true;
-      }
+    const password = this.deps.getPassword?.();
+    const authUploadDeviceSigningKeys: MatrixUiAuthCallback = async <T>(
+      makeRequest: (authData: MatrixAuthDict | null) => Promise<T>,
+    ): Promise<T> => {
       try {
-        return await crypto.userHasCrossSigningKeys(userId, true);
+        return await makeRequest(null);
       } catch {
-        return false;
+        // Some homeservers require an explicit dummy UIA stage even when no user interaction is needed.
+        try {
+          return await makeRequest({ type: "m.login.dummy" });
+        } catch {
+          if (!password?.trim()) {
+            throw new Error(
+              "Matrix cross-signing key upload requires UIA; provide matrix.password for m.login.password fallback",
+            );
+          }
+          return await makeRequest({
+            type: "m.login.password",
+            identifier: { type: "m.id.user", user: userId },
+            password,
+          });
+        }
       }
     };
-    const isCrossSigningReady = async (): Promise<boolean> => {
-      if (typeof crypto.isCrossSigningReady !== "function") {
-        return true;
-      }
-      try {
-        return await crypto.isCrossSigningReady();
-      } catch {
-        return false;
-      }
-    };
+    const hasPublishedCrossSigningKeys = () =>
+      crypto.userHasCrossSigningKeys(userId, true).catch(() => false);
+    const isCrossSigningReady = () => crypto.isCrossSigningReady().catch(() => false);
 
     const finalize = async (): Promise<{ ready: boolean; published: boolean }> => {
       const ready = await isCrossSigningReady();
-      const published = await hasPublishedCrossSigningKeys();
+      const published = ready
+        ? await waitForPublishedCrossSigningKeys()
+        : await hasPublishedCrossSigningKeys();
       if (ready && published) {
         LogService.info("MatrixClientLite", "Cross-signing bootstrap complete");
         return { ready, published };
@@ -152,16 +157,36 @@ export class MatrixCryptoBootstrapper<TRawEvent extends MatrixRawEvent> {
       return { ready, published };
     };
 
+    const waitForPublishedCrossSigningKeys = async (): Promise<boolean> => {
+      const startedAt = Date.now();
+      do {
+        if (await hasPublishedCrossSigningKeys()) {
+          return true;
+        }
+        await sleep(250);
+      } while (Date.now() - startedAt < CROSS_SIGNING_PUBLICATION_WAIT_MS);
+      return false;
+    };
+
     if (options.forceResetCrossSigning) {
       try {
         await crypto.bootstrapCrossSigning({
           setupNewCrossSigning: true,
           authUploadDeviceSigningKeys,
         });
+        await trustMatrixOwnIdentity(crypto);
       } catch (err) {
+        // A repair retry would generate another identity after the SDK already rotated local keys.
+        // Fail closed instead; the server identity and existing recovery material remain authoritative.
         LogService.warn("MatrixClientLite", "Forced cross-signing reset failed:", err);
         if (options.strict) {
-          throw err instanceof Error ? err : new Error(String(err));
+          if (isRepairableSecretStorageAccessError(err)) {
+            throw new Error(
+              "Forced cross-signing reset cannot access secret storage; restore the Matrix recovery key before retrying",
+              { cause: err },
+            );
+          }
+          throw toStringifiedError(err);
         }
         return { ready: false, published: false };
       }
@@ -170,6 +195,7 @@ export class MatrixCryptoBootstrapper<TRawEvent extends MatrixRawEvent> {
 
     // First pass: preserve existing cross-signing identity and ensure public keys are uploaded.
     try {
+      await hasPublishedCrossSigningKeys();
       await crypto.bootstrapCrossSigning({
         authUploadDeviceSigningKeys,
       });
@@ -210,7 +236,7 @@ export class MatrixCryptoBootstrapper<TRawEvent extends MatrixRawEvent> {
         } catch (resetErr) {
           LogService.warn("MatrixClientLite", "Failed to bootstrap cross-signing:", resetErr);
           if (options.strict) {
-            throw resetErr instanceof Error ? resetErr : new Error(String(resetErr));
+            throw toStringifiedError(resetErr);
           }
           return { ready: false, published: false };
         }
@@ -234,10 +260,11 @@ export class MatrixCryptoBootstrapper<TRawEvent extends MatrixRawEvent> {
         setupNewCrossSigning: true,
         authUploadDeviceSigningKeys,
       });
+      await trustMatrixOwnIdentity(crypto);
     } catch (err) {
       LogService.warn("MatrixClientLite", "Fallback cross-signing bootstrap failed:", err);
       if (options.strict) {
-        throw err instanceof Error ? err : new Error(String(err));
+        throw toStringifiedError(err);
       }
       return { ready: false, published: false };
     }
@@ -261,7 +288,7 @@ export class MatrixCryptoBootstrapper<TRawEvent extends MatrixRawEvent> {
     } catch (err) {
       LogService.warn("MatrixClientLite", "Failed to bootstrap secret storage:", err);
       if (options.strict) {
-        throw err instanceof Error ? err : new Error(String(err));
+        throw toStringifiedError(err);
       }
     }
   }
@@ -277,8 +304,8 @@ export class MatrixCryptoBootstrapper<TRawEvent extends MatrixRawEvent> {
     // Remote-user verifications are only auto-accepted. The human-operated
     // client must explicitly choose "Verify by emoji" so we do not race a
     // second SAS start from the bot side and end up with mismatched keys.
-    crypto.on(CryptoEvent.VerificationRequestReceived, async (request) => {
-      const verificationRequest = request as MatrixVerificationRequestLike;
+    crypto.on(CryptoEvent.VerificationRequestReceived, (request) => {
+      const verificationRequest = request as VerificationRequest;
       try {
         this.deps.verificationManager.trackVerificationRequest(verificationRequest);
       } catch (err) {
@@ -296,7 +323,9 @@ export class MatrixCryptoBootstrapper<TRawEvent extends MatrixRawEvent> {
 
   private async ensureOwnDeviceTrust(
     crypto: MatrixCryptoBootstrapApi,
-    strict = false,
+    options: {
+      strict: boolean;
+    },
   ): Promise<boolean | null> {
     const deviceId = this.deps.getDeviceId()?.trim();
     if (!deviceId) {
@@ -304,37 +333,28 @@ export class MatrixCryptoBootstrapper<TRawEvent extends MatrixRawEvent> {
     }
     const userId = await this.deps.getUserId();
 
-    const deviceStatus =
-      typeof crypto.getDeviceVerificationStatus === "function"
-        ? await crypto.getDeviceVerificationStatus(userId, deviceId).catch(() => null)
-        : null;
+    const deviceStatus = await crypto
+      .getDeviceVerificationStatus(userId, deviceId)
+      .catch(() => null);
     const alreadyVerified = isMatrixDeviceOwnerVerified(deviceStatus);
 
     if (alreadyVerified) {
       return true;
     }
 
-    if (typeof crypto.setDeviceVerified === "function") {
-      await crypto.setDeviceVerified(userId, deviceId, true);
+    await crypto.setDeviceVerified(userId, deviceId, true);
+    if (await crypto.isCrossSigningReady()) {
+      await crypto.crossSignDevice(deviceId);
     }
 
-    if (typeof crypto.crossSignDevice === "function") {
-      const crossSigningReady =
-        typeof crypto.isCrossSigningReady === "function"
-          ? await crypto.isCrossSigningReady()
-          : true;
-      if (crossSigningReady) {
-        await crypto.crossSignDevice(deviceId);
-      }
-    }
-
-    const refreshedStatus =
-      typeof crypto.getDeviceVerificationStatus === "function"
-        ? await crypto.getDeviceVerificationStatus(userId, deviceId).catch(() => null)
-        : null;
+    const refreshedStatus = await crypto
+      .getDeviceVerificationStatus(userId, deviceId)
+      .catch(() => null);
     const verified = isMatrixDeviceOwnerVerified(refreshedStatus);
-    if (!verified && strict) {
-      throw new Error(`Matrix own device ${deviceId} is not verified by its owner after bootstrap`);
+    if (!verified && options.strict) {
+      throw new Error(
+        `Matrix own device ${deviceId} does not have full Matrix identity trust after bootstrap`,
+      );
     }
     return verified;
   }

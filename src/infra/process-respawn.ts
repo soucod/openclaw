@@ -1,86 +1,307 @@
-import { spawn } from "node:child_process";
+// Respawns the gateway process when no supervisor handles restart.
+import { spawn, type ChildProcess } from "node:child_process";
+import { isSupported as isSystemdSupported } from "@openclaw/proc-safe/systemd";
+import { resolveOpenClawCliInvocation } from "../../cli-invocation.mjs";
 import { scheduleDetachedLaunchdRestartHandoff } from "../daemon/launchd-restart-handoff.js";
-import { triggerOpenClawRestart } from "./restart.js";
-import { detectRespawnSupervisor } from "./supervisor-markers.js";
+import { isNodeRuntime } from "../daemon/runtime-binary.js";
+import { mergeGatewayServiceEnv } from "../daemon/service-env-merge.js";
+import type { GatewayServiceState } from "../daemon/service-types.js";
+import {
+  isWindowsTaskSupervisorChildArgument,
+  readWindowsTaskSupervisorRestartExitCode,
+} from "../daemon/windows-task-supervisor-contract.js";
+import { runWithGatewayIndependentRootWorkAdmission } from "../process/gateway-work-admission.js";
+import {
+  probeChildRuntimeExecutable,
+  registerChildRuntimeRecovery,
+} from "./child-runtime-viability.js";
+import { isContainerEnvironment } from "./container-environment.js";
+import { isTruthyEnvValue } from "./env.js";
+import { formatErrorMessage } from "./errors.js";
+import { readGatewayLastShutdownAsync } from "./gateway-boot-lifecycle.js";
+import {
+  registerGatewayNativeWorkerRecovery,
+  reportGatewayRuntimeRecoveryOnly,
+  type GatewayNativeWorkerRecoveryRequest,
+  type GatewayRuntimeRecoveryResult,
+} from "./gateway-native-worker-recovery.js";
+import { rewritePnpmVersionedOpenClawEntryPath } from "./openclaw-root.js";
+import type { GatewayRestartIntent } from "./restart-lifecycle.types.js";
+import { requestGatewayRestartWithSignalAdmission, triggerOpenClawRestart } from "./restart.js";
+import { detectGatewayRespawnSupervisor } from "./supervisor-markers.js";
 
-type RespawnMode = "spawned" | "supervised" | "disabled" | "failed";
-
-export type GatewayRespawnResult = {
-  mode: RespawnMode;
-  pid?: number;
+type GatewayRespawnResult = {
+  mode: "supervised" | "disabled" | "failed";
   detail?: string;
+  exitCode?: number;
+  handoffSpawned?: Promise<boolean>;
 };
 
-function isTruthy(value: string | undefined): boolean {
-  if (!value) {
-    return false;
+type GatewayUpdateRespawnResult =
+  | { mode: "spawned"; pid?: number; child: ChildProcess }
+  | { mode: "disabled" | "failed"; detail?: string };
+type GatewayRespawnOptions = {
+  env?: NodeJS.ProcessEnv;
+  decision?: GatewayRestartDecision;
+};
+
+export type GatewayRestartDecision =
+  | { mode: "disabled"; reason: "no-respawn" }
+  | { mode: "disabled"; reason: "unmanaged"; detail: string }
+  | {
+      mode: "supervised";
+      supervisor: NonNullable<ReturnType<typeof detectGatewayRespawnSupervisor>>;
+    };
+
+export function resolveGatewayRestartDecision(): GatewayRestartDecision {
+  if (isTruthyEnvValue(process.env.OPENCLAW_NO_RESPAWN)) {
+    return { mode: "disabled", reason: "no-respawn" };
   }
-  const normalized = value.trim().toLowerCase();
-  return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
+  const supervisor = detectGatewayRespawnSupervisor(process.env);
+  if (supervisor) {
+    return { mode: "supervised", supervisor };
+  }
+  const detail =
+    process.platform === "win32"
+      ? "win32: detached respawn unsupported without Scheduled Task markers"
+      : isContainerEnvironment()
+        ? "container: use in-process restart to keep PID 1 alive"
+        : "unmanaged: use in-process restart to keep custom supervisor PID tracking stable";
+  return { mode: "disabled", reason: "unmanaged", detail };
+}
+
+const CHILD_RUNTIME_RESTART_REASON = "gateway.runtime-unavailable";
+const NATIVE_WORKER_RESTART_REASON = "gateway.native-worker-unsettled";
+
+/** Bind automatic recovery to the existing process lifecycle, never a worker pool. */
+export function registerGatewayRuntimeRecovery(params: {
+  decision: GatewayRestartDecision;
+  ownsProcessLifecycle: boolean;
+  isCurrent: () => boolean;
+}): () => void {
+  const { decision } = params;
+  // Native target detection can request a Node report, which waits for every worker.
+  // Prepare the service capability before server workers can become stuck in native I/O.
+  const serviceCapabilityReady =
+    params.ownsProcessLifecycle &&
+    decision.mode === "supervised" &&
+    decision.supervisor === "systemd"
+      ? isSystemdSupported()
+      : true;
+  // Read while the original executable still works. Once it fails, only resident facts are usable.
+  const previousShutdown =
+    params.ownsProcessLifecycle && decision.mode === "supervised"
+      ? Promise.resolve().then(() => readGatewayLastShutdownAsync())
+      : Promise.resolve(undefined);
+  // Retain failure as a refusal, without an unhandled rejection before the first diagnosis.
+  const history = previousShutdown.then(
+    (shutdown) => ({ shutdown }),
+    (error: unknown) => ({ error }),
+  );
+  let active = true;
+  const recover = async (
+    reason: string,
+    isCurrent: () => boolean,
+    intent?: GatewayRestartIntent,
+  ): Promise<GatewayRuntimeRecoveryResult> => {
+    if (
+      !params.ownsProcessLifecycle ||
+      decision.mode !== "supervised" ||
+      decision.supervisor === "external"
+    ) {
+      return reportGatewayRuntimeRecoveryOnly("no verified native service restart target.");
+    }
+    if (!serviceCapabilityReady) {
+      return reportGatewayRuntimeRecoveryOnly(
+        "native systemd inspection was unavailable at Gateway startup.",
+      );
+    }
+    const prior = await history;
+    if ("error" in prior) {
+      return reportGatewayRuntimeRecoveryOnly("restart history could not be read.");
+    }
+    if (
+      prior.shutdown?.reason?.includes(reason) &&
+      Date.now() - prior.shutdown.completedAtMs < 5 * 60_000
+    ) {
+      return reportGatewayRuntimeRecoveryOnly(
+        "a runtime recovery restart happened within the last five minutes.",
+      );
+    }
+    let service: GatewayServiceState;
+    if (decision.supervisor === "launchd") {
+      const { readLoadedLaunchAgentState, readCorrespondingLaunchAgentCommand } =
+        await import("../daemon/launchd-runtime.js");
+      const loaded = await readLoadedLaunchAgentState(process.env, { timeoutMs: 5_000 });
+      // kickstart reuses the loaded job; a rewritten plist alone cannot prove its successor.
+      const command = loaded.launchAgent
+        ? await readCorrespondingLaunchAgentCommand(process.env, loaded.launchAgent, 5_000)
+        : null;
+      service = { ...loaded, command, env: mergeGatewayServiceEnv(process.env, command) };
+    } else {
+      const { resolveGatewayService } = await import("../daemon/service.js");
+      const { readGatewayServiceState } = await import("../daemon/service-state.js");
+      service = await readGatewayServiceState(resolveGatewayService(), {
+        env: process.env,
+        requireEffective: true,
+        requireLoadedCommand: true,
+        timeoutMs: 5_000,
+      });
+    }
+    const executable = service.command?.programArguments[0];
+    if (!service.running || !executable || !isNodeRuntime(executable)) {
+      return reportGatewayRuntimeRecoveryOnly("the service has no verified Node command.");
+    }
+    const probe = probeChildRuntimeExecutable(executable, {
+      env: service.env,
+      cwd: service.command?.workingDirectory,
+    });
+    if (probe.error || probe.status !== 0 || !/^v\d+\.\d+\.\d+\s*$/.test(probe.stdout)) {
+      return reportGatewayRuntimeRecoveryOnly(
+        "the service Node cannot start. Repair the service runtime, then restart the Gateway.",
+      );
+    }
+    // Do not wait for new admission after another lifecycle request has closed it.
+    if (!active || !params.isCurrent()) {
+      return reportGatewayRuntimeRecoveryOnly("the Gateway lifecycle is already stopping.");
+    }
+    return runWithGatewayIndependentRootWorkAdmission(async () => {
+      if (!active || !params.isCurrent()) {
+        return reportGatewayRuntimeRecoveryOnly("the Gateway lifecycle is already stopping.");
+      }
+      if (!isCurrent()) {
+        return reportGatewayRuntimeRecoveryOnly("the native worker has already settled.");
+      }
+      const result = intent
+        ? requestGatewayRestartWithSignalAdmission(reason, intent)
+        : requestGatewayRestartWithSignalAdmission(reason);
+      return result.status === "emitted"
+        ? {
+            status: "restart-requested" as const,
+            reason: intent?.requireFreshProcess
+              ? "Service Node verified; requested a bounded fresh-process restart for the unsettled native worker."
+              : "Service Node verified; requested a graceful fresh-process restart for the unavailable child runtime.",
+          }
+        : reportGatewayRuntimeRecoveryOnly(`restart request ${result.status}.`);
+    }, reason);
+  };
+  const releaseChildRecovery = registerChildRuntimeRecovery(() =>
+    recover(CHILD_RUNTIME_RESTART_REASON, () => true),
+  );
+  let pending: Promise<GatewayRuntimeRecoveryResult> | undefined;
+  let requested: GatewayRuntimeRecoveryResult | undefined;
+  const unsettledWorkers = new Set<() => boolean>();
+  const request = (worker: GatewayNativeWorkerRecoveryRequest) => {
+    if (requested) {
+      return Promise.resolve(requested);
+    }
+    unsettledWorkers.add(worker.isCurrent);
+    pending ??= recover(
+      NATIVE_WORKER_RESTART_REASON,
+      () => [...unsettledWorkers].some((isCurrent) => isCurrent()),
+      { force: true, waitMs: 0, requireFreshProcess: true },
+    )
+      .then((result) => {
+        if (result.status === "restart-requested") {
+          requested = result;
+        }
+        return result;
+      })
+      .finally(() => {
+        pending = undefined;
+        unsettledWorkers.clear();
+      });
+    return pending;
+  };
+  const releaseNativeWorkerRecovery = registerGatewayNativeWorkerRecovery(request);
+  return () => {
+    active = false;
+    releaseChildRecovery();
+    releaseNativeWorkerRecovery();
+  };
 }
 
 /**
  * Attempt to restart this process with a fresh PID.
  * - supervised environments (launchd/systemd/schtasks): caller should exit and let supervisor restart
  * - OPENCLAW_NO_RESPAWN=1: caller should keep in-process restart behavior (tests/dev)
- * - otherwise: spawn detached child with current argv/execArgv, then caller exits
+ * - unmanaged environments: caller should keep in-process restart behavior so
+ *   custom supervisors keep tracking the same gateway PID
  */
-export function restartGatewayProcessWithFreshPid(): GatewayRespawnResult {
-  if (isTruthy(process.env.OPENCLAW_NO_RESPAWN)) {
-    return { mode: "disabled" };
+export function restartGatewayProcessWithFreshPid(
+  opts: GatewayRespawnOptions = {},
+): GatewayRespawnResult {
+  const decision = opts.decision ?? resolveGatewayRestartDecision();
+  if (decision.mode === "disabled") {
+    return decision.reason === "no-respawn"
+      ? { mode: "disabled" }
+      : { mode: "disabled", detail: decision.detail };
   }
-  const supervisor = detectRespawnSupervisor(process.env);
-  if (supervisor) {
-    // Hand off launchd restarts to a detached helper before exiting so config
-    // reloads and SIGUSR1-driven restarts do not depend on exit/respawn timing.
-    if (supervisor === "launchd") {
-      const handoff = scheduleDetachedLaunchdRestartHandoff({
-        env: process.env,
-        mode: "start-after-exit",
-        waitForPid: process.pid,
-      });
-      if (!handoff.ok) {
+  const { supervisor } = decision;
+  if (supervisor === "launchd") {
+    const handoff = scheduleDetachedLaunchdRestartHandoff({
+      mode: "start-after-exit",
+      waitForPid: process.pid,
+    });
+    return handoff.ok
+      ? { mode: "supervised", handoffSpawned: handoff.value }
+      : { mode: "failed", detail: handoff.error };
+  }
+  if (supervisor === "schtasks") {
+    if (process.argv.some(isWindowsTaskSupervisorChildArgument)) {
+      const exitCode = readWindowsTaskSupervisorRestartExitCode(process.argv);
+      if (exitCode === undefined) {
         return {
-          mode: "supervised",
-          detail: `launchd exit fallback (${handoff.detail ?? "restart handoff failed"})`,
+          mode: "failed",
+          detail: "Windows task supervisor restart marker is missing or invalid",
         };
       }
       return {
         mode: "supervised",
-        detail: `launchd restart handoff pid ${handoff.pid ?? "unknown"}`,
+        exitCode,
       };
     }
-    if (supervisor === "schtasks") {
-      const restart = triggerOpenClawRestart();
-      if (!restart.ok) {
-        return {
-          mode: "failed",
-          detail: restart.detail ?? `${restart.method} restart failed`,
-        };
-      }
+    const restart = triggerOpenClawRestart();
+    if (!restart.ok) {
+      return {
+        mode: "failed",
+        detail: restart.detail ?? `${restart.method} restart failed`,
+      };
     }
-    return { mode: "supervised" };
   }
-  if (process.platform === "win32") {
-    // Detached respawn is unsafe on Windows without an identified Scheduled Task:
-    // the child becomes orphaned if the original process exits.
-    return {
-      mode: "disabled",
-      detail: "win32: detached respawn unsupported without Scheduled Task markers",
-    };
-  }
+  return { mode: "supervised" };
+}
 
+/**
+ * Update restarts must replace the OS process so the new code runs from a
+ * fresh module graph after package files have changed on disk.
+ *
+ * The caller resolves supervisor ownership first; this path is only for an
+ * unmanaged process whose installed package contents have been replaced.
+ */
+export function respawnGatewayProcessForUpdate(
+  opts: GatewayRespawnOptions = {},
+): GatewayUpdateRespawnResult {
+  const decision = opts.decision ?? resolveGatewayRestartDecision();
+  if (decision.mode === "disabled" && decision.reason === "no-respawn") {
+    return { mode: "disabled", detail: "OPENCLAW_NO_RESPAWN" };
+  }
   try {
-    const args = [...process.execArgv, ...process.argv.slice(1)];
-    const child = spawn(process.execPath, args, {
-      env: process.env,
+    const [entryArg, ...entryArgs] = process.argv.slice(1);
+    const invocation = resolveOpenClawCliInvocation({
+      entryPath: entryArg ? rewritePnpmVersionedOpenClawEntryPath(entryArg) : undefined,
+      args: entryArgs,
+    });
+    const child = spawn(invocation.command, invocation.args, {
+      env: opts.env ? { ...process.env, ...opts.env } : process.env,
       detached: true,
       stdio: "inherit",
     });
+    // Register before unref: late detached-spawn failures must not crash the parent.
+    child.on("error", () => {});
     child.unref();
-    return { mode: "spawned", pid: child.pid ?? undefined };
+    return { mode: "spawned", pid: child.pid ?? undefined, child };
   } catch (err) {
-    const detail = err instanceof Error ? err.message : String(err);
-    return { mode: "failed", detail };
+    return { mode: "failed", detail: formatErrorMessage(err) };
   }
 }

@@ -1,133 +1,61 @@
-/**
- * Twitch message sending functions with dependency injection support.
- *
- * These functions are the primary interface for sending messages to Twitch.
- * They support dependency injection via the `deps` parameter for testability.
- */
+import {
+  createMessageReceiptFromOutboundResults,
+  type MessageReceipt,
+} from "openclaw/plugin-sdk/channel-outbound";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import { stripMarkdown } from "openclaw/plugin-sdk/text-chunking";
+import type { TwitchClientManager } from "./twitch-client.js";
+import type { TwitchAccountConfig } from "./types.js";
 
-import type { OpenClawConfig } from "../runtime-api.js";
-import { getClientManager as getRegistryClientManager } from "./client-manager-registry.js";
-import { DEFAULT_ACCOUNT_ID, resolveTwitchAccountContext } from "./config.js";
-import { stripMarkdownForTwitch } from "./utils/markdown.js";
-import { generateMessageId, normalizeTwitchChannel } from "./utils/twitch.js";
-
-/**
- * Result from sending a message to Twitch.
- */
-export interface SendMessageResult {
-  /** Whether the send was successful */
-  ok: boolean;
-  /** The message ID (generated for tracking) */
-  messageId: string;
-  /** Error message if the send failed */
-  error?: string;
+function createTwitchSendReceipt(messageId?: string, channel?: string): MessageReceipt {
+  return createMessageReceiptFromOutboundResults({
+    results: messageId ? [{ channel: "twitch", messageId, conversationId: channel }] : [],
+    kind: "text",
+  });
 }
 
-/**
- * Internal send function used by the outbound adapter.
- *
- * This function has access to the full OpenClaw config and handles
- * account resolution, markdown stripping, and actual message sending.
- *
- * @param channel - The channel name
- * @param text - The message text
- * @param cfg - Full OpenClaw configuration
- * @param accountId - Account ID to use
- * @param stripMarkdown - Whether to strip markdown (default: true)
- * @param logger - Logger instance
- * @returns Result with message ID and status
- *
- * @example
- * const result = await sendMessageTwitchInternal(
- *   "#mychannel",
- *   "Hello Twitch!",
- *   openclawConfig,
- *   "default",
- *   true,
- *   console,
- * );
- */
-export async function sendMessageTwitchInternal(
-  channel: string,
-  text: string,
-  cfg: OpenClawConfig,
-  accountId: string = DEFAULT_ACCOUNT_ID,
-  stripMarkdown: boolean = true,
-  logger: Console = console,
-): Promise<SendMessageResult> {
-  const { account, configured, availableAccountIds } = resolveTwitchAccountContext(cfg, accountId);
-  if (!account) {
-    return {
-      ok: false,
-      messageId: generateMessageId(),
-      error: `Account not found: ${accountId}. Available accounts: ${availableAccountIds.join(", ") || "none"}`,
-    };
-  }
-
-  if (!configured) {
-    return {
-      ok: false,
-      messageId: generateMessageId(),
-      error:
-        `Account ${accountId} is not properly configured. ` +
-        "Required: username, clientId, and token (config or env for default account).",
-    };
-  }
-
-  const normalizedChannel = channel || account.channel;
-  if (!normalizedChannel) {
-    return {
-      ok: false,
-      messageId: generateMessageId(),
-      error: "No channel specified and no default channel in account config",
-    };
-  }
-
-  const cleanedText = stripMarkdown ? stripMarkdownForTwitch(text) : text;
+// Callers retain their account and manager lifecycle; strip Markdown once before chunking.
+export async function sendMessageTwitchInternal(params: {
+  channel: string;
+  text: string;
+  cfg: OpenClawConfig;
+  account: TwitchAccountConfig;
+  accountId: string;
+  clientManager: TwitchClientManager | undefined;
+}) {
+  const cleanedText = stripMarkdown(params.text, { linkStyle: "label-and-url" })
+    .replace(/\r/g, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n/g, " ")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
   if (!cleanedText) {
     return {
-      ok: true,
-      messageId: "skipped",
+      outcome: "not_sent" as const,
+      messageId: "",
+      receipt: createTwitchSendReceipt(),
     };
   }
 
-  const clientManager = getRegistryClientManager(accountId);
-  if (!clientManager) {
-    return {
-      ok: false,
-      messageId: generateMessageId(),
-      error: `Client manager not found for account: ${accountId}. Please start the Twitch gateway first.`,
-    };
-  }
-
-  try {
-    const result = await clientManager.sendMessage(
-      account,
-      normalizeTwitchChannel(normalizedChannel),
-      cleanedText,
-      cfg,
-      accountId,
+  if (!params.clientManager) {
+    throw new Error(
+      `Client manager not found for account: ${params.accountId}. Please start the Twitch gateway first.`,
     );
-
-    if (!result.ok) {
-      return {
-        ok: false,
-        messageId: result.messageId ?? generateMessageId(),
-        error: result.error ?? "Send failed",
-      };
-    }
-
-    return {
-      ok: true,
-      messageId: result.messageId ?? generateMessageId(),
-    };
-  } catch (error) {
-    const errorMsg = error instanceof Error ? error.message : String(error);
-    logger.error(`Failed to send message: ${errorMsg}`);
-    return {
-      ok: false,
-      messageId: generateMessageId(),
-      error: errorMsg,
-    };
   }
+  const result = await params.clientManager.sendMessage(
+    params.account,
+    params.channel,
+    cleanedText,
+    params.cfg,
+    params.accountId,
+  );
+  if (!result.ok) {
+    // The public boundary keeps the formatted message and omits the raw SDK cause.
+    throw new Error(result.error);
+  }
+  const { messageId } = result;
+  return {
+    messageId,
+    receipt: createTwitchSendReceipt(messageId, params.channel),
+  };
 }

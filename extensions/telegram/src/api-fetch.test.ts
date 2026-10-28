@@ -1,81 +1,80 @@
-import { describe, expect, it, vi } from "vitest";
-import { fetchTelegramChatId } from "./api-fetch.js";
+import { afterEach, expect, it, vi } from "vitest";
+import { fetchTelegramChatId, lookupTelegramChatId } from "./api-fetch.js";
 
-describe("fetchTelegramChatId", () => {
-  const cases = [
-    {
-      name: "returns stringified id when Telegram getChat succeeds",
-      fetchImpl: vi.fn(async () => ({
-        ok: true,
-        json: async () => ({ ok: true, result: { id: 12345 } }),
-      })),
-      expected: "12345",
-    },
-    {
-      name: "returns null when response is not ok",
-      fetchImpl: vi.fn(async () => ({
-        ok: false,
-        json: async () => ({}),
-      })),
-      expected: null,
-    },
-    {
-      name: "returns null on transport failures",
-      fetchImpl: vi.fn(async () => {
-        throw new Error("network failed");
+const getChat = (fetchImpl?: typeof fetch) =>
+  fetchTelegramChatId({ token: "abc", chatId: "@user", fetchImpl });
+
+const proxyMocks = vi.hoisted(() => ({ undiciFetch: vi.fn() }));
+
+afterEach(() => vi.useRealTimers());
+
+vi.mock("undici/index.js", async () => {
+  const actual = await vi.importActual<typeof import("undici")>("undici/index.js");
+  return { ...actual, fetch: proxyMocks.undiciFetch };
+});
+
+it("returns null for oversized getChat JSON responses and cancels the stream", async () => {
+  const cancel = vi.fn();
+  const response = new Response(
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(4 * 1024 * 1024 + 1));
+      },
+      cancel,
+    }),
+  );
+  await expect(getChat(async () => response)).resolves.toBeNull();
+  expect(cancel).toHaveBeenCalledOnce();
+});
+
+it("keeps the getChat timeout active until the response body read settles", async () => {
+  vi.useFakeTimers();
+  let observedSignal: AbortSignal | undefined;
+  const fetchImpl = vi.fn<typeof fetch>(async (_url, init) => {
+    const signal = init?.signal;
+    observedSignal = signal ?? undefined;
+    return new Response(
+      new ReadableStream({
+        start(controller) {
+          signal?.addEventListener("abort", () => controller.error(signal.reason), {
+            once: true,
+          });
+        },
       }),
-      expected: null,
-    },
-  ] as const;
+    );
+  });
 
-  for (const testCase of cases) {
-    it(testCase.name, async () => {
-      vi.stubGlobal("fetch", testCase.fetchImpl);
+  const lookup = getChat(fetchImpl);
 
-      const id = await fetchTelegramChatId({
+  await vi.advanceTimersByTimeAsync(15_000);
+
+  await expect(lookup).resolves.toBeNull();
+  expect(observedSignal?.aborted).toBe(true);
+});
+it.each(["success", "transport failure"])(
+  "lookupTelegramChatId closes its owned transport after %s",
+  async (outcome) => {
+    proxyMocks.undiciFetch.mockReset();
+    const expected = outcome === "success" ? "12345" : null;
+    if (expected) {
+      proxyMocks.undiciFetch.mockResolvedValueOnce(
+        Response.json({ ok: true, result: { id: 12345 } }),
+      );
+    } else {
+      proxyMocks.undiciFetch.mockRejectedValueOnce(new Error("network failed"));
+    }
+
+    await expect(
+      lookupTelegramChatId({
         token: "abc",
         chatId: "@user",
-      });
-
-      expect(id).toBe(testCase.expected);
-    });
-  }
-
-  it("calls Telegram getChat endpoint", async () => {
-    const fetchMock = vi.fn(async () => ({
-      ok: true,
-      json: async () => ({ ok: true, result: { id: 12345 } }),
-    }));
-    vi.stubGlobal("fetch", fetchMock);
-
-    await fetchTelegramChatId({ token: "abc", chatId: "@user" });
-    expect(fetchMock).toHaveBeenCalledWith(
-      "https://api.telegram.org/botabc/getChat?chat_id=%40user",
-      undefined,
-    );
-  });
-
-  it("uses caller-provided fetch impl when present", async () => {
-    const customFetch = vi.fn(async () => ({
-      ok: true,
-      json: async () => ({ ok: true, result: { id: 12345 } }),
-    }));
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => {
-        throw new Error("global fetch should not be called");
+        network: { autoSelectFamily: false },
       }),
-    );
+    ).resolves.toBe(expected);
 
-    await fetchTelegramChatId({
-      token: "abc",
-      chatId: "@user",
-      fetchImpl: customFetch as unknown as typeof fetch,
-    });
-
-    expect(customFetch).toHaveBeenCalledWith(
-      "https://api.telegram.org/botabc/getChat?chat_id=%40user",
-      undefined,
-    );
-  });
-});
+    const init = proxyMocks.undiciFetch.mock.calls[0]?.[1] as
+      | (RequestInit & { dispatcher?: { destroyed?: boolean } })
+      | undefined;
+    expect(init?.dispatcher?.destroyed).toBe(true);
+  },
+);

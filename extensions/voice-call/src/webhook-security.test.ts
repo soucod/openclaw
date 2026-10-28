@@ -1,667 +1,424 @@
 import crypto from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { MAX_DATE_TIMESTAMP_MS } from "openclaw/plugin-sdk/number-runtime";
+import { describe, expect, it, vi } from "vitest";
+import type { WebhookContext, WebhookVerificationResult } from "./types.js";
 import {
+  reconstructWebhookUrl,
   verifyPlivoWebhook,
   verifyTelnyxWebhook,
   verifyTwilioWebhook,
 } from "./webhook-security.js";
 
-function canonicalizeBase64(input: string): string {
-  return Buffer.from(input, "base64").toString("base64");
+const authToken = "test-auth-token";
+const publicUrl = "https://example.com/voice/webhook";
+const twilioBody = "CallSid=CS123&CallStatus=completed&From=%2B15550000000";
+const plivoBody = "CallUUID=uuid&CallStatus=in-progress&From=%2B15550000000";
+const directHeaders = { host: "example.com", "x-forwarded-proto": "https" };
+
+function context(overrides: Partial<WebhookContext> = {}): WebhookContext {
+  return { headers: {}, rawBody: "", url: publicUrl, method: "POST", ...overrides };
 }
 
-function plivoV2Signature(params: {
-  authToken: string;
-  urlNoQuery: string;
-  nonce: string;
-}): string {
-  const digest = crypto
-    .createHmac("sha256", params.authToken)
-    .update(params.urlNoQuery + params.nonce)
-    .digest("base64");
-  return canonicalizeBase64(digest);
+function plivoV3Headers(canonicalBase: string, nonce: string) {
+  return {
+    ...directHeaders,
+    "x-plivo-signature-v3": hmac("sha256", `${canonicalBase}.${nonce}`),
+    "x-plivo-signature-v3-nonce": nonce,
+  };
 }
 
-function plivoV3Signature(params: {
-  authToken: string;
-  urlWithQuery: string;
-  postBody: string;
-  nonce: string;
-}): string {
-  const u = new URL(params.urlWithQuery);
-  const baseNoQuery = `${u.protocol}//${u.host}${u.pathname}`;
-  const queryPairs: Array<[string, string]> = [];
-  for (const [k, v] of u.searchParams.entries()) {
-    queryPairs.push([k, v]);
-  }
-
-  const queryMap = new Map<string, string[]>();
-  for (const [k, v] of queryPairs) {
-    queryMap.set(k, (queryMap.get(k) ?? []).concat(v));
-  }
-
-  const sortedQuery = Array.from(queryMap.keys())
-    .toSorted()
-    .flatMap((k) => [...(queryMap.get(k) ?? [])].toSorted().map((v) => `${k}=${v}`))
-    .join("&");
-
-  const postParams = new URLSearchParams(params.postBody);
-  const postMap = new Map<string, string[]>();
-  for (const [k, v] of postParams.entries()) {
-    postMap.set(k, (postMap.get(k) ?? []).concat(v));
-  }
-
-  const sortedPost = Array.from(postMap.keys())
-    .toSorted()
-    .flatMap((k) => [...(postMap.get(k) ?? [])].toSorted().map((v) => `${k}${v}`))
-    .join("");
-
-  const hasPost = sortedPost.length > 0;
-  let baseUrl = baseNoQuery;
-  if (sortedQuery.length > 0 || hasPost) {
-    baseUrl = `${baseNoQuery}?${sortedQuery}`;
-  }
-  if (sortedQuery.length > 0 && hasPost) {
-    baseUrl = `${baseUrl}.`;
-  }
-  baseUrl = `${baseUrl}${sortedPost}`;
-
-  const digest = crypto
-    .createHmac("sha256", params.authToken)
-    .update(`${baseUrl}.${params.nonce}`)
-    .digest("base64");
-  return canonicalizeBase64(digest);
+function hmac(algorithm: string, data: string) {
+  return crypto.createHmac(algorithm, authToken).update(data).digest("base64");
 }
 
-function twilioSignature(params: { authToken: string; url: string; postBody: string }): string {
-  let dataToSign = params.url;
-  const sortedParams = Array.from(new URLSearchParams(params.postBody).entries()).toSorted((a, b) =>
+function twilioSignature(url: string, postBody = twilioBody): string {
+  const sortedParams = Array.from(new URLSearchParams(postBody).entries()).toSorted((a, b) =>
     a[0].localeCompare(b[0]),
   );
 
-  for (const [key, value] of sortedParams) {
-    dataToSign += key + value;
-  }
-
-  return crypto.createHmac("sha1", params.authToken).update(dataToSign).digest("base64");
+  return hmac("sha1", url + sortedParams.map(([key, value]) => key + value).join(""));
 }
 
-function expectReplayResultPair(
-  first: { ok: boolean; isReplay?: boolean; verifiedRequestKey?: string },
-  second: { ok: boolean; isReplay?: boolean; verifiedRequestKey?: string },
-) {
+function expectReplay(first: WebhookVerificationResult, second: WebhookVerificationResult) {
   expect(first.ok).toBe(true);
-  expect(first.isReplay).toBeFalsy();
-  if (!first.verifiedRequestKey) {
-    throw new Error("verified webhook request did not produce a request key");
-  }
+  expect(first.isReplay).not.toBe(true);
+  expect(first.verifiedRequestKey).toMatch(/./);
   expect(second.ok).toBe(true);
   expect(second.isReplay).toBe(true);
   expect(second.verifiedRequestKey).toBe(first.verifiedRequestKey);
+  expect(first.releaseReplay).toEqual(expect.any(Function));
+  expect(second.releaseReplay).toBeUndefined();
 }
 
-function expectAcceptedWebhookVersion(
-  result: { ok: boolean; version?: string },
-  version: "v2" | "v3",
+function verifyTwilio(
+  overrides: Partial<WebhookContext>,
+  options?: Parameters<typeof verifyTwilioWebhook>[2],
 ) {
-  expect(result).toMatchObject({ ok: true, version });
+  return verifyTwilioWebhook(context({ rawBody: twilioBody, ...overrides }), authToken, options);
 }
 
-function verifyTwilioNgrokLoopback(signature: string) {
-  return verifyTwilioWebhook(
-    {
-      headers: {
-        host: "127.0.0.1:3334",
-        "x-forwarded-proto": "https",
-        "x-forwarded-host": "local.ngrok-free.app",
-        "x-twilio-signature": signature,
-      },
-      rawBody: "CallSid=CS123&CallStatus=completed&From=%2B15550000000",
-      url: "http://127.0.0.1:3334/voice/webhook",
-      method: "POST",
-      remoteAddress: "127.0.0.1",
+function createSignedTelnyxWebhookRequest(timestamp = String(Math.floor(Date.now() / 1000))) {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync("ed25519");
+  const pemPublicKey = publicKey.export({ format: "pem", type: "spki" });
+  const rawBody = JSON.stringify({
+    data: { event_type: "call.initiated", payload: { call_control_id: "call-1" } },
+    nonce: crypto.randomUUID(),
+  });
+  const signedPayload = `${timestamp}|${rawBody}`;
+  const signature = crypto.sign(null, Buffer.from(signedPayload), privateKey).toString("base64");
+
+  return {
+    signature,
+    verify(signatureValue = signature) {
+      return verifyTelnyxWebhook(
+        context({
+          headers: {
+            "telnyx-signature-ed25519": signatureValue,
+            "telnyx-timestamp": timestamp,
+          },
+          rawBody,
+        }),
+        pemPublicKey,
+      );
     },
-    "test-auth-token",
-    { allowNgrokFreeTierLoopbackBypass: true },
-  );
+  };
 }
 
-function verifyTwilioSignedRequest(params: {
-  headers: Record<string, string>;
-  rawBody: string;
-  authToken: string;
-  publicUrl: string;
-}) {
-  return verifyTwilioWebhook(
-    {
-      headers: params.headers,
-      rawBody: params.rawBody,
-      url: "http://local/voice/webhook?callId=abc",
-      method: "POST",
-      query: { callId: "abc" },
+describe("skip verification request keys", () => {
+  it.each(["plivo", "telnyx"] as const)(
+    "%s returns a stable request key when verification is skipped",
+    (provider) => {
+      const ctx = context({ rawBody: "synthetic-skipped-request" });
+      const verify = () =>
+        provider === "plivo"
+          ? verifyPlivoWebhook(ctx, "token", { skipVerification: true })
+          : verifyTelnyxWebhook(ctx, undefined, { skipVerification: true });
+      const first = verify();
+      expect(first.ok).toBe(true);
+      expect(first.verifiedRequestKey).toMatch(new RegExp(`^${provider}:skip:`));
+      expect(verify()).toMatchObject({
+        verifiedRequestKey: first.verifiedRequestKey,
+        isReplay: true,
+      });
     },
-    params.authToken,
-    { publicUrl: params.publicUrl },
   );
-}
+
+  it("does not keep replay keys whose expiry would exceed the Date range", () => {
+    const dateNow = vi.spyOn(Date, "now").mockReturnValue(MAX_DATE_TIMESTAMP_MS);
+    const verify = () =>
+      verifyTwilio(
+        { rawBody: "CallSid=CS-overflow&CallStatus=completed" },
+        { skipVerification: true },
+      );
+
+    try {
+      const first = verify();
+      expect(first.ok).toBe(true);
+      expect(first.isReplay).not.toBe(true);
+
+      dateNow.mockReturnValue(Date.parse("2026-05-29T12:00:00.000Z"));
+      const second = verify();
+      expect(second.ok).toBe(true);
+      expect(second.isReplay).not.toBe(true);
+    } finally {
+      dateNow.mockRestore();
+    }
+  });
+});
 
 describe("verifyPlivoWebhook", () => {
-  it("accepts valid V2 signature", () => {
-    const authToken = "test-auth-token";
-    const nonce = "nonce-123";
-
-    const ctxUrl = "http://local/voice/webhook?flow=answer&callId=abc";
-    const verificationUrl = "https://example.com/voice/webhook";
-    const signature = plivoV2Signature({
-      authToken,
-      urlNoQuery: verificationUrl,
-      nonce,
-    });
-
-    const result = verifyPlivoWebhook(
-      {
+  it.each([
+    ["GET", "?q=x", "Foo=y", "?q=x."],
+    [
+      "POST",
+      "",
+      "toString=z&__proto__=b&constructor=c&__proto__=a",
+      "?__proto__a__proto__bconstructorctoStringz",
+    ],
+    [
+      "POST",
+      "?2=x&10=y&b=%2B&a=hello+world&%C3%A4=z",
+      "Tag=z&Tag=a&Tag=a&Raw=%26%3D&Tag=hello+world&Tag=%C3%A4",
+      "?10=y&2=x&a=hello world&b=+&ä=z.Raw&=TagaTagaTaghello worldTagzTagä",
+    ],
+  ] as const)(
+    "accepts valid V3 signature (including multi-signature header): %s %s %s",
+    (method, query, rawBody, suffix) => {
+      const nonce = `literal-${method}-${query}-${rawBody}`;
+      const canonicalBase = publicUrl + suffix;
+      const headers = plivoV3Headers(canonicalBase, nonce);
+      const ctx = context({
         headers: {
-          host: "example.com",
-          "x-forwarded-proto": "https",
-          "x-plivo-signature-v2": signature,
-          "x-plivo-signature-v2-nonce": nonce,
+          ...headers,
+          "x-plivo-signature-v3": `bad, ${headers["x-plivo-signature-v3"]}`,
         },
-        rawBody: "CallUUID=uuid&CallStatus=in-progress",
-        url: ctxUrl,
-        method: "POST",
-        query: { flow: "answer", callId: "abc" },
-      },
-      authToken,
-    );
+        rawBody,
+        url: publicUrl + query,
+        method,
+      });
+      const first = verifyPlivoWebhook(ctx, authToken);
+      const second = verifyPlivoWebhook(ctx, authToken);
 
-    expectAcceptedWebhookVersion(result, "v2");
-  });
+      expectReplay(first, second);
+      first.releaseReplay?.();
+      expect(
+        verifyPlivoWebhook(
+          { ...ctx, headers: { ...ctx.headers, "x-plivo-signature-v3": "invalid" } },
+          authToken,
+        ),
+      ).toMatchObject({ ok: false, reason: "Invalid Plivo V3 signature" });
+    },
+  );
 
-  it("accepts valid V3 signature (including multi-signature header)", () => {
-    const authToken = "test-auth-token";
-    const nonce = "nonce-456";
-
-    const urlWithQuery = "https://example.com/voice/webhook?flow=answer&callId=abc";
-    const postBody = "CallUUID=uuid&CallStatus=in-progress&From=%2B15550000000";
-
-    const good = plivoV3Signature({
-      authToken,
-      urlWithQuery,
-      postBody,
-      nonce,
+  it.each([
+    {
+      name: "pins the configured public path",
+      origin: "https://voice.openclaw.ai/admin",
+      headers: { host: "voice.openclaw.ai" },
+      url: "https://voice.openclaw.ai/admin?flow=answer&callId=abc",
+      options: { publicUrl: "https://voice.openclaw.ai/voice/webhook?provider=plivo" },
+      remoteAddress: undefined,
+      expected: { ok: false, reason: "Invalid Plivo V3 signature" },
+    },
+    {
+      name: "matches IPv4-mapped trusted proxies",
+      origin: "https://proxy.example.com/voice/webhook",
+      headers: { host: "localhost:3000", "x-forwarded-host": "proxy.example.com" },
+      url: "http://localhost:3000/voice/webhook?flow=answer&callId=abc",
+      options: { trustForwardingHeaders: true, trustedProxyIPs: ["127.0.0.1"] },
+      remoteAddress: "::ffff:127.0.0.1",
+      expected: { ok: true },
+    },
+  ])("$name", ({ name, origin, headers, url, options, remoteAddress, expected }) => {
+    const base = `${origin}?callId=abc&flow=answer.CallStatusin-progressCallUUIDuuidFrom+15550000000`;
+    const ctx = context({
+      headers: { ...plivoV3Headers(base, name), ...headers },
+      rawBody: plivoBody,
+      url,
+      query: { flow: "answer", callId: "abc" },
+      remoteAddress,
     });
-
-    const result = verifyPlivoWebhook(
-      {
-        headers: {
-          host: "example.com",
-          "x-forwarded-proto": "https",
-          "x-plivo-signature-v3": `bad, ${good}`,
-          "x-plivo-signature-v3-nonce": nonce,
-        },
-        rawBody: postBody,
-        url: urlWithQuery,
-        method: "POST",
-        query: { flow: "answer", callId: "abc" },
-      },
-      authToken,
-    );
-
-    expectAcceptedWebhookVersion(result, "v3");
+    expect(verifyPlivoWebhook(ctx, authToken, options)).toMatchObject(expected);
   });
 
   it("rejects missing signatures", () => {
-    const result = verifyPlivoWebhook(
-      {
-        headers: { host: "example.com", "x-forwarded-proto": "https" },
-        rawBody: "",
-        url: "https://example.com/voice/webhook",
-        method: "POST",
-      },
-      "token",
-    );
+    const result = verifyPlivoWebhook(context({ headers: directHeaders }), "token");
 
     expect(result.ok).toBe(false);
     expect(result.reason).toMatch(/Missing Plivo signature headers/);
   });
 
-  it("marks replayed valid V3 requests as replay without failing auth", () => {
-    const authToken = "test-auth-token";
-    const nonce = "nonce-replay-v3";
-    const urlWithQuery = "https://example.com/voice/webhook?flow=answer&callId=abc";
-    const postBody = "CallUUID=uuid&CallStatus=in-progress&From=%2B15550000000";
-    const signature = plivoV3Signature({
-      authToken,
-      urlWithQuery,
-      postBody,
-      nonce,
-    });
-
-    const ctx = {
-      headers: {
-        host: "example.com",
-        "x-forwarded-proto": "https",
-        "x-plivo-signature-v3": signature,
-        "x-plivo-signature-v3-nonce": nonce,
-      },
-      rawBody: postBody,
-      url: urlWithQuery,
-      method: "POST" as const,
-      query: { flow: "answer", callId: "abc" },
-    };
-
-    const first = verifyPlivoWebhook(ctx, authToken);
-    const second = verifyPlivoWebhook(ctx, authToken);
-
-    expectReplayResultPair(first, second);
-  });
-
   it("treats query-only V2 variants as the same verified request", () => {
-    const authToken = "test-auth-token";
     const nonce = "nonce-replay-v2";
-    const verificationUrl = "https://example.com/voice/webhook";
-    const signature = plivoV2Signature({
-      authToken,
-      urlNoQuery: verificationUrl,
-      nonce,
-    });
-
-    const baseHeaders = {
-      host: "example.com",
-      "x-forwarded-proto": "https",
-      "x-plivo-signature-v2": signature,
+    const headers = {
+      ...directHeaders,
+      "x-plivo-signature-v2": hmac("sha256", publicUrl + nonce),
       "x-plivo-signature-v2-nonce": nonce,
     };
-    const rawBody = "CallUUID=uuid&CallStatus=in-progress";
-
-    const first = verifyPlivoWebhook(
-      {
-        headers: baseHeaders,
-        rawBody,
-        url: `${verificationUrl}?flow=answer&callId=abc`,
-        method: "POST",
-        query: { flow: "answer", callId: "abc" },
-      },
-      authToken,
-    );
-    const second = verifyPlivoWebhook(
-      {
-        headers: baseHeaders,
-        rawBody,
-        url: `${verificationUrl}?flow=getinput&callId=abc`,
-        method: "POST",
-        query: { flow: "getinput", callId: "abc" },
-      },
-      authToken,
-    );
-
-    expect(first.ok).toBe(true);
-    expect(first.verifiedRequestKey).toBeDefined();
-    expect(second.ok).toBe(true);
-    expect(second.verifiedRequestKey).toBe(first.verifiedRequestKey);
-    expect(second.isReplay).toBe(true);
-  });
-
-  it("returns a stable request key when verification is skipped", () => {
-    const ctx = {
-      headers: {},
-      rawBody: "CallUUID=uuid&CallStatus=in-progress",
-      url: "https://example.com/voice/webhook",
-      method: "POST" as const,
-    };
-    const first = verifyPlivoWebhook(ctx, "token", { skipVerification: true });
-    const second = verifyPlivoWebhook(ctx, "token", { skipVerification: true });
-
-    expect(first.ok).toBe(true);
-    expect(first.verifiedRequestKey).toMatch(/^plivo:skip:/);
-    expect(second.verifiedRequestKey).toBe(first.verifiedRequestKey);
-    expect(second.isReplay).toBe(true);
+    const verify = (flow: string) =>
+      verifyPlivoWebhook(
+        context({
+          headers,
+          rawBody: "CallUUID=uuid&CallStatus=in-progress",
+          url: `${publicUrl}?flow=${flow}&callId=abc`,
+          query: { flow, callId: "abc" },
+        }),
+        authToken,
+      );
+    expectReplay(verify("answer"), verify("getinput"));
   });
 });
 
 describe("verifyTelnyxWebhook", () => {
-  it("marks replayed valid requests as replay without failing auth", () => {
-    const { publicKey, privateKey } = crypto.generateKeyPairSync("ed25519");
-    const pemPublicKey = publicKey.export({ format: "pem", type: "spki" }).toString();
-    const timestamp = String(Math.floor(Date.now() / 1000));
-    const rawBody = JSON.stringify({
-      data: { event_type: "call.initiated", payload: { call_control_id: "call-1" } },
-      nonce: crypto.randomUUID(),
+  it("rejects signed timestamps with trailing characters", () => {
+    const request = createSignedTelnyxWebhookRequest(`${Math.floor(Date.now() / 1000)}abc`);
+
+    expect(request.verify()).toEqual({
+      ok: false,
+      reason: "Invalid timestamp header",
     });
-    const signedPayload = `${timestamp}|${rawBody}`;
-    const signature = crypto.sign(null, Buffer.from(signedPayload), privateKey).toString("base64");
-    const ctx = {
-      headers: {
-        "telnyx-signature-ed25519": signature,
-        "telnyx-timestamp": timestamp,
-      },
-      rawBody,
-      url: "https://example.com/voice/webhook",
-      method: "POST" as const,
-    };
-
-    const first = verifyTelnyxWebhook(ctx, pemPublicKey);
-    const second = verifyTelnyxWebhook(ctx, pemPublicKey);
-
-    expectReplayResultPair(first, second);
   });
 
-  it("returns a stable request key when verification is skipped", () => {
-    const ctx = {
-      headers: {},
-      rawBody: JSON.stringify({ data: { event_type: "call.initiated" } }),
-      url: "https://example.com/voice/webhook",
-      method: "POST" as const,
-    };
-    const first = verifyTelnyxWebhook(ctx, undefined, { skipVerification: true });
-    const second = verifyTelnyxWebhook(ctx, undefined, { skipVerification: true });
+  it("treats Base64 and Base64URL signatures as the same replayed request", () => {
+    const request = createSignedTelnyxWebhookRequest();
+    const urlSafeSignature = request.signature
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/g, "");
+    expectReplay(request.verify(), request.verify(urlSafeSignature));
+  });
+});
 
-    expect(first.ok).toBe(true);
-    expect(first.verifiedRequestKey).toMatch(/^telnyx:skip:/);
-    expect(second.verifiedRequestKey).toBe(first.verifiedRequestKey);
-    expect(second.isReplay).toBe(true);
+describe("reconstructWebhookUrl", () => {
+  const fallback = "https://fallback.example/voice/webhook?callId=ipv6";
+  it.each([
+    [{ host: "[::1]evil" }, fallback, undefined],
+    [{ host: "[not-ipv6]:8443" }, fallback, undefined],
+    [
+      { host: "fallback.example", "x-forwarded-host": "[fe80::1%25eth0]" },
+      "http://localhost:3000/voice/webhook?callId=ipv6",
+      { trustForwardingHeaders: true },
+    ],
+  ] as const)("falls back from malformed or scoped IPv6 hosts: %j", (headers, url, options) => {
+    expect(reconstructWebhookUrl(context({ headers, url }), options)).toBe(fallback);
   });
 });
 
 describe("verifyTwilioWebhook", () => {
-  it("uses request query when publicUrl omits it", () => {
-    const authToken = "test-auth-token";
-    const publicUrl = "https://example.com/voice/webhook";
-    const urlWithQuery = `${publicUrl}?callId=abc`;
-    const postBody = "CallSid=CS123&CallStatus=completed&From=%2B15550000000";
+  it("verifies a signature reconstructed from an allowed bracketed IPv6 proxy host", () => {
+    const postBody = "CallSid=CS-IPV6&CallStatus=completed";
+    const webhookUrl = "https://[2001:db8::1]/voice/webhook?callId=ipv6";
+    const signature = twilioSignature(webhookUrl, postBody);
 
-    const signature = twilioSignature({
-      authToken,
-      url: urlWithQuery,
-      postBody,
-    });
+    const verify = (idempotencyToken: string) =>
+      verifyTwilio(
+        {
+          headers: {
+            host: "localhost:3000",
+            "x-forwarded-proto": "https",
+            "x-forwarded-host": "[2001:db8::1]:8443",
+            "x-twilio-signature": signature,
+            "i-twilio-idempotency-token": idempotencyToken,
+          },
+          rawBody: postBody,
+          url: "http://localhost:3000/voice/webhook?callId=ipv6",
+        },
+        { allowedHosts: ["[2001:0db8:0000:0000:0000:0000:0000:0001]"] },
+      );
+    const result = verify("first");
 
-    const result = verifyTwilioWebhook(
+    expectReplay(result, verify("changed"));
+  });
+
+  it("uses the configured public path with the request query", () => {
+    const configuredUrl = "https://example.com/proxy/voice/webhook";
+    const urlWithQuery = `${configuredUrl}?callId=abc`;
+    const verifySignedUrl = (signedUrl: string) =>
+      verifyTwilio(
+        {
+          headers: {
+            host: "example.com",
+            "x-forwarded-proto": "https",
+            "x-twilio-signature": twilioSignature(signedUrl),
+          },
+          url: "http://local/voice/webhook?callId=abc",
+          query: { callId: "abc" },
+        },
+        { publicUrl: configuredUrl },
+      );
+
+    const result = verifySignedUrl(urlWithQuery);
+    expect(result.ok).toBe(true);
+
+    const localPathResult = verifySignedUrl("https://example.com/voice/webhook?callId=abc");
+    expect(localPathResult.ok).toBe(false);
+    expect(localPathResult.reason).toContain(`${configuredUrl}?callId=***`);
+  });
+
+  it("redacts query params from invalid Twilio signature diagnostics", () => {
+    const result = verifyTwilio(
       {
         headers: {
           host: "example.com",
-          "x-forwarded-proto": "https",
-          "x-twilio-signature": signature,
-        },
-        rawBody: postBody,
-        url: "http://local/voice/webhook?callId=abc",
-        method: "POST",
-        query: { callId: "abc" },
-      },
-      authToken,
-      { publicUrl },
-    );
-
-    expect(result.ok).toBe(true);
-  });
-
-  it("marks replayed valid requests as replay without failing auth", () => {
-    const authToken = "test-auth-token";
-    const publicUrl = "https://example.com/voice/webhook";
-    const urlWithQuery = `${publicUrl}?callId=abc`;
-    const postBody = "CallSid=CS777&CallStatus=completed&From=%2B15550000000";
-    const signature = twilioSignature({ authToken, url: urlWithQuery, postBody });
-    const headers = {
-      host: "example.com",
-      "x-forwarded-proto": "https",
-      "x-twilio-signature": signature,
-      "i-twilio-idempotency-token": "idem-replay-1",
-    };
-
-    const first = verifyTwilioSignedRequest({ headers, rawBody: postBody, authToken, publicUrl });
-    const second = verifyTwilioSignedRequest({ headers, rawBody: postBody, authToken, publicUrl });
-
-    expectReplayResultPair(first, second);
-  });
-
-  it("treats changed idempotency header as replay for identical signed requests", () => {
-    const authToken = "test-auth-token";
-    const publicUrl = "https://example.com/voice/webhook";
-    const urlWithQuery = `${publicUrl}?callId=abc`;
-    const postBody = "CallSid=CS778&CallStatus=completed&From=%2B15550000000";
-    const signature = twilioSignature({ authToken, url: urlWithQuery, postBody });
-
-    const first = verifyTwilioSignedRequest({
-      headers: {
-        host: "example.com",
-        "x-forwarded-proto": "https",
-        "x-twilio-signature": signature,
-        "i-twilio-idempotency-token": "idem-replay-a",
-      },
-      rawBody: postBody,
-      authToken,
-      publicUrl,
-    });
-    const second = verifyTwilioSignedRequest({
-      headers: {
-        host: "example.com",
-        "x-forwarded-proto": "https",
-        "x-twilio-signature": signature,
-        "i-twilio-idempotency-token": "idem-replay-b",
-      },
-      rawBody: postBody,
-      authToken,
-      publicUrl,
-    });
-
-    expectReplayResultPair(first, second);
-  });
-
-  it("rejects invalid signatures even when attacker injects forwarded host", () => {
-    const authToken = "test-auth-token";
-    const postBody = "CallSid=CS123&CallStatus=completed&From=%2B15550000000";
-
-    const result = verifyTwilioWebhook(
-      {
-        headers: {
-          host: "127.0.0.1:3334",
-          "x-forwarded-proto": "https",
-          "x-forwarded-host": "attacker.ngrok-free.app",
           "x-twilio-signature": "invalid",
         },
-        rawBody: postBody,
+        url: "https://example.com/voice/webhook?callId=call-1&turnToken=secret-turn-token",
+        query: { callId: "call-1", turnToken: "secret-turn-token" },
+      },
+      { publicUrl: "https://user:pass@example.com/callback#fragment-secret" },
+    );
+
+    expect(result.ok).toBe(false);
+    for (const text of ["Invalid signature for URL:", "turnToken=***", "callId=***"]) {
+      expect(result.reason).toContain(text);
+    }
+    for (const text of ["secret-turn-token", "user:pass", "fragment-secret"]) {
+      expect(result.reason).not.toContain(text);
+    }
+  });
+
+  it("does not echo malformed verification URLs in diagnostics", () => {
+    const result = verifyTwilio(
+      {
+        headers: { "x-twilio-signature": "invalid" },
+        rawBody: "CallSid=CS123",
+        url: "https://local/voice/webhook",
+      },
+      { publicUrl: "not a url?turnToken=secret-turn-token" },
+    );
+
+    expect(result).toMatchObject({
+      ok: false,
+      reason: "Invalid signature for URL: <invalid verification URL>",
+    });
+    expect(result.reason).not.toContain("secret-turn-token");
+  });
+
+  function forwardedRequest(host: string, forwarded: string, extra: Partial<WebhookContext> = {}) {
+    return {
+      url: "http://localhost:3000/voice/webhook",
+      ...extra,
+      headers: {
+        host,
+        "x-forwarded-host": forwarded,
+        "x-twilio-signature": "invalid",
+        ...extra.headers,
+      },
+    };
+  }
+  it.each<
+    [string, ReturnType<typeof forwardedRequest>, Parameters<typeof verifyTwilio>[1], string]
+  >([
+    [
+      "ngrok loopback still requires a signature",
+      forwardedRequest("127.0.0.1:3334", "local.ngrok-free.app", {
         url: "http://127.0.0.1:3334/voice/webhook",
-        method: "POST",
-      },
-      authToken,
-    );
-
-    expect(result.ok).toBe(false);
-    // X-Forwarded-Host is ignored by default, so URL uses Host header
-    expect(result.isNgrokFreeTier).toBe(false);
-    expect(result.reason).toMatch(/Invalid signature/);
-  });
-
-  it("accepts valid signatures for ngrok free tier on loopback when compatibility mode is enabled", () => {
-    const webhookUrl = "https://local.ngrok-free.app/voice/webhook";
-
-    const signature = twilioSignature({
-      authToken: "test-auth-token",
-      url: webhookUrl,
-      postBody: "CallSid=CS123&CallStatus=completed&From=%2B15550000000",
-    });
-
-    const result = verifyTwilioNgrokLoopback(signature);
-
-    expect(result.ok).toBe(true);
-    expect(result.verificationUrl).toBe(webhookUrl);
-  });
-
-  it("does not allow invalid signatures for ngrok free tier on loopback", () => {
-    const result = verifyTwilioNgrokLoopback("invalid");
-
-    expect(result.ok).toBe(false);
-    expect(result.reason).toMatch(/Invalid signature/);
-    expect(result.isNgrokFreeTier).toBe(true);
-  });
-
-  it("ignores attacker X-Forwarded-Host without allowedHosts or trustForwardingHeaders", () => {
-    const authToken = "test-auth-token";
-    const postBody = "CallSid=CS123&CallStatus=completed&From=%2B15550000000";
-
-    // Attacker tries to inject their host - should be ignored
-    const result = verifyTwilioWebhook(
-      {
-        headers: {
-          host: "legitimate.example.com",
-          "x-forwarded-host": "attacker.evil.com",
-          "x-twilio-signature": "invalid",
-        },
-        rawBody: postBody,
-        url: "http://localhost:3000/voice/webhook",
-        method: "POST",
-      },
-      authToken,
-    );
-
-    expect(result.ok).toBe(false);
-    // Attacker's host is ignored - uses Host header instead
-    expect(result.verificationUrl).toBe("https://legitimate.example.com/voice/webhook");
-  });
-
-  it("uses X-Forwarded-Host when allowedHosts whitelist is provided", () => {
-    const authToken = "test-auth-token";
-    const postBody = "CallSid=CS123&CallStatus=completed&From=%2B15550000000";
-    const webhookUrl = "https://myapp.ngrok.io/voice/webhook";
-
-    const signature = twilioSignature({ authToken, url: webhookUrl, postBody });
-
-    const result = verifyTwilioWebhook(
-      {
-        headers: {
-          host: "localhost:3000",
-          "x-forwarded-proto": "https",
-          "x-forwarded-host": "myapp.ngrok.io",
-          "x-twilio-signature": signature,
-        },
-        rawBody: postBody,
-        url: "http://localhost:3000/voice/webhook",
-        method: "POST",
-      },
-      authToken,
-      { allowedHosts: ["myapp.ngrok.io"] },
-    );
-
-    expect(result.ok).toBe(true);
-    expect(result.verificationUrl).toBe(webhookUrl);
-  });
-
-  it("rejects X-Forwarded-Host not in allowedHosts whitelist", () => {
-    const authToken = "test-auth-token";
-    const postBody = "CallSid=CS123&CallStatus=completed&From=%2B15550000000";
-
-    const result = verifyTwilioWebhook(
-      {
-        headers: {
-          host: "localhost:3000",
-          "x-forwarded-host": "attacker.evil.com",
-          "x-twilio-signature": "invalid",
-        },
-        rawBody: postBody,
-        url: "http://localhost:3000/voice/webhook",
-        method: "POST",
-      },
-      authToken,
+        remoteAddress: "127.0.0.1",
+        headers: { "x-forwarded-proto": "https" },
+      }),
+      { allowNgrokFreeTierLoopbackBypass: true },
+      "Invalid signature",
+    ],
+    [
+      "forwarding requires trust",
+      forwardedRequest("legitimate.example.com", "attacker.evil.com"),
+      undefined,
+      "https://legitimate.example.com/voice/webhook",
+    ],
+    [
+      "forwarded host must be allowlisted",
+      forwardedRequest("localhost:3000", "attacker.evil.com"),
       { allowedHosts: ["myapp.ngrok.io", "webhook.example.com"] },
-    );
-
-    expect(result.ok).toBe(false);
-    // Attacker's host not in whitelist, falls back to Host header
-    expect(result.verificationUrl).toBe("https://localhost/voice/webhook");
-  });
-
-  it("trusts forwarding headers only from trusted proxy IPs", () => {
-    const authToken = "test-auth-token";
-    const postBody = "CallSid=CS123&CallStatus=completed&From=%2B15550000000";
-    const webhookUrl = "https://proxy.example.com/voice/webhook";
-
-    const signature = twilioSignature({ authToken, url: webhookUrl, postBody });
-
-    const result = verifyTwilioWebhook(
-      {
-        headers: {
-          host: "localhost:3000",
-          "x-forwarded-proto": "https",
-          "x-forwarded-host": "proxy.example.com",
-          "x-twilio-signature": signature,
-        },
-        rawBody: postBody,
-        url: "http://localhost:3000/voice/webhook",
-        method: "POST",
-        remoteAddress: "203.0.113.10",
-      },
-      authToken,
+      "https://localhost/voice/webhook",
+    ],
+    [
+      "trusted proxy requires a remote IP",
+      forwardedRequest("legitimate.example.com", "proxy.example.com", {
+        headers: { "x-forwarded-proto": "https" },
+      }),
       { trustForwardingHeaders: true, trustedProxyIPs: ["203.0.113.10"] },
-    );
-
-    expect(result.ok).toBe(true);
-    expect(result.verificationUrl).toBe(webhookUrl);
-  });
-
-  it("ignores forwarding headers when trustedProxyIPs are set but remote IP is missing", () => {
-    const authToken = "test-auth-token";
-    const postBody = "CallSid=CS123&CallStatus=completed&From=%2B15550000000";
-
-    const result = verifyTwilioWebhook(
-      {
-        headers: {
-          host: "legitimate.example.com",
-          "x-forwarded-proto": "https",
-          "x-forwarded-host": "proxy.example.com",
-          "x-twilio-signature": "invalid",
-        },
-        rawBody: postBody,
-        url: "http://localhost:3000/voice/webhook",
-        method: "POST",
-      },
-      authToken,
-      { trustForwardingHeaders: true, trustedProxyIPs: ["203.0.113.10"] },
-    );
-
+      "https://legitimate.example.com/voice/webhook",
+    ],
+  ])("%s", (_name, request, options, expected) => {
+    const result = verifyTwilio(request, options);
     expect(result.ok).toBe(false);
-    expect(result.verificationUrl).toBe("https://legitimate.example.com/voice/webhook");
+    expect(result.reason).toContain(expected);
   });
-  it("returns a stable request key when verification is skipped", () => {
-    const ctx = {
-      headers: {},
-      rawBody: "CallSid=CS123&CallStatus=completed",
-      url: "https://example.com/voice/webhook",
-      method: "POST" as const,
-    };
-    const first = verifyTwilioWebhook(ctx, "token", { skipVerification: true });
-    const second = verifyTwilioWebhook(ctx, "token", { skipVerification: true });
-
-    expect(first.ok).toBe(true);
-    expect(first.verifiedRequestKey).toMatch(/^twilio:skip:/);
-    expect(second.verifiedRequestKey).toBe(first.verifiedRequestKey);
-    expect(second.isReplay).toBe(true);
-  });
-
   it("succeeds when Twilio signs URL without port but server URL has port", () => {
-    const authToken = "test-auth-token";
-    const postBody = "CallSid=CS123&CallStatus=completed&From=%2B15550000000";
-    // Twilio signs using URL without port.
     const urlWithPort = "https://example.com:8443/voice/webhook";
     const signedUrl = "https://example.com/voice/webhook";
-
-    const signature = twilioSignature({ authToken, url: signedUrl, postBody });
-
-    const result = verifyTwilioWebhook(
+    const result = verifyTwilio(
       {
         headers: {
           host: "example.com:8443",
-          "x-twilio-signature": signature,
+          "x-twilio-signature": twilioSignature(signedUrl),
         },
-        rawBody: postBody,
         url: urlWithPort,
-        method: "POST",
       },
-      authToken,
       { publicUrl: urlWithPort },
     );
 
     expect(result.ok).toBe(true);
-    expect(result.verificationUrl).toBe(signedUrl);
     expect(result.verifiedRequestKey).toMatch(/^twilio:req:/);
   });
 });

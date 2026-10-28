@@ -1,6 +1,11 @@
-import { defineSetupPluginEntry } from "openclaw/plugin-sdk/core";
-import { zalouserSetupPlugin } from "./src/channel.setup.js";
+import { defineBundledChannelSetupEntry } from "openclaw/plugin-sdk/channel-entry-contract";
+import { registerZalouserRuntimeLifecycle } from "./src/session-runtime.js";
 
-export { zalouserSetupPlugin } from "./src/channel.setup.js";
-
-export default defineSetupPluginEntry(zalouserSetupPlugin);
+export default defineBundledChannelSetupEntry({
+  importMetaUrl: import.meta.url,
+  plugin: {
+    specifier: "./setup-plugin-api.js",
+    exportName: "zalouserSetupPlugin",
+  },
+  registerSetupRuntime: registerZalouserRuntimeLifecycle,
+});

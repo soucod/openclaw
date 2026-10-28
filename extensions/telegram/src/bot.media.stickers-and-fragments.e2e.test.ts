@@ -1,255 +1,243 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  TELEGRAM_TEST_TIMINGS,
-  cacheStickerSpy,
-  createBotHandlerWithOptions,
-  describeStickerImageSpy,
-  getCachedStickerSpy,
-} from "./bot.media.test-utils.js";
+import { afterEach, beforeEach, expect, it, vi, type MockInstance } from "vitest";
+import { holdTelegramMediaTimeouts } from "./bot-media-timers.test-support.js";
+import { makeTelegramConfig } from "./bot.config.test-support.js";
+import { telegramBotDepsForTest } from "./bot.media.e2e.test-harness.js";
+import { TELEGRAM_TEST_TIMINGS, createBotHandlerWithOptions } from "./bot.media.test-utils.js";
 
-describe("telegram stickers", () => {
-  const STICKER_TEST_TIMEOUT_MS = process.platform === "win32" ? 30_000 : 20_000;
+type CreateBuffersSpy = MockInstance<
+  typeof import("./bot-handlers.inbound-buffer.js").createTelegramInboundBuffers
+>;
 
-  beforeEach(() => {
-    cacheStickerSpy.mockClear();
-    getCachedStickerSpy.mockClear();
-    describeStickerImageSpy.mockClear();
-    // Re-seed defaults so per-test overrides do not leak when using mockClear.
-    getCachedStickerSpy.mockReturnValue(undefined);
-    describeStickerImageSpy.mockReturnValue(undefined);
-  });
+async function drainBuffers(createBuffers: CreateBuffersSpy) {
+  const buffers = createBuffers.mock.results[0];
+  if (buffers?.type !== "return") {
+    throw new Error("Expected the bot's inbound buffers");
+  }
+  await buffers.value.inboundDebouncer.drain();
+}
 
-  // TODO #50185: re-enable once deterministic static sticker fetch injection is in place.
-  it.skip(
-    "downloads static sticker (WEBP) and includes sticker metadata",
-    async () => {
-      const proxyFetch = vi.fn().mockResolvedValue(
-        new Response(Buffer.from(new Uint8Array([0x52, 0x49, 0x46, 0x46])), {
-          status: 200,
-          headers: { "content-type": "image/webp" },
-        }),
-      );
-      const { handler, replySpy, runtimeError } = await createBotHandlerWithOptions({
-        proxyFetch: proxyFetch as unknown as typeof fetch,
-      });
+const fragmentMessage = (message_id: number, text: string, date = 1736380800) => ({
+  chat: { id: 42, type: "private" as const },
+  from: { id: 777, is_bot: false as const, first_name: "Ada" },
+  message_id,
+  date,
+  text,
+});
+const fragmentContext = (message: object) => ({
+  message,
+  me: { username: "openclaw_bot" },
+  getFile: async () => ({}),
+});
 
-      await handler({
-        message: {
-          message_id: 100,
-          chat: { id: 1234, type: "private" },
-          from: { id: 777, is_bot: false, first_name: "Ada" },
-          sticker: {
-            file_id: "sticker_file_id_123",
-            file_unique_id: "sticker_unique_123",
-            type: "regular",
-            width: 512,
-            height: 512,
-            is_animated: false,
-            is_video: false,
-            emoji: "🎉",
-            set_name: "TestStickerPack",
-          },
-          date: 1736380800,
-        },
-        me: { username: "openclaw_bot" },
-        getFile: async () => ({ file_path: "stickers/sticker.webp" }),
-      });
-
-      expect(runtimeError).not.toHaveBeenCalled();
-      expect(proxyFetch).toHaveBeenCalledWith(
-        "https://api.telegram.org/file/bottok/stickers/sticker.webp",
-        expect.objectContaining({ redirect: "manual" }),
-      );
-      expect(replySpy).toHaveBeenCalledTimes(1);
-      const payload = replySpy.mock.calls[0][0];
-      expect(payload.Body).toContain("<media:sticker>");
-      expect(payload.Sticker?.emoji).toBe("🎉");
-      expect(payload.Sticker?.setName).toBe("TestStickerPack");
-      expect(payload.Sticker?.fileId).toBe("sticker_file_id_123");
-    },
-    STICKER_TEST_TIMEOUT_MS,
-  );
-
-  // TODO #50185: re-enable with deterministic cache-refresh assertions in CI.
-  it.skip(
-    "refreshes cached sticker metadata on cache hit",
-    async () => {
-      const proxyFetch = vi.fn().mockResolvedValue(
-        new Response(Buffer.from(new Uint8Array([0x52, 0x49, 0x46, 0x46])), {
-          status: 200,
-          headers: { "content-type": "image/webp" },
-        }),
-      );
-      const { handler, replySpy, runtimeError } = await createBotHandlerWithOptions({
-        proxyFetch: proxyFetch as unknown as typeof fetch,
-      });
-
-      getCachedStickerSpy.mockReturnValue({
-        fileId: "old_file_id",
-        fileUniqueId: "sticker_unique_456",
-        emoji: "😴",
-        setName: "OldSet",
-        description: "Cached description",
-        cachedAt: "2026-01-20T10:00:00.000Z",
-      });
-
-      await handler({
-        message: {
-          message_id: 103,
-          chat: { id: 1234, type: "private" },
-          from: { id: 777, is_bot: false, first_name: "Ada" },
-          sticker: {
-            file_id: "new_file_id",
-            file_unique_id: "sticker_unique_456",
-            type: "regular",
-            width: 512,
-            height: 512,
-            is_animated: false,
-            is_video: false,
-            emoji: "🔥",
-            set_name: "NewSet",
-          },
-          date: 1736380800,
-        },
-        me: { username: "openclaw_bot" },
-        getFile: async () => ({ file_path: "stickers/sticker.webp" }),
-      });
-
-      expect(runtimeError).not.toHaveBeenCalled();
-      expect(cacheStickerSpy).toHaveBeenCalledWith(
-        expect.objectContaining({
-          fileId: "new_file_id",
-          emoji: "🔥",
-          setName: "NewSet",
-        }),
-      );
-      const payload = replySpy.mock.calls[0][0];
-      expect(payload.Sticker?.fileId).toBe("new_file_id");
-      expect(payload.Sticker?.cachedDescription).toBe("Cached description");
-      expect(proxyFetch).toHaveBeenCalledWith(
-        "https://api.telegram.org/file/bottok/stickers/sticker.webp",
-        expect.objectContaining({ redirect: "manual" }),
-      );
-    },
-    STICKER_TEST_TIMEOUT_MS,
-  );
-
-  it(
-    "skips animated and video sticker formats that cannot be downloaded",
-    async () => {
-      const proxyFetch = vi.fn();
-      const { handler, replySpy, runtimeError } = await createBotHandlerWithOptions({
-        proxyFetch: proxyFetch as unknown as typeof fetch,
-      });
-
-      for (const scenario of [
-        {
-          messageId: 101,
-          filePath: "stickers/animated.tgs",
-          sticker: {
-            file_id: "animated_sticker_id",
-            file_unique_id: "animated_unique",
-            type: "regular",
-            width: 512,
-            height: 512,
-            is_animated: true,
-            is_video: false,
-            emoji: "😎",
-            set_name: "AnimatedPack",
-          },
-        },
-        {
-          messageId: 102,
-          filePath: "stickers/video.webm",
-          sticker: {
-            file_id: "video_sticker_id",
-            file_unique_id: "video_unique",
-            type: "regular",
-            width: 512,
-            height: 512,
-            is_animated: false,
-            is_video: true,
-            emoji: "🎬",
-            set_name: "VideoPack",
-          },
-        },
-      ]) {
-        replySpy.mockClear();
-        runtimeError.mockClear();
-        proxyFetch.mockClear();
-
-        await handler({
-          message: {
-            message_id: scenario.messageId,
-            chat: { id: 1234, type: "private" },
-            from: { id: 777, is_bot: false, first_name: "Ada" },
-            sticker: scenario.sticker,
-            date: 1736380800,
-          },
-          me: { username: "openclaw_bot" },
-          getFile: async () => ({ file_path: scenario.filePath }),
-        });
-
-        expect(proxyFetch).not.toHaveBeenCalled();
-        expect(replySpy).not.toHaveBeenCalled();
-        expect(runtimeError).not.toHaveBeenCalled();
+// Fragment batches flush on the gap timer or a monotonic deadline anchored at the
+// first fragment. Held timers model an in-gap arrival only if that clock is held
+// too; otherwise slow admission reschedules the append with an unheld delay.
+function holdTelegramFragmentTimers(createBuffers: CreateBuffersSpy) {
+  vi.useFakeTimers({ toFake: ["performance"] });
+  const setTimeoutSpy = holdTelegramMediaTimeouts(TELEGRAM_TEST_TIMINGS.textFragmentGapMs);
+  const clearTimeoutSpy = vi.spyOn(globalThis, "clearTimeout");
+  const timers = () => {
+    const clearedHandles = new Set(clearTimeoutSpy.mock.calls.map(([handle]) => handle));
+    return setTimeoutSpy.mock.calls.flatMap(([callback, delay], index) => {
+      const handle = setTimeoutSpy.mock.results[index]?.value as ReturnType<typeof setTimeout>;
+      return delay === TELEGRAM_TEST_TIMINGS.textFragmentGapMs &&
+        !clearedHandles.has(handle) &&
+        typeof callback === "function"
+        ? [{ callback: callback as () => unknown, handle }]
+        : [];
+    });
+  };
+  return {
+    timers,
+    flush: async () => {
+      const timer = timers().at(-1);
+      expect(timer?.callback).toBeTypeOf("function");
+      if (timer) {
+        clearTimeout(timer.handle);
+        await timer.callback();
       }
+      await drainBuffers(createBuffers);
     },
-    STICKER_TEST_TIMEOUT_MS,
+  };
+}
+
+let createBuffers: CreateBuffersSpy;
+let originalLoadConfig: typeof telegramBotDepsForTest.getRuntimeConfig;
+beforeEach(async () => {
+  createBuffers = vi.spyOn(
+    await import("./bot-handlers.inbound-buffer.js"),
+    "createTelegramInboundBuffers",
   );
+  originalLoadConfig = telegramBotDepsForTest.getRuntimeConfig;
+});
+afterEach(() => {
+  vi.clearAllTimers();
+  vi.restoreAllMocks();
+  vi.useRealTimers();
+  telegramBotDepsForTest.getRuntimeConfig = originalLoadConfig;
 });
 
-describe("telegram text fragments", () => {
-  afterEach(() => {
-    vi.clearAllTimers();
-  });
+const TEXT_FRAGMENT_TEST_TIMEOUT_MS = process.platform === "win32" ? 45_000 : 20_000;
+const nearLimitText = (prefix = "", suffix = "") => `${prefix}${"A".repeat(4050)}${suffix}`;
 
-  const TEXT_FRAGMENT_TEST_TIMEOUT_MS = process.platform === "win32" ? 45_000 : 20_000;
-  const TEXT_FRAGMENT_FLUSH_MS = TELEGRAM_TEST_TIMINGS.textFragmentGapMs + 80;
+it(
+  "buffers slash-prefixed near-limit text with its selected reply quote",
+  async () => {
+    const { handler, replySpy } = await createBotHandlerWithOptions({});
+    const quote = "FRAGMENT_REPLY_QUOTE";
+    const part1 = nearLimitText("/not_a_command ", ` ${quote}`);
+    const firstMessage = fragmentMessage(10, part1);
+    const part2 = "B".repeat(50);
+    const { flush } = holdTelegramFragmentTimers(createBuffers);
 
-  it(
-    "buffers near-limit text and processes sequential parts as one message",
-    async () => {
-      const { handler, replySpy } = await createBotHandlerWithOptions({});
-      const part1 = "A".repeat(4050);
-      const part2 = "B".repeat(50);
+    await handler(fragmentContext(firstMessage));
+    await handler(
+      fragmentContext({
+        ...fragmentMessage(11, part2, 1736380801),
+        reply_to_message: { ...firstMessage, reply_to_message: undefined },
+        quote: { text: quote, position: part1.indexOf(quote) },
+      }),
+    );
 
-      await handler({
-        message: {
-          chat: { id: 42, type: "private" },
-          from: { id: 777, is_bot: false, first_name: "Ada" },
-          message_id: 10,
-          date: 1736380800,
-          text: part1,
+    expect(replySpy).not.toHaveBeenCalled();
+    await flush();
+
+    expect(replySpy).toHaveBeenCalledTimes(1);
+    const payload = replySpy.mock.calls.at(0)?.[0] as { Body?: string; RawBody?: string };
+    expect(payload.RawBody).toContain(part1.slice(0, 32));
+    expect(payload.RawBody).toContain(part2.slice(0, 32));
+    expect(payload.Body).toContain(`[1. Ada id:10]\n"${quote}"`);
+  },
+  TEXT_FRAGMENT_TEST_TIMEOUT_MS,
+);
+
+it(
+  "processes leading Telegram bot commands immediately without static registration",
+  async () => {
+    const { handler, replySpy } = await createBotHandlerWithOptions({});
+    const command = "/deploy@openclaw_bot";
+    const message = {
+      ...fragmentMessage(20, nearLimitText(`${command} `)),
+      entities: [{ type: "bot_command", offset: 0, length: command.length }],
+    };
+
+    await handler(fragmentContext(message));
+
+    expect(replySpy).toHaveBeenCalledTimes(1);
+  },
+  TEXT_FRAGMENT_TEST_TIMEOUT_MS,
+);
+
+it(
+  "keeps per-DM pairing store authorization when flushing text fragments",
+  async () => {
+    telegramBotDepsForTest.getRuntimeConfig = (() =>
+      makeTelegramConfig({
+        dmPolicy: "open",
+        direct: {
+          "42": { dmPolicy: "pairing" },
         },
-        me: { username: "openclaw_bot" },
-        getFile: async () => ({}),
+      })) as typeof telegramBotDepsForTest.getRuntimeConfig;
+
+    const readAllowFromStore = vi.mocked(telegramBotDepsForTest.readChannelAllowFromStore);
+    const upsertPairingRequest = vi.mocked(telegramBotDepsForTest.upsertChannelPairingRequest);
+    readAllowFromStore.mockReset();
+    readAllowFromStore.mockResolvedValue(["777"]);
+    upsertPairingRequest.mockClear();
+
+    const runtimeError = vi.fn();
+    const { handler, replySpy } = await createBotHandlerWithOptions({ runtimeError });
+    // A loaded runner can spend the whole 5x-gap batch window admitting the
+    // second fragment; held flushes must not depend on host monotonic time.
+    const hostNow = performance.now.bind(performance);
+    let hostDelayMs = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => hostNow() + hostDelayMs);
+    const { flush } = holdTelegramFragmentTimers(createBuffers);
+    const part1 = "A".repeat(4050);
+    const part2 = "B".repeat(50);
+
+    try {
+      await handler(fragmentContext(fragmentMessage(30, part1)));
+
+      hostDelayMs = 5 * TELEGRAM_TEST_TIMINGS.textFragmentGapMs;
+      await handler(fragmentContext(fragmentMessage(31, part2, 1736380801)));
+
+      await flush();
+
+      expect(replySpy).toHaveBeenCalledTimes(1);
+      expect(readAllowFromStore).toHaveBeenCalledWith("telegram", process.env, "default");
+      expect(upsertPairingRequest).not.toHaveBeenCalled();
+      expect(runtimeError).not.toHaveBeenCalled();
+    } finally {
+      readAllowFromStore.mockReset();
+      readAllowFromStore.mockResolvedValue([]);
+    }
+  },
+  TEXT_FRAGMENT_TEST_TIMEOUT_MS,
+);
+
+it(
+  "buffers different forum topic fragments independently",
+  async () => {
+    telegramBotDepsForTest.getRuntimeConfig = (() =>
+      makeTelegramConfig({
+        dmPolicy: "open",
+        allowFrom: ["*"],
+        groupAllowFrom: ["777"],
+        groupPolicy: "open",
+        groups: {
+          "-10042": { allowFrom: ["777"], groupPolicy: "open", requireMention: false },
+        },
+      })) as typeof telegramBotDepsForTest.getRuntimeConfig;
+
+    const runtimeError = vi.fn();
+    const { handler, replySpy } = await createBotHandlerWithOptions({ runtimeError });
+    const { timers } = holdTelegramFragmentTimers(createBuffers);
+
+    try {
+      const topicMessage = (
+        messageId: number,
+        text: string,
+        threadId: number,
+        date = 1736380800,
+      ) => ({
+        ...fragmentMessage(messageId, text, date),
+        chat: { id: -10042, type: "supergroup", is_forum: true },
+        message_thread_id: threadId,
+        is_topic_message: true,
       });
-
-      await handler({
-        message: {
-          chat: { id: 42, type: "private" },
-          from: { id: 777, is_bot: false, first_name: "Ada" },
-          message_id: 11,
-          date: 1736380801,
-          text: part2,
-        },
-        me: { username: "openclaw_bot" },
-        getFile: async () => ({}),
-      });
-
-      expect(replySpy).not.toHaveBeenCalled();
-      await vi.waitFor(
-        () => {
-          expect(replySpy).toHaveBeenCalledTimes(1);
-        },
-        { timeout: TEXT_FRAGMENT_FLUSH_MS * 6, interval: 5 },
+      await handler(
+        fragmentContext(topicMessage(120, `@openclaw_bot topic-one ${"A".repeat(4050)}`, 101)),
+      );
+      await handler(
+        fragmentContext(
+          topicMessage(121, `@openclaw_bot topic-two ${"B".repeat(4050)}`, 202, 1736380801),
+        ),
       );
 
-      const payload = replySpy.mock.calls[0][0] as { RawBody?: string };
-      expect(payload.RawBody).toContain(part1.slice(0, 32));
-      expect(payload.RawBody).toContain(part2.slice(0, 32));
-    },
-    TEXT_FRAGMENT_TEST_TIMEOUT_MS,
-  );
-});
+      const activeTimers = timers();
+      expect(activeTimers).toHaveLength(2);
+      for (const timer of activeTimers) {
+        clearTimeout(timer.handle);
+        await timer.callback();
+      }
+      await drainBuffers(createBuffers);
+      expect(replySpy).toHaveBeenCalledTimes(2);
+      const rawBodies = replySpy.mock.calls.map(
+        (call) => (call[0] as { RawBody?: string }).RawBody,
+      );
+      expect(rawBodies).toEqual(
+        expect.arrayContaining([
+          expect.stringContaining("topic-one"),
+          expect.stringContaining("topic-two"),
+        ]),
+      );
+      expect(runtimeError).not.toHaveBeenCalled();
+    } finally {
+      for (const timer of timers()) {
+        clearTimeout(timer.handle);
+      }
+    }
+  },
+  TEXT_FRAGMENT_TEST_TIMEOUT_MS,
+);

@@ -1,11 +1,19 @@
+// Covers best-effort network discovery display helpers.
 import os from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { makeNetworkInterfacesSnapshot } from "../test-helpers/network-interfaces.js";
 import {
-  inspectBestEffortPrimaryTailnetIPv4,
   pickBestEffortPrimaryLanIPv4,
-  resolveBestEffortGatewayBindHostForDisplay,
+  pickBestEffortPrimaryTailnetIPv4,
 } from "./network-discovery-display.js";
+
+const discoveryErrorMessage = "uv_interface_addresses failed";
+
+function mockInterfaceDiscoveryFailure(): void {
+  vi.spyOn(os, "networkInterfaces").mockImplementation(() => {
+    throw new Error(discoveryErrorMessage);
+  });
+}
 
 describe("network display discovery", () => {
   afterEach(() => {
@@ -13,44 +21,15 @@ describe("network display discovery", () => {
   });
 
   it("returns no LAN address when interface discovery throws", () => {
-    vi.spyOn(os, "networkInterfaces").mockImplementation(() => {
-      throw new Error("uv_interface_addresses failed");
-    });
+    mockInterfaceDiscoveryFailure();
 
     expect(pickBestEffortPrimaryLanIPv4()).toBeUndefined();
   });
 
-  it("reports a warning when tailnet inspection throws", () => {
-    vi.spyOn(os, "networkInterfaces").mockImplementation(() => {
-      throw new Error("uv_interface_addresses failed");
-    });
+  it("returns no tailnet address when interface discovery throws", () => {
+    mockInterfaceDiscoveryFailure();
 
-    expect(
-      inspectBestEffortPrimaryTailnetIPv4({
-        warningPrefix: "Status could not inspect tailnet addresses",
-      }),
-    ).toEqual({
-      tailnetIPv4: undefined,
-      warning: "Status could not inspect tailnet addresses: uv_interface_addresses failed.",
-    });
-  });
-
-  it("falls back to loopback when bind host resolution throws", async () => {
-    vi.spyOn(os, "networkInterfaces").mockImplementation(() => {
-      throw new Error("uv_interface_addresses failed");
-    });
-
-    await expect(
-      resolveBestEffortGatewayBindHostForDisplay({
-        bindMode: "tailnet",
-        warningPrefix:
-          "Status is using fallback network details because interface discovery failed",
-      }),
-    ).resolves.toEqual({
-      bindHost: "127.0.0.1",
-      warning:
-        "Status is using fallback network details because interface discovery failed: uv_interface_addresses failed.",
-    });
+    expect(pickBestEffortPrimaryTailnetIPv4()).toBeUndefined();
   });
 
   it("still returns discovered tailnet values when interfaces are available", () => {
@@ -60,8 +39,6 @@ describe("network display discovery", () => {
       }),
     );
 
-    expect(inspectBestEffortPrimaryTailnetIPv4()).toEqual({
-      tailnetIPv4: "100.88.1.5",
-    });
+    expect(pickBestEffortPrimaryTailnetIPv4()).toBe("100.88.1.5");
   });
 });

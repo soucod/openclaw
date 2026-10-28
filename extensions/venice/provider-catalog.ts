@@ -1,14 +1,10 @@
-import {
-  discoverVeniceModels,
-  type ModelProviderConfig,
-  VENICE_BASE_URL,
-} from "openclaw/plugin-sdk/provider-models";
+import type { ModelProviderConfig } from "openclaw/plugin-sdk/provider-model-shared";
+import { VENICE_BASE_URL, VENICE_MODEL_CATALOG } from "./models.js";
 
-export async function buildVeniceProvider(): Promise<ModelProviderConfig> {
-  const models = await discoverVeniceModels();
+export function buildStaticVeniceProvider(): ModelProviderConfig {
   return {
     baseUrl: VENICE_BASE_URL,
     api: "openai-completions",
-    models,
+    models: VENICE_MODEL_CATALOG,
   };
 }

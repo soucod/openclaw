@@ -1,45 +1,42 @@
-import type { Guild, Message, User } from "@buape/carbon";
-import { resolveTimestampMs } from "./format.js";
+import type { Guild, Message, User } from "../internal/discord.js";
+import {
+  resolveDiscordReferencedReplyMessage,
+  resolveDiscordReferencedReplyMessageId,
+} from "./message-forwarded.js";
 import { resolveDiscordSenderIdentity } from "./sender-identity.js";
-
-export type DiscordReplyContext = {
-  id: string;
-  channelId: string;
-  sender: string;
-  body: string;
-  timestamp?: number;
-};
 
 export function resolveReplyContext(
   message: Message,
   resolveDiscordMessageText: (message: Message, options?: { includeForwarded?: boolean }) => string,
-): DiscordReplyContext | null {
-  const referenced = message.referencedMessage;
-  if (!referenced?.author) {
+) {
+  const id = resolveDiscordReferencedReplyMessageId(message);
+  if (!id) {
+    return null;
+  }
+  const referenced = resolveDiscordReferencedReplyMessage(message);
+  if (!referenced?.author || referenced.id !== id) {
     return null;
   }
   const referencedText = resolveDiscordMessageText(referenced, {
     includeForwarded: true,
   });
-  if (!referencedText) {
-    return null;
-  }
   const sender = resolveDiscordSenderIdentity({
     author: referenced.author,
     pluralkitInfo: null,
   });
   return {
-    id: referenced.id,
-    channelId: referenced.channelId,
+    id,
     sender: sender.tag ?? sender.label ?? "unknown",
-    body: referencedText,
-    timestamp: resolveTimestampMs(referenced.timestamp),
+    senderId: referenced.author.id,
+    senderName: referenced.author.username,
+    senderTag: sender.tag,
+    memberRoleIds: referenced.member?.roles,
+    ...(referencedText ? { body: referencedText } : {}),
   };
 }
 
-export function buildDirectLabel(author: User, tagOverride?: string) {
-  const username =
-    tagOverride?.trim() || resolveDiscordSenderIdentity({ author, pluralkitInfo: null }).tag;
+export function buildDirectLabel(author: User) {
+  const username = resolveDiscordSenderIdentity({ author, pluralkitInfo: null }).tag;
   return `${username ?? "unknown"} user id:${author.id}`;
 }
 

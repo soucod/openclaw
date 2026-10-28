@@ -1,746 +1,442 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
-import type { LookupFn } from "../../runtime-api.js";
-import type { CoreConfig } from "../types.js";
-import {
-  getMatrixScopedEnvVarNames,
-  resolveImplicitMatrixAccountId,
-  resolveMatrixConfig,
-  resolveMatrixConfigForAccount,
-  resolveMatrixAuth,
-  resolveMatrixAuthContext,
-  resolveValidatedMatrixHomeserverUrl,
-  validateMatrixHomeserverUrl,
-} from "./client/config.js";
+import { expectDefined } from "@openclaw/normalization-core";
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
+import * as runtimeEnv from "openclaw/plugin-sdk/runtime-env";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { installMatrixTestRuntime } from "../test-runtime.js";
+import type { CoreConfig, MatrixConfig } from "../types.js";
+import { backfillMatrixAuthDeviceIdAfterStartup, resolveMatrixAuth } from "./client/config.js";
 import * as credentialsReadModule from "./credentials-read.js";
-import * as sdkModule from "./sdk.js";
 
-function createLookupFn(addresses: Array<{ address: string; family: number }>): LookupFn {
-  return vi.fn(async (_hostname: string, options?: unknown) => {
-    if (typeof options === "number" || !options || !(options as { all?: boolean }).all) {
-      return addresses[0]!;
-    }
-    return addresses;
-  }) as unknown as LookupFn;
-}
-
-const saveMatrixCredentialsMock = vi.hoisted(() => vi.fn());
-const touchMatrixCredentialsMock = vi.hoisted(() => vi.fn());
+const mocks = vi.hoisted(() => ({
+  save: vi.fn(),
+  backfill: vi.fn(async () => "saved"),
+  repair: vi.fn(),
+  secret: vi.fn(),
+  request: vi.fn(),
+}));
 
 vi.mock("./credentials-read.js", () => ({
-  loadMatrixCredentials: vi.fn(() => null),
+  loadMatrixCredentialsAsync: vi.fn(async () => null),
   credentialsMatchConfig: vi.fn(() => false),
 }));
 
-vi.mock("./credentials-write.runtime.js", () => ({
-  saveMatrixCredentials: saveMatrixCredentialsMock,
-  touchMatrixCredentials: touchMatrixCredentialsMock,
+vi.mock("./credentials.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./credentials.js")>()),
+  saveBackfilledMatrixDeviceId: mocks.backfill,
+  saveMatrixCredentials: mocks.save,
 }));
 
-describe("resolveMatrixConfig", () => {
-  it("prefers config over env", () => {
-    const cfg = {
-      channels: {
-        matrix: {
-          homeserver: "https://cfg.example.org",
-          userId: "@cfg:example.org",
-          accessToken: "cfg-token",
-          password: "cfg-pass",
-          deviceName: "CfgDevice",
-          initialSyncLimit: 5,
-        },
-      },
-    } as CoreConfig;
-    const env = {
-      MATRIX_HOMESERVER: "https://env.example.org",
-      MATRIX_USER_ID: "@env:example.org",
-      MATRIX_ACCESS_TOKEN: "env-token",
-      MATRIX_PASSWORD: "env-pass",
-      MATRIX_DEVICE_NAME: "EnvDevice",
-    } as NodeJS.ProcessEnv;
-    const resolved = resolveMatrixConfig(cfg, env);
-    expect(resolved).toEqual({
-      homeserver: "https://cfg.example.org",
-      userId: "@cfg:example.org",
-      accessToken: "cfg-token",
-      password: "cfg-pass",
-      deviceId: undefined,
-      deviceName: "CfgDevice",
-      initialSyncLimit: 5,
-      encryption: false,
-    });
+vi.mock("./client/storage.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./client/storage.js")>()),
+  repairCurrentTokenStorageMetaDeviceId: mocks.repair,
+}));
+
+// mock-isolation: Supply secret-resolution results without consulting configured providers or credentials.
+vi.mock("openclaw/plugin-sdk/secret-input-runtime", () => ({
+  resolveConfiguredSecretInputString: mocks.secret,
+}));
+
+vi.mock("./sdk/http-client.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./sdk/http-client.js")>()),
+  MatrixAuthedHttpClient: class {
+    async requestJson(...args: unknown[]) {
+      return await mocks.request(...args);
+    }
+  },
+}));
+
+function expectSavedCredentials(
+  mock: ReturnType<typeof vi.fn>,
+  accountId = "default",
+  fields = savedCredentials,
+) {
+  expect(mock.mock.calls[0]).toEqual([
+    expect.objectContaining(fields),
+    expect.any(Object),
+    accountId,
+  ]);
+}
+
+function expectWhoami() {
+  expect(mocks.request).toHaveBeenCalledWith({
+    method: "GET",
+    endpoint: "/_matrix/client/v3/account/whoami",
+    timeoutMs: 60_000,
   });
+}
 
-  it("uses env when config is missing", () => {
-    const cfg = {} as CoreConfig;
-    const env = {
-      MATRIX_HOMESERVER: "https://env.example.org",
-      MATRIX_USER_ID: "@env:example.org",
-      MATRIX_ACCESS_TOKEN: "env-token",
-      MATRIX_PASSWORD: "env-pass",
-      MATRIX_DEVICE_ID: "ENVDEVICE",
-      MATRIX_DEVICE_NAME: "EnvDevice",
-    } as NodeJS.ProcessEnv;
-    const resolved = resolveMatrixConfig(cfg, env);
-    expect(resolved.homeserver).toBe("https://env.example.org");
-    expect(resolved.userId).toBe("@env:example.org");
-    expect(resolved.accessToken).toBe("env-token");
-    expect(resolved.password).toBe("env-pass");
-    expect(resolved.deviceId).toBe("ENVDEVICE");
-    expect(resolved.deviceName).toBe("EnvDevice");
-    expect(resolved.initialSyncLimit).toBeUndefined();
-    expect(resolved.encryption).toBe(false);
-  });
+function expectNoBackfill() {
+  expect(mocks.repair).not.toHaveBeenCalled();
+  expect(mocks.backfill).not.toHaveBeenCalled();
+}
 
-  it("uses account-scoped env vars for non-default accounts before global env", () => {
-    const cfg = {
-      channels: {
-        matrix: {
-          homeserver: "https://base.example.org",
-        },
-      },
-    } as CoreConfig;
-    const env = {
-      MATRIX_HOMESERVER: "https://global.example.org",
-      MATRIX_ACCESS_TOKEN: "global-token",
-      MATRIX_OPS_HOMESERVER: "https://ops.example.org",
-      MATRIX_OPS_ACCESS_TOKEN: "ops-token",
-      MATRIX_OPS_DEVICE_NAME: "Ops Device",
-    } as NodeJS.ProcessEnv;
+it("defers constructor module evaluation and forwards each creation independently", async () => {
+  vi.resetModules();
+  try {
+    const firstClient = { id: "first client" };
+    const secondClient = { id: "second client" };
+    const failure = new Error("creation failed");
+    const createClient = vi
+      .fn()
+      .mockResolvedValueOnce(firstClient)
+      .mockResolvedValueOnce(secondClient)
+      .mockRejectedValueOnce(failure);
+    const evaluateConstructor = vi.fn(() => ({ createMatrixClient: createClient }));
+    vi.doMock("./client/create-client.js", evaluateConstructor);
 
-    const resolved = resolveMatrixConfigForAccount(cfg, "ops", env);
-    expect(resolved.homeserver).toBe("https://ops.example.org");
-    expect(resolved.accessToken).toBe("ops-token");
-    expect(resolved.deviceName).toBe("Ops Device");
-  });
+    const { createMatrixClient } = await import("./client.js");
+    expect(evaluateConstructor).not.toHaveBeenCalled();
 
-  it("uses collision-free scoped env var names for normalized account ids", () => {
-    expect(getMatrixScopedEnvVarNames("ops-prod").accessToken).toBe(
-      "MATRIX_OPS_X2D_PROD_ACCESS_TOKEN",
-    );
-    expect(getMatrixScopedEnvVarNames("ops_prod").accessToken).toBe(
-      "MATRIX_OPS_X5F_PROD_ACCESS_TOKEN",
-    );
-  });
-
-  it("prefers channels.matrix.accounts.default over global env for the default account", () => {
-    const cfg = {
-      channels: {
-        matrix: {
-          accounts: {
-            default: {
-              homeserver: "https://matrix.gumadeiras.com",
-              userId: "@pinguini:matrix.gumadeiras.com",
-              password: "cfg-pass", // pragma: allowlist secret
-              deviceName: "OpenClaw Gateway Pinguini",
-              encryption: true,
-            },
-          },
-        },
-      },
-    } as CoreConfig;
-    const env = {
-      MATRIX_HOMESERVER: "https://env.example.org",
-      MATRIX_USER_ID: "@env:example.org",
-      MATRIX_PASSWORD: "env-pass",
-      MATRIX_DEVICE_NAME: "EnvDevice",
-    } as NodeJS.ProcessEnv;
-
-    const resolved = resolveMatrixAuthContext({ cfg, env });
-    expect(resolved.accountId).toBe("default");
-    expect(resolved.resolved).toMatchObject({
-      homeserver: "https://matrix.gumadeiras.com",
-      userId: "@pinguini:matrix.gumadeiras.com",
-      password: "cfg-pass",
-      deviceName: "OpenClaw Gateway Pinguini",
+    const options = {
+      homeserver: "https://matrix.example.org",
+      accessToken: "synthetic-token",
+      accountId: "ops",
+      persistStorage: false,
       encryption: true,
-    });
-  });
+      localTimeoutMs: 1234,
+    };
+    await expect(createMatrixClient(options)).resolves.toBe(firstClient);
+    const secondOptions = { ...options, accountId: "other" };
+    await expect(createMatrixClient(secondOptions)).resolves.toBe(secondClient);
+    await expect(createMatrixClient(options)).rejects.toBe(failure);
 
-  it("ignores typoed defaultAccount values that do not map to a real Matrix account", () => {
-    const cfg = {
-      channels: {
-        matrix: {
-          defaultAccount: "ops",
-          homeserver: "https://legacy.example.org",
-          accessToken: "legacy-token",
-        },
-      },
-    } as CoreConfig;
-
-    expect(resolveImplicitMatrixAccountId(cfg, {} as NodeJS.ProcessEnv)).toBe("default");
-    expect(resolveMatrixAuthContext({ cfg, env: {} as NodeJS.ProcessEnv }).accountId).toBe(
-      "default",
-    );
-  });
-
-  it("requires explicit defaultAccount selection when multiple named Matrix accounts exist", () => {
-    const cfg = {
-      channels: {
-        matrix: {
-          accounts: {
-            assistant: {
-              homeserver: "https://matrix.assistant.example.org",
-              accessToken: "assistant-token",
-            },
-            ops: {
-              homeserver: "https://matrix.ops.example.org",
-              accessToken: "ops-token",
-            },
-          },
-        },
-      },
-    } as CoreConfig;
-
-    expect(resolveImplicitMatrixAccountId(cfg, {} as NodeJS.ProcessEnv)).toBeNull();
-    expect(() => resolveMatrixAuthContext({ cfg, env: {} as NodeJS.ProcessEnv })).toThrow(
-      /channels\.matrix\.defaultAccount.*--account <id>/i,
-    );
-  });
-
-  it("rejects explicit non-default account ids that are neither configured nor scoped in env", () => {
-    const cfg = {
-      channels: {
-        matrix: {
-          homeserver: "https://legacy.example.org",
-          accessToken: "legacy-token",
-          accounts: {
-            ops: {
-              homeserver: "https://ops.example.org",
-              accessToken: "ops-token",
-            },
-          },
-        },
-      },
-    } as CoreConfig;
-
-    expect(() =>
-      resolveMatrixAuthContext({ cfg, env: {} as NodeJS.ProcessEnv, accountId: "typo" }),
-    ).toThrow(/Matrix account "typo" is not configured/i);
-  });
-
-  it("allows explicit non-default account ids backed only by scoped env vars", () => {
-    const cfg = {
-      channels: {
-        matrix: {
-          homeserver: "https://legacy.example.org",
-          accessToken: "legacy-token",
-        },
-      },
-    } as CoreConfig;
-    const env = {
-      MATRIX_OPS_HOMESERVER: "https://ops.example.org",
-      MATRIX_OPS_ACCESS_TOKEN: "ops-token",
-    } as NodeJS.ProcessEnv;
-
-    expect(resolveMatrixAuthContext({ cfg, env, accountId: "ops" }).accountId).toBe("ops");
-  });
-
-  it("does not inherit the base deviceId for non-default accounts", () => {
-    const cfg = {
-      channels: {
-        matrix: {
-          homeserver: "https://base.example.org",
-          accessToken: "base-token",
-          deviceId: "BASEDEVICE",
-          accounts: {
-            ops: {
-              homeserver: "https://ops.example.org",
-              accessToken: "ops-token",
-            },
-          },
-        },
-      },
-    } as CoreConfig;
-
-    const resolved = resolveMatrixConfigForAccount(cfg, "ops", {} as NodeJS.ProcessEnv);
-    expect(resolved.deviceId).toBeUndefined();
-  });
-
-  it("does not inherit the base userId for non-default accounts", () => {
-    const cfg = {
-      channels: {
-        matrix: {
-          homeserver: "https://base.example.org",
-          userId: "@base:example.org",
-          accessToken: "base-token",
-          accounts: {
-            ops: {
-              homeserver: "https://ops.example.org",
-              accessToken: "ops-token",
-            },
-          },
-        },
-      },
-    } as CoreConfig;
-
-    const resolved = resolveMatrixConfigForAccount(cfg, "ops", {} as NodeJS.ProcessEnv);
-    expect(resolved.userId).toBe("");
-  });
-
-  it("does not inherit base or global auth secrets for non-default accounts", () => {
-    const cfg = {
-      channels: {
-        matrix: {
-          homeserver: "https://base.example.org",
-          accessToken: "base-token",
-          password: "base-pass", // pragma: allowlist secret
-          deviceId: "BASEDEVICE",
-          accounts: {
-            ops: {
-              homeserver: "https://ops.example.org",
-              userId: "@ops:example.org",
-              password: "ops-pass", // pragma: allowlist secret
-            },
-          },
-        },
-      },
-    } as CoreConfig;
-    const env = {
-      MATRIX_ACCESS_TOKEN: "global-token",
-      MATRIX_PASSWORD: "global-pass",
-      MATRIX_DEVICE_ID: "GLOBALDEVICE",
-    } as NodeJS.ProcessEnv;
-
-    const resolved = resolveMatrixConfigForAccount(cfg, "ops", env);
-    expect(resolved.accessToken).toBeUndefined();
-    expect(resolved.password).toBe("ops-pass");
-    expect(resolved.deviceId).toBeUndefined();
-  });
-
-  it("does not inherit a base password for non-default accounts", () => {
-    const cfg = {
-      channels: {
-        matrix: {
-          homeserver: "https://base.example.org",
-          password: "base-pass", // pragma: allowlist secret
-          accounts: {
-            ops: {
-              homeserver: "https://ops.example.org",
-              userId: "@ops:example.org",
-            },
-          },
-        },
-      },
-    } as CoreConfig;
-    const env = {
-      MATRIX_PASSWORD: "global-pass",
-    } as NodeJS.ProcessEnv;
-
-    const resolved = resolveMatrixConfigForAccount(cfg, "ops", env);
-    expect(resolved.password).toBeUndefined();
-  });
-
-  it("rejects insecure public http Matrix homeservers", () => {
-    expect(() => validateMatrixHomeserverUrl("http://matrix.example.org")).toThrow(
-      "Matrix homeserver must use https:// unless it targets a private or loopback host",
-    );
-    expect(validateMatrixHomeserverUrl("http://127.0.0.1:8008")).toBe("http://127.0.0.1:8008");
-  });
-
-  it("accepts internal http homeservers only when private-network access is enabled", () => {
-    expect(() => validateMatrixHomeserverUrl("http://matrix-synapse:8008")).toThrow(
-      "Matrix homeserver must use https:// unless it targets a private or loopback host",
-    );
-    expect(
-      validateMatrixHomeserverUrl("http://matrix-synapse:8008", {
-        allowPrivateNetwork: true,
-      }),
-    ).toBe("http://matrix-synapse:8008");
-  });
-
-  it("rejects public http homeservers even when private-network access is enabled", async () => {
-    await expect(
-      resolveValidatedMatrixHomeserverUrl("http://matrix.example.org:8008", {
-        allowPrivateNetwork: true,
-        lookupFn: createLookupFn([{ address: "93.184.216.34", family: 4 }]),
-      }),
-    ).rejects.toThrow(
-      "Matrix homeserver must use https:// unless it targets a private or loopback host",
-    );
-  });
+    expect(createClient.mock.calls).toEqual([[options], [secondOptions], [options]]);
+    expect(evaluateConstructor).toHaveBeenCalledTimes(1);
+  } finally {
+    vi.doUnmock("./client/create-client.js");
+    vi.resetModules();
+  }
 });
 
+const tokenConfig = {
+  homeserver: "https://matrix.example.org",
+  userId: "@bot:example.org",
+  accessToken: "tok-123",
+};
+const authFixture = { accountId: "default", ...tokenConfig };
+const passwordConfig = {
+  homeserver: tokenConfig.homeserver,
+  userId: tokenConfig.userId,
+  password: "secret", // pragma: allowlist secret
+};
+const identity = { user_id: "@bot:example.org", device_id: "DEVICE123" };
+const cachedCredentials = { ...tokenConfig, createdAt: "2026-01-01T00:00:00.000Z" };
+const savedCredentials = { ...tokenConfig, deviceId: "DEVICE123" };
+const encryptedAuth = { ...authFixture, deviceId: "DEVICE123", encryption: true };
+const opsCredentials = {
+  homeserver: tokenConfig.homeserver,
+  userId: "@ops:example.org",
+  accessToken: "ops-token",
+  deviceId: "OPSDEVICE",
+};
+const loadCredentials = vi.mocked(credentialsReadModule.loadMatrixCredentialsAsync);
+const credentialsMatch = vi.mocked(credentialsReadModule.credentialsMatchConfig);
+
+function networkError(message: string) {
+  return Object.assign(new TypeError("fetch failed"), {
+    cause: Object.assign(new Error(message), { code: "ECONNRESET" }),
+  });
+}
+
+function backfill(
+  params: Partial<Parameters<typeof backfillMatrixAuthDeviceIdAfterStartup>[0]> = {},
+) {
+  return backfillMatrixAuthDeviceIdAfterStartup({ auth: authFixture, env: {}, ...params });
+}
+
+function createConfig(matrix: MatrixConfig): CoreConfig {
+  return { channels: { matrix } };
+}
+
+function resolveAuth(matrix: MatrixConfig, accountId?: string, env: NodeJS.ProcessEnv = {}) {
+  return resolveMatrixAuth({ cfg: createConfig(matrix), env, accountId });
+}
+
 describe("resolveMatrixAuth", () => {
-  afterEach(() => {
-    vi.restoreAllMocks();
-    vi.unstubAllGlobals();
-    saveMatrixCredentialsMock.mockReset();
+  beforeEach(() => {
+    loadCredentials.mockReset().mockResolvedValue(null);
+    credentialsMatch.mockReset().mockReturnValue(false);
+    mocks.save.mockReset();
+    mocks.backfill.mockReset().mockResolvedValue("saved");
+    mocks.repair.mockReset().mockReturnValue(true);
+    mocks.secret.mockReset().mockResolvedValue({});
+    mocks.request.mockReset();
   });
 
-  it("uses the hardened client request path for password login and persists deviceId", async () => {
-    const doRequestSpy = vi.spyOn(sdkModule.MatrixClient.prototype, "doRequest").mockResolvedValue({
-      access_token: "tok-123",
-      user_id: "@bot:example.org",
-      device_id: "DEVICE123",
-    });
+  afterEach(() => vi.restoreAllMocks());
 
-    const cfg = {
-      channels: {
-        matrix: {
-          homeserver: "https://matrix.example.org",
-          userId: "@bot:example.org",
-          password: "secret", // pragma: allowlist secret
-          encryption: true,
-        },
-      },
-    } as CoreConfig;
-
-    const auth = await resolveMatrixAuth({
-      cfg,
-      env: {} as NodeJS.ProcessEnv,
-    });
-
-    expect(doRequestSpy).toHaveBeenCalledWith(
-      "POST",
-      "/_matrix/client/v3/login",
-      undefined,
-      expect.objectContaining({
-        type: "m.login.password",
-      }),
-    );
-    expect(auth).toMatchObject({
-      accountId: "default",
-      homeserver: "https://matrix.example.org",
-      userId: "@bot:example.org",
-      accessToken: "tok-123",
-      deviceId: "DEVICE123",
-      encryption: true,
-    });
-    expect(saveMatrixCredentialsMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        homeserver: "https://matrix.example.org",
-        userId: "@bot:example.org",
-        accessToken: "tok-123",
-        deviceId: "DEVICE123",
-      }),
-      expect.any(Object),
-      "default",
-    );
-  });
-
-  it("surfaces password login errors when account credentials are invalid", async () => {
-    const doRequestSpy = vi.spyOn(sdkModule.MatrixClient.prototype, "doRequest");
-    doRequestSpy.mockRejectedValueOnce(new Error("Invalid username or password"));
-
-    const cfg = {
-      channels: {
-        matrix: {
-          homeserver: "https://matrix.example.org",
-          userId: "@bot:example.org",
-          password: "secret", // pragma: allowlist secret
-        },
-      },
-    } as CoreConfig;
-
-    await expect(
-      resolveMatrixAuth({
-        cfg,
-        env: {} as NodeJS.ProcessEnv,
-      }),
-    ).rejects.toThrow("Invalid username or password");
-
-    expect(doRequestSpy).toHaveBeenCalledWith(
-      "POST",
-      "/_matrix/client/v3/login",
-      undefined,
-      expect.objectContaining({
-        type: "m.login.password",
-      }),
-    );
-    expect(saveMatrixCredentialsMock).not.toHaveBeenCalled();
-  });
-
-  it("uses cached matching credentials when access token is not configured", async () => {
-    vi.mocked(credentialsReadModule.loadMatrixCredentials).mockReturnValue({
-      homeserver: "https://matrix.example.org",
-      userId: "@bot:example.org",
+  it("uses cached matching credentials for env-backed named accounts without fresh auth", async () => {
+    const cached = {
+      ...cachedCredentials,
+      userId: opsCredentials.userId,
       accessToken: "cached-token",
       deviceId: "CACHEDDEVICE",
-      createdAt: "2026-01-01T00:00:00.000Z",
+    };
+    loadCredentials.mockResolvedValue(cached);
+    credentialsMatch.mockReturnValue(true);
+    const auth = await resolveAuth({ homeserver: tokenConfig.homeserver }, "ops", {
+      MATRIX_OPS_USER_ID: opsCredentials.userId,
     });
-    vi.mocked(credentialsReadModule.credentialsMatchConfig).mockReturnValue(true);
-
-    const cfg = {
-      channels: {
-        matrix: {
-          homeserver: "https://matrix.example.org",
-          userId: "@bot:example.org",
-          password: "secret", // pragma: allowlist secret
-        },
-      },
-    } as CoreConfig;
-
-    const auth = await resolveMatrixAuth({
-      cfg,
-      env: {} as NodeJS.ProcessEnv,
-    });
-
-    expect(auth).toMatchObject({
-      accountId: "default",
-      homeserver: "https://matrix.example.org",
-      userId: "@bot:example.org",
-      accessToken: "cached-token",
-      deviceId: "CACHEDDEVICE",
-    });
-    expect(saveMatrixCredentialsMock).not.toHaveBeenCalled();
+    const { createdAt: _createdAt, ...expected } = cached;
+    expect(auth).toMatchObject({ ...expected, accountId: "ops" });
+    expect(mocks.save).not.toHaveBeenCalled();
   });
 
   it("rejects embedded credentials in Matrix homeserver URLs", async () => {
-    const cfg = {
-      channels: {
-        matrix: {
-          homeserver: "https://user:pass@matrix.example.org",
-          accessToken: "tok-123",
-        },
-      },
-    } as CoreConfig;
+    await expect(
+      resolveAuth({ ...tokenConfig, homeserver: "https://user:pass@matrix.example.org" }),
+    ).rejects.toThrow("Matrix homeserver URL must not include embedded credentials");
+  });
 
-    await expect(resolveMatrixAuth({ cfg, env: {} as NodeJS.ProcessEnv })).rejects.toThrow(
-      "Matrix homeserver URL must not include embedded credentials",
+  it.each([true, false])(
+    "uses config deviceId when cached credentials lack it (configured token: %s)",
+    async (configuredToken) => {
+      loadCredentials.mockResolvedValue(cachedCredentials);
+      credentialsMatch.mockReturnValue(true);
+      const auth = await resolveAuth({
+        ...savedCredentials,
+        accessToken: configuredToken ? "tok-123" : undefined,
+        encryption: true,
+      });
+      expect(auth).toMatchObject(encryptedAuth);
+      if (configuredToken) {
+        expectSavedCredentials(mocks.save);
+      }
+    },
+  );
+  it("does not call whoami when token auth already has a userId and only deviceId is missing", async () => {
+    mocks.request.mockRejectedValue(new Error("whoami should not be called"));
+
+    const auth = await resolveAuth({ ...tokenConfig, encryption: true });
+
+    expect(mocks.request).not.toHaveBeenCalled();
+    expect(auth).toMatchObject({ ...authFixture, deviceId: undefined, encryption: true });
+  });
+
+  it("retries password login when startup auth hits a transient network error", async () => {
+    mocks.request
+      .mockRejectedValueOnce(networkError("socket hang up"))
+      .mockResolvedValue({ ...identity, access_token: tokenConfig.accessToken });
+
+    const auth = await resolveAuth(
+      {
+        accessToken: "legacy-token",
+        accounts: { ops: { ...passwordConfig, encryption: true } },
+      },
+      "ops",
     );
-  });
 
-  it("falls back to config deviceId when cached credentials are missing it", async () => {
-    vi.mocked(credentialsReadModule.loadMatrixCredentials).mockReturnValue({
-      homeserver: "https://matrix.example.org",
-      userId: "@bot:example.org",
-      accessToken: "tok-123",
-      createdAt: "2026-01-01T00:00:00.000Z",
-    });
-    vi.mocked(credentialsReadModule.credentialsMatchConfig).mockReturnValue(true);
-
-    const cfg = {
-      channels: {
-        matrix: {
-          homeserver: "https://matrix.example.org",
-          userId: "@bot:example.org",
-          accessToken: "tok-123",
-          deviceId: "DEVICE123",
-          encryption: true,
-        },
-      },
-    } as CoreConfig;
-
-    const auth = await resolveMatrixAuth({ cfg, env: {} as NodeJS.ProcessEnv });
-
-    expect(auth.deviceId).toBe("DEVICE123");
-    expect(auth.accountId).toBe("default");
-    expect(saveMatrixCredentialsMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        homeserver: "https://matrix.example.org",
-        userId: "@bot:example.org",
-        accessToken: "tok-123",
-        deviceId: "DEVICE123",
-      }),
-      expect.any(Object),
-      "default",
-    );
-  });
-
-  it("carries the private-network opt-in through Matrix auth resolution", async () => {
-    const cfg = {
-      channels: {
-        matrix: {
-          homeserver: "http://127.0.0.1:8008",
-          allowPrivateNetwork: true,
-          userId: "@bot:example.org",
-          accessToken: "tok-123",
-          deviceId: "DEVICE123",
-        },
-      },
-    } as CoreConfig;
-
-    const auth = await resolveMatrixAuth({ cfg, env: {} as NodeJS.ProcessEnv });
-
-    expect(auth).toMatchObject({
-      homeserver: "http://127.0.0.1:8008",
-      allowPrivateNetwork: true,
-      ssrfPolicy: { allowPrivateNetwork: true },
-    });
-  });
-
-  it("resolves token-only non-default account userId from whoami instead of inheriting the base user", async () => {
-    const doRequestSpy = vi.spyOn(sdkModule.MatrixClient.prototype, "doRequest").mockResolvedValue({
-      user_id: "@ops:example.org",
-      device_id: "OPSDEVICE",
-    });
-
-    const cfg = {
-      channels: {
-        matrix: {
-          userId: "@base:example.org",
-          homeserver: "https://matrix.example.org",
-          accounts: {
-            ops: {
-              homeserver: "https://matrix.example.org",
-              accessToken: "ops-token",
-            },
-          },
-        },
-      },
-    } as CoreConfig;
-
-    const auth = await resolveMatrixAuth({
-      cfg,
-      env: {} as NodeJS.ProcessEnv,
-      accountId: "ops",
-    });
-
-    expect(doRequestSpy).toHaveBeenCalledWith("GET", "/_matrix/client/v3/account/whoami");
-    expect(auth.userId).toBe("@ops:example.org");
-    expect(auth.deviceId).toBe("OPSDEVICE");
-  });
-
-  it("uses named-account password auth instead of inheriting the base access token", async () => {
-    vi.mocked(credentialsReadModule.loadMatrixCredentials).mockReturnValue(null);
-    vi.mocked(credentialsReadModule.credentialsMatchConfig).mockReturnValue(false);
-    const doRequestSpy = vi.spyOn(sdkModule.MatrixClient.prototype, "doRequest").mockResolvedValue({
-      access_token: "ops-token",
-      user_id: "@ops:example.org",
-      device_id: "OPSDEVICE",
-    });
-
-    const cfg = {
-      channels: {
-        matrix: {
-          homeserver: "https://matrix.example.org",
-          accessToken: "legacy-token",
-          accounts: {
-            ops: {
-              homeserver: "https://matrix.example.org",
-              userId: "@ops:example.org",
-              password: "ops-pass", // pragma: allowlist secret
-            },
-          },
-        },
-      },
-    } as CoreConfig;
-
-    const auth = await resolveMatrixAuth({
-      cfg,
-      env: {} as NodeJS.ProcessEnv,
-      accountId: "ops",
-    });
-
-    expect(doRequestSpy).toHaveBeenCalledWith(
-      "POST",
-      "/_matrix/client/v3/login",
-      undefined,
-      expect.objectContaining({
+    expect(mocks.request).toHaveBeenCalledTimes(2);
+    expect(mocks.request).toHaveBeenNthCalledWith(1, {
+      method: "POST",
+      endpoint: "/_matrix/client/v3/login",
+      timeoutMs: 60_000,
+      body: expect.objectContaining({
         type: "m.login.password",
-        identifier: { type: "m.id.user", user: "@ops:example.org" },
-        password: "ops-pass",
+        identifier: { type: "m.id.user", user: "@bot:example.org" },
+        password: "secret",
+      }),
+    });
+    expect(auth).toMatchObject({ ...encryptedAuth, accountId: "ops" });
+    expectSavedCredentials(mocks.save, "ops");
+  });
+
+  it("best-effort backfills a missing deviceId after startup", async () => {
+    mocks.request.mockResolvedValue(identity);
+
+    const deviceId = await backfill();
+
+    expectWhoami();
+    expectSavedCredentials(mocks.backfill);
+    expect(mocks.repair).toHaveBeenNthCalledWith(1, {
+      ...authFixture,
+      deviceId: "DEVICE123",
+      env: {},
+    });
+    expect(
+      expectDefined(mocks.repair.mock.invocationCallOrder[0], "Matrix token repair invocation"),
+    ).toBeLessThan(
+      expectDefined(mocks.backfill.mock.invocationCallOrder[0], "Matrix device save invocation"),
+    );
+    expect(deviceId).toBe("DEVICE123");
+  });
+
+  it("skips deviceId backfill when auth already includes it", async () => {
+    const deviceId = await backfill({ auth: { ...authFixture, deviceId: "DEVICE123" } });
+    expect(mocks.request).not.toHaveBeenCalled();
+    expect(mocks.save).not.toHaveBeenCalled();
+    expectNoBackfill();
+    expect(deviceId).toBe("DEVICE123");
+  });
+
+  it.each([null, { user_id: 7 }, { device_id: false }])(
+    "rejects malformed whoami identity fields before backfill persistence (%j)",
+    async (invalidIdentity) => {
+      mocks.request.mockResolvedValue(invalidIdentity);
+      await expect(backfill()).rejects.toThrow("Matrix whoami returned an invalid identity");
+      expect(mocks.backfill).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["aborted", "replaced"])(
+    "does not publish credentials when backfill is %s during metadata persistence",
+    async (reason) => {
+      mocks.request.mockResolvedValue(identity);
+      const metadata = createDeferred<boolean>();
+      mocks.repair.mockReturnValue(metadata.promise);
+      const abortController = new AbortController();
+      const pending = backfill({ abortSignal: abortController.signal });
+      try {
+        await vi.waitFor(() => expect(mocks.repair).toHaveBeenCalled());
+        expect(mocks.backfill).not.toHaveBeenCalled();
+        if (reason === "aborted") {
+          abortController.abort();
+        } else {
+          loadCredentials.mockResolvedValue({
+            ...cachedCredentials,
+            accessToken: "newer-token",
+          });
+        }
+        metadata.resolve(true);
+        await expect(pending).resolves.toBeUndefined();
+        expect(mocks.backfill).not.toHaveBeenCalled();
+      } finally {
+        metadata.resolve(true);
+        await pending;
+      }
+    },
+  );
+
+  it("fails before saving repaired credentials when storage metadata repair fails", async () => {
+    mocks.request.mockResolvedValue(identity);
+    mocks.repair.mockReturnValue(false);
+
+    await expect(backfill()).rejects.toThrow(
+      "Matrix deviceId backfill failed to repair current-token storage metadata",
+    );
+    expect(mocks.backfill).not.toHaveBeenCalled();
+  });
+
+  it("skips stale deviceId backfill writes after newer credentials take over", async () => {
+    mocks.request.mockResolvedValue(identity);
+    loadCredentials.mockResolvedValue({
+      ...cachedCredentials,
+      accessToken: "tok-new",
+    });
+
+    const deviceId = await backfill({ auth: { ...authFixture, accessToken: "tok-old" } });
+
+    expect(deviceId).toBeUndefined();
+    expectNoBackfill();
+  });
+
+  it("skips persistence when startup backfill is aborted before whoami resolves", async () => {
+    const whoami = createDeferred<typeof identity>();
+    mocks.request.mockReturnValue(whoami.promise);
+    const abortController = new AbortController();
+    const backfillPromise = backfill({ abortSignal: abortController.signal });
+
+    await vi.waitFor(() => expect(mocks.request).toHaveBeenCalled());
+    abortController.abort();
+    whoami.resolve(identity);
+
+    await expect(backfillPromise).resolves.toBeUndefined();
+    expectNoBackfill();
+  });
+
+  it("stops waiting on whoami retry backoff when startup backfill is aborted", async () => {
+    vi.useFakeTimers();
+    const retryStarted = createDeferred<void>();
+    const sleepWithAbort = runtimeEnv.sleepWithAbort;
+    vi.spyOn(runtimeEnv, "sleepWithAbort").mockImplementation((...args) => {
+      const sleeping = sleepWithAbort(...args);
+      retryStarted.resolve();
+      return sleeping;
+    });
+    mocks.request.mockRejectedValueOnce(networkError("read ECONNRESET"));
+    const abortController = new AbortController();
+    const backfillPromise = backfill({ abortSignal: abortController.signal });
+
+    try {
+      await retryStarted.promise;
+      expect(vi.getTimerCount()).toBe(1);
+      abortController.abort();
+
+      // Cancellation must settle the backoff without advancing its clock.
+      await expect(backfillPromise).resolves.toBeUndefined();
+      expect(vi.getTimerCount()).toBe(0);
+      expect(mocks.request).toHaveBeenCalledTimes(1);
+      expectNoBackfill();
+    } finally {
+      abortController.abort();
+      vi.useRealTimers();
+    }
+  });
+
+  it("resolves configured accessToken SecretRefs during Matrix auth", async () => {
+    mocks.request.mockResolvedValue(identity);
+    mocks.secret.mockResolvedValue({ value: "resolved-token" });
+
+    const secretRef = { source: "file", provider: "matrix-file", id: "value" } as const;
+    const cfg = createConfig({ homeserver: tokenConfig.homeserver, accessToken: secretRef });
+
+    const auth = await resolveMatrixAuth({ cfg, env: {} });
+
+    expect(mocks.secret).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        config: cfg,
+        value: secretRef,
+        path: "channels.matrix.accessToken",
       }),
     );
+    expectWhoami();
     expect(auth).toMatchObject({
-      accountId: "ops",
-      homeserver: "https://matrix.example.org",
-      userId: "@ops:example.org",
-      accessToken: "ops-token",
-      deviceId: "OPSDEVICE",
+      ...authFixture,
+      accessToken: "resolved-token",
+      deviceId: "DEVICE123",
     });
   });
 
-  it("resolves missing whoami identity fields for token auth", async () => {
-    const doRequestSpy = vi.spyOn(sdkModule.MatrixClient.prototype, "doRequest").mockResolvedValue({
-      user_id: "@bot:example.org",
-      device_id: "DEVICE123",
+  it("does not resolve inactive password SecretRefs when scoped token auth wins", async () => {
+    mocks.request.mockResolvedValue({
+      user_id: opsCredentials.userId,
+      device_id: opsCredentials.deviceId,
     });
 
-    const cfg = {
-      channels: {
-        matrix: {
-          homeserver: "https://matrix.example.org",
-          accessToken: "tok-123",
-          encryption: true,
+    const cfg = createConfig({
+      accounts: {
+        ops: {
+          homeserver: tokenConfig.homeserver,
+          password: { source: "env", provider: "default", id: "MATRIX_OPS_PASSWORD" },
         },
       },
-    } as CoreConfig;
+    });
+
+    installMatrixTestRuntime({ cfg });
 
     const auth = await resolveMatrixAuth({
       cfg,
-      env: {} as NodeJS.ProcessEnv,
+      env: { MATRIX_OPS_ACCESS_TOKEN: opsCredentials.accessToken },
+      accountId: "ops",
     });
 
-    expect(doRequestSpy).toHaveBeenCalledWith("GET", "/_matrix/client/v3/account/whoami");
-    expect(auth).toMatchObject({
-      accountId: "default",
-      homeserver: "https://matrix.example.org",
-      userId: "@bot:example.org",
-      accessToken: "tok-123",
-      deviceId: "DEVICE123",
-      encryption: true,
-    });
-  });
-
-  it("uses config deviceId with cached credentials when token is loaded from cache", async () => {
-    vi.mocked(credentialsReadModule.loadMatrixCredentials).mockReturnValue({
-      homeserver: "https://matrix.example.org",
-      userId: "@bot:example.org",
-      accessToken: "tok-123",
-      createdAt: "2026-01-01T00:00:00.000Z",
-    });
-    vi.mocked(credentialsReadModule.credentialsMatchConfig).mockReturnValue(true);
-
-    const cfg = {
-      channels: {
-        matrix: {
-          homeserver: "https://matrix.example.org",
-          userId: "@bot:example.org",
-          deviceId: "DEVICE123",
-          encryption: true,
-        },
-      },
-    } as CoreConfig;
-
-    const auth = await resolveMatrixAuth({ cfg, env: {} as NodeJS.ProcessEnv });
-
-    expect(auth).toMatchObject({
-      accountId: "default",
-      homeserver: "https://matrix.example.org",
-      userId: "@bot:example.org",
-      accessToken: "tok-123",
-      deviceId: "DEVICE123",
-      encryption: true,
-    });
+    expectWhoami();
+    expect(auth).toMatchObject({ ...opsCredentials, accountId: "ops", password: undefined });
   });
 
   it("falls back to the sole configured account when no global homeserver is set", async () => {
-    const cfg = {
-      channels: {
-        matrix: {
-          accounts: {
-            ops: {
-              homeserver: "https://ops.example.org",
-              userId: "@ops:example.org",
-              accessToken: "ops-token",
-              deviceId: "OPSDEVICE",
-              encryption: true,
-            },
-          },
-        },
-      },
-    } as CoreConfig;
-
-    const auth = await resolveMatrixAuth({ cfg, env: {} as NodeJS.ProcessEnv });
-
-    expect(auth).toMatchObject({
-      accountId: "ops",
+    const soleAccount = {
+      ...opsCredentials,
       homeserver: "https://ops.example.org",
-      userId: "@ops:example.org",
-      accessToken: "ops-token",
-      deviceId: "OPSDEVICE",
       encryption: true,
+    };
+    const auth = await resolveAuth({ accounts: { ops: soleAccount } });
+
+    expect(auth).toMatchObject({ ...soleAccount, accountId: "ops" });
+    expectSavedCredentials(mocks.save, "ops", {
+      ...opsCredentials,
+      homeserver: soleAccount.homeserver,
     });
-    expect(saveMatrixCredentialsMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        homeserver: "https://ops.example.org",
-        userId: "@ops:example.org",
-        accessToken: "ops-token",
-        deviceId: "OPSDEVICE",
-      }),
-      expect.any(Object),
-      "ops",
-    );
   });
 });

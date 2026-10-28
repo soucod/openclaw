@@ -1,39 +1,17 @@
 import {
+  normalizeLowercaseStringOrEmpty,
+  normalizeOptionalString,
+} from "@openclaw/normalization-core/string-coerce";
+import {
   buildConfiguredAcpSessionKey,
   normalizeBindingConfig,
   type ConfiguredAcpBindingChannel,
 } from "../../acp/persistent-bindings.types.js";
-import { resolveConfiguredBindingRecord } from "../../channels/plugins/binding-registry.js";
+import { resolveConfiguredBindingRecord } from "../../channels/plugins/configured-binding-registry.js";
 import { listAcpBindings } from "../../config/bindings.js";
-import type { OpenClawConfig } from "../../config/config.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { getSessionBindingService } from "../../infra/outbound/session-binding-service.js";
 import { DEFAULT_ACCOUNT_ID, isAcpSessionKey } from "../../routing/session-key.js";
-
-const acpResetTargetDeps = {
-  getSessionBindingService,
-  listAcpBindings,
-  resolveConfiguredBindingRecord,
-};
-
-export const __testing = {
-  setDepsForTest(
-    overrides?: Partial<{
-      getSessionBindingService: typeof getSessionBindingService;
-      listAcpBindings: typeof listAcpBindings;
-      resolveConfiguredBindingRecord: typeof resolveConfiguredBindingRecord;
-    }>,
-  ) {
-    acpResetTargetDeps.getSessionBindingService =
-      overrides?.getSessionBindingService ?? getSessionBindingService;
-    acpResetTargetDeps.listAcpBindings = overrides?.listAcpBindings ?? listAcpBindings;
-    acpResetTargetDeps.resolveConfiguredBindingRecord =
-      overrides?.resolveConfiguredBindingRecord ?? resolveConfiguredBindingRecord;
-  },
-};
-
-function normalizeText(value: string | undefined | null): string {
-  return value?.trim() ?? "";
-}
 
 function resolveRawConfiguredAcpSessionKey(params: {
   cfg: OpenClawConfig;
@@ -42,18 +20,18 @@ function resolveRawConfiguredAcpSessionKey(params: {
   conversationId: string;
   parentConversationId?: string;
 }): string | undefined {
-  for (const binding of acpResetTargetDeps.listAcpBindings(params.cfg)) {
-    const bindingChannel = normalizeText(binding.match.channel).toLowerCase();
+  for (const binding of listAcpBindings(params.cfg)) {
+    const bindingChannel = normalizeLowercaseStringOrEmpty(binding.match.channel);
     if (!bindingChannel || bindingChannel !== params.channel) {
       continue;
     }
 
-    const bindingAccountId = normalizeText(binding.match.accountId);
+    const bindingAccountId = normalizeOptionalString(binding.match.accountId) ?? "";
     if (bindingAccountId && bindingAccountId !== "*" && bindingAccountId !== params.accountId) {
       continue;
     }
 
-    const peerId = normalizeText(binding.match.peer?.id);
+    const peerId = normalizeOptionalString(binding.match.peer?.id) ?? "";
     const matchedConversationId =
       peerId === params.conversationId
         ? params.conversationId
@@ -81,66 +59,61 @@ function resolveRawConfiguredAcpSessionKey(params: {
   return undefined;
 }
 
-export function resolveEffectiveResetTargetSessionKey(params: {
+export async function resolveEffectiveResetTargetSessionKey(params: {
   cfg: OpenClawConfig;
   channel?: string | null;
   accountId?: string | null;
   conversationId?: string | null;
   parentConversationId?: string | null;
+  commandTargetSessionKey?: string | null;
   activeSessionKey?: string | null;
   allowNonAcpBindingSessionKey?: boolean;
   skipConfiguredFallbackWhenActiveSessionNonAcp?: boolean;
   fallbackToActiveAcpWhenUnbound?: boolean;
-}): string | undefined {
-  const activeSessionKey = normalizeText(params.activeSessionKey);
+}): Promise<string | undefined> {
+  const allowedTarget = (sessionKey: string) =>
+    params.allowNonAcpBindingSessionKey || isAcpSessionKey(sessionKey) ? sessionKey : undefined;
+  const commandTargetSessionKey = normalizeOptionalString(params.commandTargetSessionKey);
+  if (commandTargetSessionKey) {
+    return allowedTarget(commandTargetSessionKey);
+  }
+  const activeSessionKey = normalizeOptionalString(params.activeSessionKey);
   const activeAcpSessionKey =
     activeSessionKey && isAcpSessionKey(activeSessionKey) ? activeSessionKey : undefined;
   const activeIsNonAcp = Boolean(activeSessionKey) && !activeAcpSessionKey;
 
-  const channel = normalizeText(params.channel).toLowerCase();
-  const conversationId = normalizeText(params.conversationId);
+  const channel = normalizeLowercaseStringOrEmpty(params.channel);
+  const conversationId = normalizeOptionalString(params.conversationId) ?? "";
   if (!channel || !conversationId) {
     return activeAcpSessionKey;
   }
-  const accountId = normalizeText(params.accountId) || DEFAULT_ACCOUNT_ID;
-  const parentConversationId = normalizeText(params.parentConversationId) || undefined;
-  const allowNonAcpBindingSessionKey = Boolean(params.allowNonAcpBindingSessionKey);
-
-  const serviceBinding = acpResetTargetDeps.getSessionBindingService().resolveByConversation({
-    channel,
-    accountId,
-    conversationId,
-    parentConversationId,
-  });
+  const accountId =
+    normalizeOptionalString(params.accountId) ??
+    normalizeOptionalString(params.cfg.channels?.[channel]?.defaultAccount) ??
+    DEFAULT_ACCOUNT_ID;
+  const parentConversationId = normalizeOptionalString(params.parentConversationId);
+  const conversation = { channel, accountId, conversationId, parentConversationId };
+  const serviceBinding = await getSessionBindingService().resolveByConversationAsync(conversation);
   const serviceSessionKey =
     serviceBinding?.targetKind === "session" ? serviceBinding.targetSessionKey.trim() : "";
   if (serviceSessionKey) {
-    if (allowNonAcpBindingSessionKey) {
-      return serviceSessionKey;
-    }
-    return isAcpSessionKey(serviceSessionKey) ? serviceSessionKey : undefined;
+    return allowedTarget(serviceSessionKey);
   }
 
   if (activeIsNonAcp && params.skipConfiguredFallbackWhenActiveSessionNonAcp) {
     return undefined;
   }
 
-  const configuredBinding = acpResetTargetDeps.resolveConfiguredBindingRecord({
+  const configuredBinding = resolveConfiguredBindingRecord({
     cfg: params.cfg,
-    channel,
-    accountId,
-    conversationId,
-    parentConversationId,
+    ...conversation,
   });
   const configuredSessionKey =
     configuredBinding?.record.targetKind === "session"
       ? configuredBinding.record.targetSessionKey.trim()
       : "";
   if (configuredSessionKey) {
-    if (allowNonAcpBindingSessionKey) {
-      return configuredSessionKey;
-    }
-    return isAcpSessionKey(configuredSessionKey) ? configuredSessionKey : undefined;
+    return allowedTarget(configuredSessionKey);
   }
 
   const rawConfiguredSessionKey = resolveRawConfiguredAcpSessionKey({
@@ -154,8 +127,5 @@ export function resolveEffectiveResetTargetSessionKey(params: {
     return rawConfiguredSessionKey;
   }
 
-  if (params.fallbackToActiveAcpWhenUnbound === false) {
-    return undefined;
-  }
-  return activeAcpSessionKey;
+  return params.fallbackToActiveAcpWhenUnbound === false ? undefined : activeAcpSessionKey;
 }

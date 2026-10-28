@@ -2,6 +2,10 @@ export type GoogleChatSpace = {
   name?: string;
   displayName?: string;
   type?: string;
+  /** Current Google Chat field that replaces the deprecated `type` field. */
+  spaceType?: string;
+  /** True when the space is a 1:1 DM between a user and the Chat app. */
+  singleUserBotDm?: boolean;
 };
 
 export type GoogleChatUser = {
@@ -11,16 +15,6 @@ export type GoogleChatUser = {
   type?: string;
 };
 
-export type GoogleChatThread = {
-  name?: string;
-  threadKey?: string;
-};
-
-export type GoogleChatAttachmentDataRef = {
-  resourceName?: string;
-  attachmentUploadToken?: string;
-};
-
 export type GoogleChatAttachment = {
   name?: string;
   contentName?: string;
@@ -28,20 +22,21 @@ export type GoogleChatAttachment = {
   thumbnailUri?: string;
   downloadUri?: string;
   source?: string;
-  attachmentDataRef?: GoogleChatAttachmentDataRef;
+  attachmentDataRef?: {
+    resourceName?: string;
+    attachmentUploadToken?: string;
+  };
   driveDataRef?: Record<string, unknown>;
-};
-
-export type GoogleChatUserMention = {
-  user?: GoogleChatUser;
-  type?: string;
 };
 
 export type GoogleChatAnnotation = {
   type?: string;
   startIndex?: number;
   length?: number;
-  userMention?: GoogleChatUserMention;
+  userMention?: {
+    user?: GoogleChatUser;
+    type?: string;
+  };
   slashCommand?: Record<string, unknown>;
   richLinkMetadata?: Record<string, unknown>;
   customEmojiMetadata?: Record<string, unknown>;
@@ -52,9 +47,23 @@ export type GoogleChatMessage = {
   text?: string;
   argumentText?: string;
   sender?: GoogleChatUser;
-  thread?: GoogleChatThread;
+  thread?: {
+    name?: string;
+    threadKey?: string;
+  };
+  cardsV2?: GoogleChatCardV2[];
   attachment?: GoogleChatAttachment[];
   annotations?: GoogleChatAnnotation[];
+};
+
+export type GoogleChatActionParameter = {
+  key?: string;
+  value?: string;
+};
+
+export type GoogleChatAction = {
+  actionMethodName?: string;
+  parameters?: GoogleChatActionParameter[];
 };
 
 export type GoogleChatEvent = {
@@ -64,10 +73,51 @@ export type GoogleChatEvent = {
   space?: GoogleChatSpace;
   user?: GoogleChatUser;
   message?: GoogleChatMessage;
+  action?: GoogleChatAction;
+  common?: {
+    invokedFunction?: string;
+    parameters?: Record<string, string>;
+  };
+  commonEventObject?: {
+    invokedFunction?: string;
+    parameters?: Record<string, string>;
+  };
 };
 
-export type GoogleChatReaction = {
-  name?: string;
-  user?: GoogleChatUser;
-  emoji?: { unicode?: string };
+export type GoogleChatCardV2 = {
+  cardId?: string;
+  card: {
+    header?: {
+      title?: string;
+      subtitle?: string;
+      imageType?: "SQUARE" | "CIRCLE";
+    };
+    sections?: Array<{
+      header?: string;
+      collapsible?: boolean;
+      uncollapsibleWidgetsCount?: number;
+      widgets?: (
+        | {
+            textParagraph: {
+              text: string;
+            };
+          }
+        | {
+            buttonList: {
+              buttons: Array<{
+                text: string;
+                onClick: {
+                  action: {
+                    function: string;
+                    parameters?: GoogleChatActionParameter[];
+                    loadIndicator?: "SPINNER" | "NONE";
+                  };
+                };
+              }>;
+            };
+          }
+        | { divider: Record<string, never> }
+      )[];
+    }>;
+  };
 };

@@ -1,72 +1,95 @@
-import { describe, expect, it, vi } from "vitest";
-import { createHookRunner } from "./hooks.js";
-import { createMockPluginRegistry } from "./hooks.test-helpers.js";
+import { expect, it, vi } from "vitest";
+import { createHookRunnerWithRegistry } from "./hooks.test-fixtures.js";
 
-describe("llm hook runner methods", () => {
-  it("runLlmInput invokes registered llm_input hooks", async () => {
-    const handler = vi.fn();
-    const registry = createMockPluginRegistry([{ hookName: "llm_input", handler }]);
-    const runner = createHookRunner(registry);
+const base = { runId: "run-1", sessionId: "session-1", provider: "openai", model: "gpt-5" };
+const input = {
+  ...base,
+  systemPrompt: "be helpful",
+  prompt: "PRIVATE_INPUT",
+  historyMessages: [],
+  imagesCount: 0,
+  tools: [],
+};
+const output = {
+  ...base,
+  assistantTexts: ["PRIVATE_OUTPUT"],
+  lastAssistant: { role: "assistant", content: "PRIVATE_OUTPUT" },
+  usage: { input: 10, output: 20, total: 30 },
+};
 
-    await runner.runLlmInput(
-      {
-        runId: "run-1",
-        sessionId: "session-1",
-        provider: "openai",
-        model: "gpt-5",
-        systemPrompt: "be helpful",
-        prompt: "hello",
-        historyMessages: [],
-        imagesCount: 0,
+it.each([
+  "main",
+  "dashboard:incognito-test",
+  "subagent:incognito-test",
+  "internal-session-effects:incognito-test",
+])("gates conversation observers but preserves terminal lifecycle for %s", async (session) => {
+  const privateSession = session !== "main";
+  const llmInput = vi.fn();
+  const llmOutput = vi.fn();
+  const agentEnd = vi.fn();
+  const { runner } = createHookRunnerWithRegistry([
+    { hookName: "llm_input", handler: llmInput },
+    { hookName: "llm_output", handler: llmOutput },
+    { hookName: "agent_end", handler: agentEnd },
+  ]);
+  const context = {
+    agentId: "main",
+    sessionId: "session-1",
+    sessionKey: `agent:main:${session}`,
+    runId: "run-1",
+  };
+  await runner.runLlmInput({ ...input, historyMessages: [...input.historyMessages] }, context);
+  await runner.runLlmOutput({ ...output, assistantTexts: [...output.assistantTexts] }, context);
+  if (!privateSession) {
+    expect(llmInput).toHaveBeenCalledWith(input, context);
+    expect(llmOutput).toHaveBeenCalledWith(output, context);
+    return;
+  }
+  expect(llmInput).not.toHaveBeenCalled();
+  expect(llmOutput).not.toHaveBeenCalled();
+  const readMessages = vi.fn(() => [{ role: "user", content: "PRIVATE_INPUT" }]);
+  const readError = vi.fn(() => "PRIVATE_ERROR");
+  await runner.runAgentEnd(
+    {
+      get messages() {
+        return readMessages();
       },
-      {
-        agentId: "main",
-        sessionId: "session-1",
+      get error() {
+        return readError();
       },
-    );
+      success: false,
+      durationMs: 42,
+    },
+    context,
+  );
+  expect(agentEnd).toHaveBeenCalledExactlyOnceWith(
+    { runId: "run-1", messages: [], success: false, durationMs: 42 },
+    context,
+  );
+  expect(readMessages).not.toHaveBeenCalled();
+  expect(readError).not.toHaveBeenCalled();
+});
 
-    expect(handler).toHaveBeenCalledWith(
-      expect.objectContaining({ runId: "run-1", prompt: "hello" }),
-      expect.objectContaining({ sessionId: "session-1" }),
-    );
-  });
-
-  it("runLlmOutput invokes registered llm_output hooks", async () => {
-    const handler = vi.fn();
-    const registry = createMockPluginRegistry([{ hookName: "llm_output", handler }]);
-    const runner = createHookRunner(registry);
-
-    await runner.runLlmOutput(
-      {
-        runId: "run-1",
-        sessionId: "session-1",
-        provider: "openai",
-        model: "gpt-5",
-        assistantTexts: ["hi"],
-        lastAssistant: { role: "assistant", content: "hi" },
-        usage: {
-          input: 10,
-          output: 20,
-          total: 30,
-        },
+it("preserves Incognito policy order and fail-closed behavior", async () => {
+  const calls: string[] = [];
+  const { runner } = createHookRunnerWithRegistry(
+    ["first", "second"].map((name, index) => ({
+      hookName: "before_tool_call",
+      priority: 10 - index * 5,
+      handler: () => {
+        calls.push(name);
+        if (name === "second") {
+          throw new Error("policy unavailable");
+        }
       },
-      {
-        agentId: "main",
-        sessionId: "session-1",
-      },
-    );
-
-    expect(handler).toHaveBeenCalledWith(
-      expect.objectContaining({ runId: "run-1", assistantTexts: ["hi"] }),
-      expect.objectContaining({ sessionId: "session-1" }),
-    );
-  });
-
-  it("hasHooks returns true for registered llm hooks", () => {
-    const registry = createMockPluginRegistry([{ hookName: "llm_input", handler: vi.fn() }]);
-    const runner = createHookRunner(registry);
-
-    expect(runner.hasHooks("llm_input")).toBe(true);
-    expect(runner.hasHooks("llm_output")).toBe(false);
-  });
+    })),
+    { failurePolicyByHook: { before_tool_call: "fail-closed" } },
+  );
+  await expect(
+    runner.runBeforeToolCall(
+      { toolName: "exec", params: { command: "echo private" } },
+      { sessionKey: "agent:main:dashboard:incognito-test", toolName: "exec" },
+    ),
+  ).rejects.toThrow("policy unavailable");
+  expect(calls).toEqual(["first", "second"]);
 });

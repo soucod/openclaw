@@ -1,166 +1,67 @@
-import { randomUUID } from "node:crypto";
-import { createWriteStream } from "node:fs";
-import { mkdir } from "node:fs/promises";
-import { homedir } from "node:os";
-import * as path from "node:path";
-import { Readable } from "node:stream";
-import { pipeline } from "node:stream/promises";
-import { fetchWithSsrFGuard } from "openclaw/plugin-sdk/infra-runtime";
-import { getDefaultSsrFPolicy } from "../urbit/context.js";
+import { MAX_IMAGE_BYTES, saveRemoteMedia } from "openclaw/plugin-sdk/media-runtime";
+import { TLON_MEDIA_FETCH_TIMEOUTS } from "../media-fetch-timeouts.js";
 
-// Default to OpenClaw workspace media directory
-const DEFAULT_MEDIA_DIR = path.join(homedir(), ".openclaw", "workspace", "media", "inbound");
+const MAX_IMAGES_PER_MESSAGE = 8;
 
-export interface ExtractedImage {
-  url: string;
-  alt?: string;
-}
+type TlonInboundMedia = { path: string; contentType: string };
 
-export interface DownloadedMedia {
-  localPath: string;
-  contentType: string;
-  originalUrl: string;
-}
-
-/**
- * Extract image blocks from Tlon message content.
- * Returns array of image URLs found in the message.
- */
-export function extractImageBlocks(content: unknown): ExtractedImage[] {
-  if (!content || !Array.isArray(content)) {
-    return [];
+/** Keeps Tlon's shipped path-duplicating prompt bytes paired with ordered facts. */
+export function buildTlonInboundMediaPrompt(messageText: string, media: TlonInboundMedia[]) {
+  if (media.length === 0) {
+    return { body: messageText, media };
   }
+  const mediaLines = media
+    .map(
+      (attachment) =>
+        `[media attached: ${attachment.path} (${attachment.contentType}) | ${attachment.path}]`,
+    )
+    .join("\n");
+  return { body: `${mediaLines}\n${messageText}`, media };
+}
 
-  const images: ExtractedImage[] = [];
+export async function downloadMessageImages(content: unknown, maxBytes?: number) {
+  const images: string[] = [];
+  const attachments: TlonInboundMedia[] = [];
+  let unavailableCount = 0;
 
-  for (const verse of content) {
-    if (verse?.block?.image?.src) {
-      images.push({
-        url: verse.block.image.src,
-        alt: verse.block.image.alt,
-      });
+  // Retain the number omitted by the download cap for the unavailable-media notice.
+  if (Array.isArray(content)) {
+    for (const verse of content) {
+      if (verse?.block?.image?.src) {
+        if (images.length >= MAX_IMAGES_PER_MESSAGE) {
+          unavailableCount++;
+          continue;
+        }
+        images.push(verse.block.image.src);
+      }
     }
   }
 
-  return images;
-}
-
-/**
- * Download a media file from URL to local storage.
- * Returns the local path where the file was saved.
- */
-export async function downloadMedia(
-  url: string,
-  mediaDir: string = DEFAULT_MEDIA_DIR,
-): Promise<DownloadedMedia | null> {
-  try {
-    // Validate URL is http/https before fetching
-    const parsedUrl = new URL(url);
-    if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
-      console.warn(`[tlon-media] Rejected non-http(s) URL: ${url}`);
-      return null;
-    }
-
-    // Ensure media directory exists
-    await mkdir(mediaDir, { recursive: true });
-
-    // Fetch with SSRF protection
-    // Use fetchWithSsrFGuard directly (not urbitFetch) to preserve the full URL path
-    const { response, release } = await fetchWithSsrFGuard({
-      url,
-      init: { method: "GET" },
-      policy: getDefaultSsrFPolicy(),
-      auditContext: "tlon-media-download",
-    });
-
+  for (const url of images) {
     try {
-      if (!response.ok) {
-        console.error(`[tlon-media] Failed to fetch ${url}: ${response.status}`);
-        return null;
+      const parsedUrl = new URL(url);
+      if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+        console.warn("[tlon-media] Rejected non-http(s) media URL");
+        unavailableCount++;
+        continue;
       }
 
-      // Determine content type and extension
-      const contentType = response.headers.get("content-type") || "application/octet-stream";
-      const ext = getExtensionFromContentType(contentType) || getExtensionFromUrl(url) || "bin";
-
-      // Generate unique filename
-      const filename = `${randomUUID()}.${ext}`;
-      const localPath = path.join(mediaDir, filename);
-
-      // Stream to file
-      const body = response.body;
-      if (!body) {
-        console.error(`[tlon-media] No response body for ${url}`);
-        return null;
-      }
-
-      const writeStream = createWriteStream(localPath);
-      await pipeline(Readable.fromWeb(body as any), writeStream);
-
-      return {
-        localPath,
-        contentType,
-        originalUrl: url,
-      };
-    } finally {
-      await release();
-    }
-  } catch (error: any) {
-    console.error(`[tlon-media] Error downloading ${url}: ${error?.message ?? String(error)}`);
-    return null;
-  }
-}
-
-function getExtensionFromContentType(contentType: string): string | null {
-  const map: Record<string, string> = {
-    "image/jpeg": "jpg",
-    "image/jpg": "jpg",
-    "image/png": "png",
-    "image/gif": "gif",
-    "image/webp": "webp",
-    "image/svg+xml": "svg",
-    "video/mp4": "mp4",
-    "video/webm": "webm",
-    "audio/mpeg": "mp3",
-    "audio/ogg": "ogg",
-  };
-  return map[contentType.split(";")[0].trim()] ?? null;
-}
-
-function getExtensionFromUrl(url: string): string | null {
-  try {
-    const pathname = new URL(url).pathname;
-    const match = pathname.match(/\.([a-z0-9]+)$/i);
-    return match ? match[1].toLowerCase() : null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Download all images from a message and return attachment metadata.
- * Format matches OpenClaw's expected attachment structure.
- */
-export async function downloadMessageImages(
-  content: unknown,
-  mediaDir?: string,
-): Promise<Array<{ path: string; contentType: string }>> {
-  const images = extractImageBlocks(content);
-  if (images.length === 0) {
-    return [];
-  }
-
-  const attachments: Array<{ path: string; contentType: string }> = [];
-
-  for (const image of images) {
-    const downloaded = await downloadMedia(image.url, mediaDir);
-    if (downloaded) {
-      attachments.push({
-        path: downloaded.localPath,
-        contentType: downloaded.contentType,
+      const saved = await saveRemoteMedia({
+        url,
+        maxBytes: Math.min(maxBytes ?? MAX_IMAGE_BYTES, MAX_IMAGE_BYTES),
+        ...TLON_MEDIA_FETCH_TIMEOUTS,
+        ssrfPolicy: undefined,
+        requestInit: { method: "GET" },
       });
+      attachments.push({
+        path: saved.path,
+        contentType: saved.contentType ?? "application/octet-stream",
+      });
+    } catch {
+      console.error("[tlon-media] Error downloading inbound media");
+      unavailableCount++;
     }
   }
 
-  return attachments;
+  return { attachments, unavailableCount };
 }

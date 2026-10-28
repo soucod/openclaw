@@ -1,114 +1,97 @@
-import { describe, expect, it } from "vitest";
-import type { OpenClawConfig } from "../../config/config.js";
+import { expect, it } from "vitest";
+import { createChannelTestPluginBase } from "../../test-utils/channel-plugins.js";
 import {
   buildAccountScopedDmSecurityPolicy,
   formatPairingApproveHint,
   parseOptionalDelimitedEntries,
+  resolveChannelDefaultAccountId,
 } from "./helpers.js";
 
-function cfgWithChannel(channelKey: string, accounts?: Record<string, unknown>): OpenClawConfig {
+it.each([
+  ["unlisted", ["supplied"], ["listed"], "unlisted"],
+  ["", undefined, ["listed"], ""],
+  [undefined, ["supplied", "second"], ["listed"], "supplied"],
+  [undefined, [], ["listed"], "default"],
+  [undefined, undefined, ["listed", "second"], "listed"],
+  [undefined, undefined, [], "default"],
+  [undefined, undefined, ["", "second"], ""],
+] satisfies [string | undefined, string[] | undefined, string[], string][])(
+  "resolves default=%j supplied=%j listed=%j to %j",
+  (defaultId, accountIds, listed, result) => {
+    const plugin = createChannelTestPluginBase({ id: "accountchat" });
+    plugin.config.listAccountIds = () => listed;
+    plugin.config.defaultAccountId = defaultId === undefined ? undefined : () => defaultId;
+    expect(resolveChannelDefaultAccountId({ plugin, cfg: {}, accountIds })).toBe(result);
+  },
+);
+
+type PolicyInput = Omit<
+  Parameters<typeof buildAccountScopedDmSecurityPolicy>[0],
+  "cfg" | "channelKey"
+>;
+const allowlist = { policy: "allowlist", allowFrom: ["+15550001111"] } satisfies PolicyInput;
+const pairing = { policy: "pairing", allowFrom: ["*"] } satisfies PolicyInput;
+const accounts = { default: { dmPolicy: "allowlist", allowFrom: ["+15550001111"] }, work: {} };
+function expected(policy: string, allowFrom: string[], scope = "", suffix = "") {
   return {
-    channels: {
-      [channelKey]: accounts ? { accounts } : {},
-    },
-  } as unknown as OpenClawConfig;
+    policy,
+    allowFrom,
+    policyPath: suffix ? undefined : `channels.demo.${scope}dmPolicy`,
+    allowFromPath: `channels.demo.${scope}${suffix}`,
+    approveHint: formatPairingApproveHint("demo"),
+    normalizeEntry: undefined,
+  };
 }
-
-describe("buildAccountScopedDmSecurityPolicy", () => {
-  it("builds top-level dm policy paths when no account config exists", () => {
+it.each([
+  ["root", pairing, {}, expected("pairing", ["*"])],
+  [
+    "account",
+    { ...allowlist, accountId: "work" },
+    { accounts: { work: {} } },
+    expected("allowlist", ["+15550001111"], "accounts.work."),
+  ],
+  [
+    "nested",
+    { ...pairing, accountId: "work", allowFromPathSuffix: "dm.", policyPathSuffix: undefined },
+    { accounts: { work: {} } },
+    expected("pairing", ["*"], "accounts.work.", "dm."),
+  ],
+  [
+    "inherited",
+    { ...allowlist, accountId: "work", inheritSharedDefaultsFromDefaultAccount: true },
+    { accounts },
+    expected("allowlist", ["+15550001111"], "accounts.default."),
+  ],
+  [
+    "no inheritance",
+    { ...pairing, accountId: "work" },
+    { allowFrom: ["*"], dmPolicy: "pairing", accounts },
+    expected("pairing", ["*"]),
+  ],
+  [
+    "custom defaults",
+    { allowFrom: ["user-1"], defaultPolicy: "allowlist", approveHint: "custom" },
+    {},
+    { ...expected("allowlist", ["user-1"]), approveHint: "custom" },
+  ],
+] satisfies [string, PolicyInput, Record<string, unknown>, ReturnType<typeof expected>][])(
+  "builds %s security policy paths",
+  (_name, overrides, section, result) => {
     expect(
       buildAccountScopedDmSecurityPolicy({
-        cfg: cfgWithChannel("telegram"),
-        channelKey: "telegram",
+        channelKey: "demo",
+        cfg: { channels: { demo: section } },
         fallbackAccountId: "default",
-        policy: "pairing",
-        allowFrom: ["123"],
         policyPathSuffix: "dmPolicy",
+        ...overrides,
       }),
-    ).toEqual({
-      policy: "pairing",
-      allowFrom: ["123"],
-      policyPath: "channels.telegram.dmPolicy",
-      allowFromPath: "channels.telegram.",
-      approveHint: formatPairingApproveHint("telegram"),
-      normalizeEntry: undefined,
-    });
-  });
+    ).toEqual(result);
+  },
+);
 
-  it("uses account-scoped paths when account config exists", () => {
-    expect(
-      buildAccountScopedDmSecurityPolicy({
-        cfg: cfgWithChannel("signal", { work: {} }),
-        channelKey: "signal",
-        accountId: "work",
-        fallbackAccountId: "default",
-        policy: "allowlist",
-        allowFrom: ["+12125551212"],
-        policyPathSuffix: "dmPolicy",
-      }),
-    ).toEqual({
-      policy: "allowlist",
-      allowFrom: ["+12125551212"],
-      policyPath: "channels.signal.accounts.work.dmPolicy",
-      allowFromPath: "channels.signal.accounts.work.",
-      approveHint: formatPairingApproveHint("signal"),
-      normalizeEntry: undefined,
-    });
-  });
-
-  it("supports nested dm paths without explicit policyPath", () => {
-    expect(
-      buildAccountScopedDmSecurityPolicy({
-        cfg: cfgWithChannel("discord", { work: {} }),
-        channelKey: "discord",
-        accountId: "work",
-        policy: "pairing",
-        allowFrom: [],
-        allowFromPathSuffix: "dm.",
-      }),
-    ).toEqual({
-      policy: "pairing",
-      allowFrom: [],
-      policyPath: undefined,
-      allowFromPath: "channels.discord.accounts.work.dm.",
-      approveHint: formatPairingApproveHint("discord"),
-      normalizeEntry: undefined,
-    });
-  });
-
-  it("supports custom defaults and approve hints", () => {
-    expect(
-      buildAccountScopedDmSecurityPolicy({
-        cfg: cfgWithChannel("synology-chat"),
-        channelKey: "synology-chat",
-        fallbackAccountId: "default",
-        allowFrom: ["user-1"],
-        defaultPolicy: "allowlist",
-        policyPathSuffix: "dmPolicy",
-        approveHint: "openclaw pairing approve synology-chat <code>",
-      }),
-    ).toEqual({
-      policy: "allowlist",
-      allowFrom: ["user-1"],
-      policyPath: "channels.synology-chat.dmPolicy",
-      allowFromPath: "channels.synology-chat.",
-      approveHint: "openclaw pairing approve synology-chat <code>",
-      normalizeEntry: undefined,
-    });
-  });
-});
-
-describe("parseOptionalDelimitedEntries", () => {
-  it("returns undefined for empty input", () => {
-    expect(parseOptionalDelimitedEntries("  ")).toBeUndefined();
-  });
-
-  it("splits comma, newline, and semicolon separated entries", () => {
-    expect(parseOptionalDelimitedEntries("alpha, beta\ngamma; delta")).toEqual([
-      "alpha",
-      "beta",
-      "gamma",
-      "delta",
-    ]);
-  });
+it.each([
+  ["  ", undefined],
+  ["alpha, beta\ngamma; delta", ["alpha", "beta", "gamma", "delta"]],
+] as const)("parses optional entries %j", (input, result) => {
+  expect(parseOptionalDelimitedEntries(input)).toEqual(result);
 });

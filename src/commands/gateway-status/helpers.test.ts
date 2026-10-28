@@ -1,294 +1,197 @@
 import { describe, expect, it } from "vitest";
+import type { OpenClawConfig } from "../../config/types.js";
+import type { GatewayProbeResult } from "../../gateway/probe.js";
 import { withEnvAsync } from "../../test-utils/env.js";
 import {
   extractConfigSummary,
   isProbeReachable,
+  isPostConnectProbeFailure,
   isScopeLimitedProbeFailure,
   renderProbeSummaryLine,
   resolveAuthForTarget,
   resolveProbeBudgetMs,
+  resolveTargets,
+  sanitizeSshTarget,
+  type GatewayStatusTarget,
 } from "./helpers.js";
+import { createUnreachableGatewayProbe, createSecretRefGatewayConfig } from "./test-support.js";
 
-describe("extractConfigSummary", () => {
-  it("marks SecretRef-backed gateway auth credentials as configured", () => {
-    const summary = extractConfigSummary({
-      path: "/tmp/openclaw.json",
-      exists: true,
-      valid: true,
-      issues: [],
-      legacyIssues: [],
-      config: {
-        secrets: {
-          defaults: {
-            env: "default",
-          },
-        },
-        gateway: {
-          auth: {
-            mode: "token",
-            token: { source: "env", provider: "default", id: "OPENCLAW_GATEWAY_TOKEN" },
-            password: { source: "env", provider: "default", id: "OPENCLAW_GATEWAY_PASSWORD" },
-          },
-          remote: {
-            url: "wss://remote.example:18789",
-            token: { source: "env", provider: "default", id: "REMOTE_GATEWAY_TOKEN" },
-            password: { source: "env", provider: "default", id: "REMOTE_GATEWAY_PASSWORD" },
-          },
-        },
-      },
-    });
+function makeTarget(kind: GatewayStatusTarget["kind"], url: string): GatewayStatusTarget {
+  return { id: kind, kind, url, active: true };
+}
 
-    expect(summary.gateway.authTokenConfigured).toBe(true);
-    expect(summary.gateway.authPasswordConfigured).toBe(true);
-    expect(summary.gateway.remoteTokenConfigured).toBe(true);
-    expect(summary.gateway.remotePasswordConfigured).toBe(true);
-  });
+function tokenConfig(surface: "auth" | "remote", id: string): OpenClawConfig {
+  const token = { source: "env" as const, provider: "default", id };
+  return {
+    secrets: { providers: { default: { source: "env" } } },
+    gateway: surface === "auth" ? { auth: { mode: "token", token } } : { remote: { token } },
+  };
+}
 
-  it("still treats empty plaintext auth values as not configured", () => {
-    const summary = extractConfigSummary({
-      path: "/tmp/openclaw.json",
-      exists: true,
-      valid: true,
-      issues: [],
-      legacyIssues: [],
-      config: {
-        gateway: {
-          auth: {
-            mode: "token",
-            token: "   ",
-            password: "",
-          },
-          remote: {
-            token: " ",
-            password: "",
-          },
-        },
-      },
-    });
+function configSummary(config: unknown) {
+  return extractConfigSummary({
+    path: "/tmp/openclaw.json",
+    exists: true,
+    valid: true,
+    issues: [],
+    legacyIssues: [],
+    config,
+  }).gateway;
+}
 
-    expect(summary.gateway.authTokenConfigured).toBe(false);
-    expect(summary.gateway.authPasswordConfigured).toBe(false);
-    expect(summary.gateway.remoteTokenConfigured).toBe(false);
-    expect(summary.gateway.remotePasswordConfigured).toBe(false);
-  });
-});
+function connectedProbe(
+  error: string,
+  connectLatencyMs: number,
+  auth: GatewayProbeResult["auth"] = {
+    role: "operator",
+    scopes: ["operator.write"],
+    capability: "write_capable",
+  },
+): GatewayProbeResult {
+  return {
+    ...createUnreachableGatewayProbe("ws://127.0.0.1:18789", error),
+    gatewayReached: true,
+    connectLatencyMs,
+    auth,
+  };
+}
 
-describe("resolveAuthForTarget", () => {
-  function createConfigRemoteTarget() {
-    return {
-      id: "configRemote",
-      kind: "configRemote" as const,
-      url: "wss://remote.example:18789",
-      active: true,
-    };
-  }
-
-  function createRemoteGatewayTargetConfig(params?: { mode?: "none" | "password" | "token" }) {
-    return {
-      secrets: {
-        providers: {
-          default: { source: "env" as const },
-        },
-      },
-      gateway: {
-        ...(params?.mode
-          ? {
-              auth: {
-                mode: params.mode,
-              },
-            }
-          : {}),
-        remote: {
-          token: { source: "env" as const, provider: "default", id: "REMOTE_GATEWAY_TOKEN" },
-        },
-      },
-    };
-  }
-
-  it("resolves local auth token SecretRef before probing local targets", async () => {
-    await withEnvAsync(
+describe("gateway-status helpers", () => {
+  it.each([
+    ["SecretRefs", createSecretRefGatewayConfig(), true],
+    [
+      "empty plaintext",
       {
-        OPENCLAW_GATEWAY_TOKEN: undefined,
-        OPENCLAW_GATEWAY_PASSWORD: undefined,
-        LOCAL_GATEWAY_TOKEN: "resolved-local-token",
+        gateway: {
+          auth: { mode: "token", token: "   ", password: "" },
+          remote: { token: " ", password: "" },
+        },
       },
-      async () => {
-        const auth = await resolveAuthForTarget(
-          {
-            secrets: {
-              providers: {
-                default: { source: "env" },
-              },
-            },
-            gateway: {
-              auth: {
-                token: { source: "env", provider: "default", id: "LOCAL_GATEWAY_TOKEN" },
-              },
-            },
-          },
-          {
-            id: "localLoopback",
-            kind: "localLoopback",
-            url: "ws://127.0.0.1:18789",
-            active: true,
-          },
-          {},
-        );
-
-        expect(auth).toEqual({ token: "resolved-local-token", password: undefined });
-      },
-    );
+      false,
+    ],
+  ])("summarizes configured credentials for %s", (_name, config, configured) => {
+    expect(configSummary(config)).toMatchObject({
+      authTokenConfigured: configured,
+      authPasswordConfigured: configured,
+      remoteTokenConfigured: configured,
+      remotePasswordConfigured: configured,
+    });
   });
-
   it("resolves remote auth token SecretRef before probing remote targets", async () => {
-    await withEnvAsync(
-      {
-        REMOTE_GATEWAY_TOKEN: "resolved-remote-token",
-      },
-      async () => {
-        const auth = await resolveAuthForTarget(
-          createRemoteGatewayTargetConfig(),
-          createConfigRemoteTarget(),
-          {},
-        );
+    await withEnvAsync({ REMOTE_GATEWAY_TOKEN: "resolved-remote-token" }, async () => {
+      const auth = await resolveAuthForTarget(
+        tokenConfig("remote", "REMOTE_GATEWAY_TOKEN"),
+        makeTarget("configRemote", "wss://remote.example:18789"),
+        {},
+      );
 
-        expect(auth).toEqual({ token: "resolved-remote-token", password: undefined });
-      },
-    );
-  });
-
-  it("resolves remote auth even when local auth mode is none", async () => {
-    await withEnvAsync(
-      {
-        REMOTE_GATEWAY_TOKEN: "resolved-remote-token",
-      },
-      async () => {
-        const auth = await resolveAuthForTarget(
-          createRemoteGatewayTargetConfig({ mode: "none" }),
-          createConfigRemoteTarget(),
-          {},
-        );
-
-        expect(auth).toEqual({ token: "resolved-remote-token", password: undefined });
-      },
-    );
-  });
-
-  it("does not force remote auth type from local auth mode", async () => {
-    const auth = await resolveAuthForTarget(
-      {
-        gateway: {
-          auth: {
-            mode: "password",
-          },
-          remote: {
-            token: "remote-token",
-            password: "remote-password", // pragma: allowlist secret
-          },
-        },
-      },
-      {
-        id: "configRemote",
-        kind: "configRemote",
-        url: "wss://remote.example:18789",
-        active: true,
-      },
-      {},
-    );
-
-    expect(auth).toEqual({ token: "remote-token", password: undefined });
+      expect(auth).toEqual({ token: "resolved-remote-token", password: undefined });
+    });
   });
 
   it("redacts resolver internals from unresolved SecretRef diagnostics", async () => {
     await withEnvAsync(
       {
+        OPENCLAW_GATEWAY_PASSWORD: undefined,
+        OPENCLAW_GATEWAY_TOKEN: undefined,
         MISSING_GATEWAY_TOKEN: undefined,
       },
       async () => {
         const auth = await resolveAuthForTarget(
-          {
-            secrets: {
-              providers: {
-                default: { source: "env" },
-              },
-            },
-            gateway: {
-              auth: {
-                mode: "token",
-                token: { source: "env", provider: "default", id: "MISSING_GATEWAY_TOKEN" },
-              },
-            },
-          },
-          {
-            id: "localLoopback",
-            kind: "localLoopback",
-            url: "ws://127.0.0.1:18789",
-            active: true,
-          },
+          tokenConfig("auth", "MISSING_GATEWAY_TOKEN"),
+          makeTarget("localLoopback", "ws://127.0.0.1:18789"),
           {},
         );
 
-        expect(auth.diagnostics).toContain(
+        expect(auth.diagnostics).toStrictEqual([
           "gateway.auth.token SecretRef is unresolved (env:default:MISSING_GATEWAY_TOKEN).",
-        );
-        expect(auth.diagnostics?.join("\n")).not.toContain("missing or empty");
+        ]);
       },
     );
   });
-});
-
-describe("probe reachability classification", () => {
   it("treats missing-scope RPC failures as scope-limited and reachable", () => {
-    const probe = {
-      ok: false,
-      url: "ws://127.0.0.1:18789",
-      connectLatencyMs: 51,
-      error: "missing scope: operator.read",
-      close: null,
-      health: null,
-      status: null,
-      presence: null,
-      configSnapshot: null,
-    };
+    const probe = connectedProbe("missing scope: operator.read", 51);
 
     expect(isScopeLimitedProbeFailure(probe)).toBe(true);
     expect(isProbeReachable(probe)).toBe(true);
-    expect(renderProbeSummaryLine(probe, false)).toContain("RPC: limited");
+    expect(renderProbeSummaryLine(probe, false)).toBe(
+      "Connect: ok (51ms) · Capability: write-capable · Read check: limited - missing scope: operator.read",
+    );
   });
 
-  it("keeps non-scope RPC failures as unreachable", () => {
+  it("uses structured missing-scope probe details before the display message", () => {
     const probe = {
-      ok: false,
-      url: "ws://127.0.0.1:18789",
-      connectLatencyMs: 43,
-      error: "unknown method: status",
-      close: null,
-      health: null,
-      status: null,
-      presence: null,
-      configSnapshot: null,
+      ...connectedProbe("permission denied", 51),
+      missingScopeErrorDetails: {
+        code: "MISSING_SCOPE" as const,
+        missingScope: "operator.read",
+        requiredScopes: ["operator.read"],
+      },
     };
 
+    expect(isScopeLimitedProbeFailure(probe)).toBe(true);
+  });
+
+  it("treats post-connect read failures as reachable with failed diagnostics", () => {
+    const probe = connectedProbe("unknown method: status", 43, {
+      role: "operator",
+      scopes: [],
+      capability: "connected_no_operator_scope",
+    });
+
     expect(isScopeLimitedProbeFailure(probe)).toBe(false);
+    expect(isPostConnectProbeFailure(probe)).toBe(true);
+    expect(isProbeReachable(probe)).toBe(true);
+    expect(renderProbeSummaryLine(probe, false)).toBe(
+      "Connect: ok (43ms) · Capability: connect-only · Read check: failed - unknown method: status",
+    );
+  });
+
+  it("keeps failed-before-connect probes unreachable", () => {
+    const probe = createUnreachableGatewayProbe("ws://127.0.0.1:18789", "timeout");
+
+    expect(isPostConnectProbeFailure(probe)).toBe(false);
     expect(isProbeReachable(probe)).toBe(false);
-    expect(renderProbeSummaryLine(probe, false)).toContain("RPC: failed");
   });
-});
-
-describe("resolveProbeBudgetMs", () => {
-  it("lets active local loopback probes use the full caller budget", () => {
-    expect(resolveProbeBudgetMs(15_000, { kind: "localLoopback", active: true })).toBe(15_000);
-    expect(resolveProbeBudgetMs(3_000, { kind: "localLoopback", active: true })).toBe(3_000);
-  });
-
-  it("keeps inactive local loopback probes on the short cap", () => {
-    expect(resolveProbeBudgetMs(15_000, { kind: "localLoopback", active: false })).toBe(800);
-    expect(resolveProbeBudgetMs(500, { kind: "localLoopback", active: false })).toBe(500);
+  it.each([
+    [{ mode: "local", tls: { enabled: true } }, undefined, "wss://127.0.0.1:18789"],
+    [{ mode: "local", port: 18789 }, 19080, "ws://127.0.0.1:19080"],
+  ] as const)("resolves local target %j with port override %s", (gateway, port, url) => {
+    const targets = resolveTargets({ gateway }, undefined, port);
+    expect(targets.find((target) => target.id === "localLoopback")?.url).toBe(url);
   });
 
-  it("keeps non-local probe caps unchanged", () => {
-    expect(resolveProbeBudgetMs(15_000, { kind: "configRemote", active: true })).toBe(1_500);
-    expect(resolveProbeBudgetMs(15_000, { kind: "explicit", active: true })).toBe(1_500);
-    expect(resolveProbeBudgetMs(15_000, { kind: "sshTunnel", active: true })).toBe(2_000);
+  it("preserves explicit URL targets when a local port override is also present", () => {
+    const cfg: OpenClawConfig = {
+      gateway: {
+        mode: "remote",
+        port: 18789,
+        remote: { url: "wss://remote.example:18789" },
+      },
+    };
+
+    expect(resolveTargets(cfg, "wss://override.example/ws", 19080)).toEqual([
+      makeTarget("explicit", "wss://override.example/ws"),
+      makeTarget("configRemote", "wss://remote.example:18789"),
+      makeTarget("localLoopback", "ws://127.0.0.1:19080"),
+    ]);
+  });
+  it.each([
+    [15_000, "localLoopback", false, "ws://127.0.0.1:18789", 800],
+    [500, "localLoopback", false, "ws://127.0.0.1:18789", 500],
+    [15_000, "explicit", true, "ws://127.0.0.1:18789", 15_000],
+    [2_500, "explicit", true, "wss://localhost:18789/ws", 2_500],
+    [15_000, "configRemote", false, "wss://gateway.example/ws", 1500],
+    [15_000, "sshTunnel", true, "wss://gateway.example/ws", 2000],
+  ] as const)(
+    "caps %s ms for %s (active=%s, url=%s) at %s ms",
+    (overallMs, kind, active, url, expected) => {
+      expect(resolveProbeBudgetMs(overallMs, { kind, active, url })).toBe(expected);
+    },
+  );
+
+  it("strips a leading ssh command prefix", () => {
+    expect(sanitizeSshTarget("ssh me@studio")).toBe("me@studio");
+    expect(sanitizeSshTarget("  ssh me@studio:2222  ")).toBe("me@studio:2222");
   });
 });

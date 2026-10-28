@@ -1,133 +1,225 @@
 import fs from "node:fs";
-import path from "node:path";
-import type { OpenClawConfig } from "../config/config.js";
-import { resolveOAuthDir } from "../config/paths.js";
-import { DEFAULT_ACCOUNT_ID } from "../routing/session-key.js";
+import os from "node:os";
+import {
+  hasNonEmptyString,
+  normalizeOptionalLowercaseString,
+} from "@openclaw/normalization-core/string-coerce";
+import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
+import { hasMeaningfulChannelConfig } from "../config/channel-config-activation.js";
+import { resolveStateDir } from "../config/paths.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import type { PluginDiscoveryResult } from "../plugins/discovery.js";
+import { listOfficialExternalChannelEnvVars } from "../plugins/official-external-plugin-catalog.js";
+import { isRecord } from "../utils.js";
+import { isChannelConfigMetadataKey } from "./config-metadata.js";
+import { listBundledChannelIds } from "./plugins/bundled-ids.js";
+import {
+  hasBundledChannelPackageState,
+  hasBundledChannelPackageStateAsync,
+  listBundledChannelIdsForPackageState,
+} from "./plugins/package-state-probes.js";
 
-const IGNORED_CHANNEL_CONFIG_KEYS = new Set(["defaults", "modelByChannel"]);
+export { hasMeaningfulChannelConfig } from "../config/channel-config-activation.js";
 
-const CHANNEL_ENV_PREFIXES = [
-  ["BLUEBUBBLES_", "bluebubbles"],
-  ["DISCORD_", "discord"],
-  ["GOOGLECHAT_", "googlechat"],
-  ["IRC_", "irc"],
-  ["LINE_", "line"],
-  ["MATRIX_", "matrix"],
-  ["MSTEAMS_", "msteams"],
-  ["SIGNAL_", "signal"],
-  ["SLACK_", "slack"],
-  ["TELEGRAM_", "telegram"],
-  ["WHATSAPP_", "whatsapp"],
-  ["ZALOUSER_", "zalouser"],
-  ["ZALO_", "zalo"],
-] as const;
+export type AmbientEnvTriggerPolicy = "allow" | "suppress";
 
-function hasNonEmptyString(value: unknown): boolean {
-  return typeof value === "string" && value.trim().length > 0;
-}
+type ChannelPresenceOptions = {
+  channelIds?: readonly string[];
+  /** Canonical channel ids whose persisted credentials may be probed. */
+  persistedAuthChannelIds?: ReadonlySet<string>;
+  discovery?: PluginDiscoveryResult;
+  includePersistedAuthState?: boolean;
+  ambientEnvTriggers?: AmbientEnvTriggerPolicy;
+};
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
+/** Source that made a channel look potentially configured. */
+export type ChannelPresenceSignalSource = "config" | "env" | "persisted-auth";
 
-export function hasMeaningfulChannelConfig(value: unknown): boolean {
-  if (!isRecord(value)) {
-    return false;
+export type ChannelPresenceSignal = {
+  channelId: string;
+  source: ChannelPresenceSignalSource;
+};
+
+/** Lists channels explicitly disabled in config so activation logic can suppress auto-detection. */
+export function listExplicitlyDisabledChannelIdsForConfig(cfg: OpenClawConfig): string[] {
+  const channels = isRecord(cfg.channels) ? cfg.channels : null;
+  if (!channels) {
+    return [];
   }
-  return Object.keys(value).some((key) => key !== "enabled");
+  return Object.entries(channels)
+    .filter(([, value]) => isRecord(value) && value.enabled === false)
+    .map(([channelId]) => channelId.trim())
+    .filter((channelId) => channelId && !isChannelConfigMetadataKey(channelId))
+    .map((channelId) => normalizeOptionalLowercaseString(channelId))
+    .filter((channelId): channelId is string => Boolean(channelId));
 }
 
-function hasWhatsAppAuthState(env: NodeJS.ProcessEnv): boolean {
-  try {
-    const oauthDir = resolveOAuthDir(env);
-    const legacyCreds = path.join(oauthDir, "creds.json");
-    if (fs.existsSync(legacyCreds)) {
-      return true;
-    }
-
-    const accountsRoot = path.join(oauthDir, "whatsapp");
-    const defaultCreds = path.join(accountsRoot, DEFAULT_ACCOUNT_ID, "creds.json");
-    if (fs.existsSync(defaultCreds)) {
-      return true;
-    }
-
-    const entries = fs.readdirSync(accountsRoot, { withFileTypes: true });
-    return entries.some((entry) => {
-      if (!entry.isDirectory()) {
-        return false;
-      }
-      return fs.existsSync(path.join(accountsRoot, entry.name, "creds.json"));
-    });
-  } catch {
-    return false;
-  }
+function listChannelEnvPrefixes(
+  channelIds: readonly string[],
+): Array<[prefix: string, channelId: string]> {
+  // Match channel-owned env namespaces such as MATRIX_* without hardcoding bundled ids here.
+  return channelIds.map((channelId) => [
+    `${channelId.replace(/[^a-z0-9]+/gi, "_").toUpperCase()}_`,
+    channelId,
+  ]);
 }
 
+/** Lists channel ids detected from config, env vars, or persisted auth state. */
 export function listPotentialConfiguredChannelIds(
   cfg: OpenClawConfig,
   env: NodeJS.ProcessEnv = process.env,
+  options: ChannelPresenceOptions = {},
 ): string[] {
-  const configuredChannelIds = new Set<string>();
+  return uniqueStrings(
+    listPotentialConfiguredChannelPresenceSignals(cfg, env, options).map(
+      (signal) => signal.channelId,
+    ),
+  );
+}
+
+/** Lists deduplicated channel presence signals with their detection source. */
+export function listPotentialConfiguredChannelPresenceSignals(
+  cfg: OpenClawConfig,
+  env: NodeJS.ProcessEnv = process.env,
+  options: ChannelPresenceOptions = {},
+): ChannelPresenceSignal[] {
+  const signals = new Map<string, ChannelPresenceSignal>();
+  const addSignal = (rawChannelId: string, source: ChannelPresenceSignalSource) => {
+    const channelId = rawChannelId.trim();
+    if (!channelId || isChannelConfigMetadataKey(channelId)) {
+      return;
+    }
+    const key = `${source}:${channelId}`;
+    if (!signals.has(key)) {
+      signals.set(key, { channelId, source });
+    }
+  };
   const channels = isRecord(cfg.channels) ? cfg.channels : null;
   if (channels) {
     for (const [key, value] of Object.entries(channels)) {
-      if (IGNORED_CHANNEL_CONFIG_KEYS.has(key)) {
+      if (isChannelConfigMetadataKey(key)) {
         continue;
       }
-      if (hasMeaningfulChannelConfig(value)) {
-        configuredChannelIds.add(key);
+      // Shared channel defaults are not concrete channel configuration; only per-channel entries
+      // with meaningful settings should produce presence signals.
+      if (hasMeaningfulChannelConfig(value, key)) {
+        addSignal(key, "config");
       }
     }
   }
 
-  for (const [key, value] of Object.entries(env)) {
-    if (!hasNonEmptyString(value)) {
-      continue;
-    }
-    for (const [prefix, channelId] of CHANNEL_ENV_PREFIXES) {
-      if (key.startsWith(prefix)) {
-        configuredChannelIds.add(channelId);
+  if (options.ambientEnvTriggers !== "suppress") {
+    const scopedChannelIds = options.channelIds
+      ? new Set(
+          options.channelIds
+            .map((channelId) => normalizeOptionalLowercaseString(channelId))
+            .filter((channelId): channelId is string => Boolean(channelId)),
+        )
+      : undefined;
+    const channelEnvPrefixes = listChannelEnvPrefixes(
+      options.channelIds ?? listBundledChannelIds(env, options.discovery),
+    );
+    const officialExternalChannelEnvVars = listOfficialExternalChannelEnvVars().filter(
+      ({ channelId }) => !scopedChannelIds || scopedChannelIds.has(channelId),
+    );
+    for (const [key, value] of Object.entries(env)) {
+      if (!hasNonEmptyString(value)) {
+        continue;
+      }
+      for (const [prefix, channelId] of channelEnvPrefixes) {
+        if (key.startsWith(prefix)) {
+          addSignal(channelId, "env");
+        }
+      }
+      for (const { channelId, envVars } of officialExternalChannelEnvVars) {
+        if (envVars.includes(key)) {
+          addSignal(channelId, "env");
+        }
       }
     }
-    if (key === "TELEGRAM_BOT_TOKEN") {
-      configuredChannelIds.add("telegram");
+  }
+
+  if (
+    options.includePersistedAuthState !== false &&
+    fs.existsSync(resolveStateDir(env, os.homedir))
+  ) {
+    // Persisted auth can make a channel usable even when config/env is empty, but only probe it
+    // when the state directory exists to keep startup/status checks cheap.
+    for (const channelId of listBundledChannelIdsForPackageState(
+      "persistedAuthState",
+      options.discovery,
+    )) {
+      if (
+        options.persistedAuthChannelIds &&
+        !options.persistedAuthChannelIds.has(normalizeOptionalLowercaseString(channelId) ?? "")
+      ) {
+        continue;
+      }
+      if (
+        hasBundledChannelPackageState({
+          metadataKey: "persistedAuthState",
+          channelId,
+          cfg,
+          env,
+          discovery: options.discovery,
+        })
+      ) {
+        addSignal(channelId, "persisted-auth");
+      }
     }
   }
-  if (hasWhatsAppAuthState(env)) {
-    configuredChannelIds.add("whatsapp");
-  }
-  return [...configuredChannelIds];
+
+  return [...signals.values()];
 }
 
-function hasEnvConfiguredChannel(env: NodeJS.ProcessEnv): boolean {
-  for (const [key, value] of Object.entries(env)) {
-    if (!hasNonEmptyString(value)) {
+/** Reads persisted credential presence off-thread before publishing channel signals. */
+export async function listPotentialConfiguredChannelPresenceSignalsAsync(
+  cfg: OpenClawConfig,
+  env: NodeJS.ProcessEnv = process.env,
+  options: ChannelPresenceOptions = {},
+): Promise<ChannelPresenceSignal[]> {
+  const signals = listPotentialConfiguredChannelPresenceSignals(cfg, env, {
+    ...options,
+    includePersistedAuthState: false,
+  });
+  const persistedChannelIds = new Set<string>();
+  if (
+    options.includePersistedAuthState === false ||
+    options.persistedAuthChannelIds?.size === 0 ||
+    !fs.existsSync(resolveStateDir(env, os.homedir))
+  ) {
+    return signals;
+  }
+  for (const channelId of listBundledChannelIdsForPackageState(
+    "persistedAuthState",
+    options.discovery,
+  )) {
+    const normalizedChannelId = channelId.trim();
+    if (
+      !normalizedChannelId ||
+      isChannelConfigMetadataKey(normalizedChannelId) ||
+      persistedChannelIds.has(normalizedChannelId)
+    ) {
       continue;
     }
     if (
-      CHANNEL_ENV_PREFIXES.some(([prefix]) => key.startsWith(prefix)) ||
-      key === "TELEGRAM_BOT_TOKEN"
+      options.persistedAuthChannelIds &&
+      !options.persistedAuthChannelIds.has(normalizeOptionalLowercaseString(channelId) ?? "")
     ) {
-      return true;
+      continue;
+    }
+    if (
+      await hasBundledChannelPackageStateAsync({
+        metadataKey: "persistedAuthState",
+        channelId,
+        cfg,
+        env,
+        discovery: options.discovery,
+      })
+    ) {
+      persistedChannelIds.add(normalizedChannelId);
+      signals.push({ channelId: normalizedChannelId, source: "persisted-auth" });
     }
   }
-  return hasWhatsAppAuthState(env);
-}
-
-export function hasPotentialConfiguredChannels(
-  cfg: OpenClawConfig,
-  env: NodeJS.ProcessEnv = process.env,
-): boolean {
-  const channels = isRecord(cfg.channels) ? cfg.channels : null;
-  if (channels) {
-    for (const [key, value] of Object.entries(channels)) {
-      if (IGNORED_CHANNEL_CONFIG_KEYS.has(key)) {
-        continue;
-      }
-      if (hasMeaningfulChannelConfig(value)) {
-        return true;
-      }
-    }
-  }
-  return hasEnvConfiguredChannel(env);
+  return signals;
 }

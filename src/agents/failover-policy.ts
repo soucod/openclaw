@@ -1,22 +1,29 @@
-import type { FailoverReason } from "./pi-embedded-helpers.js";
+/**
+ * Shared failover policy helpers for auth profile cooldown probing.
+ */
+import type { FailoverReason } from "./failover/signal.js";
 
 export function shouldAllowCooldownProbeForReason(
   reason: FailoverReason | null | undefined,
 ): boolean {
-  return (
-    reason === "rate_limit" ||
-    reason === "overloaded" ||
-    reason === "billing" ||
-    reason === "unknown"
-  );
+  return reason === "billing" || shouldUseTransientCooldownProbeSlot(reason);
 }
 
 export function shouldUseTransientCooldownProbeSlot(
   reason: FailoverReason | null | undefined,
 ): boolean {
-  return reason === "rate_limit" || reason === "overloaded" || reason === "unknown";
+  return (
+    reason === "rate_limit" ||
+    reason === "overloaded" ||
+    reason === "unknown" ||
+    reason === "empty_response" ||
+    reason === "no_error_details" ||
+    reason === "unclassified" ||
+    reason === "timeout"
+  );
 }
 
+/** Returns true when a non-transient failure should leave transient probe budget intact. */
 export function shouldPreserveTransientCooldownProbeSlot(
   reason: FailoverReason | null | undefined,
 ): boolean {
@@ -25,6 +32,7 @@ export function shouldPreserveTransientCooldownProbeSlot(
     reason === "format" ||
     reason === "auth" ||
     reason === "auth_permanent" ||
-    reason === "session_expired"
+    reason === "session_expired" ||
+    reason === "tls_certificate"
   );
 }

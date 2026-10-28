@@ -1,9 +1,10 @@
+// Slack tests cover threading plugin behavior.
 import { describe, expect, it } from "vitest";
-import { resolveSlackThreadContext, resolveSlackThreadTargets } from "./threading.js";
+import { resolveSlackThreadContext } from "./threading.js";
 
-describe("resolveSlackThreadTargets", () => {
-  function expectAutoCreatedTopLevelThreadTsBehavior(replyToMode: "off" | "first") {
-    const { replyThreadTs, statusThreadTs, isThreadReply } = resolveSlackThreadTargets({
+describe("resolveSlackThreadContext", () => {
+  function expectAutoCreatedTopLevelThreadTsBehavior(replyToMode: "off" | "first" | "batched") {
+    const { messageThreadId, isThreadReply } = resolveSlackThreadContext({
       replyToMode,
       message: {
         type: "message",
@@ -14,12 +15,11 @@ describe("resolveSlackThreadTargets", () => {
     });
 
     expect(isThreadReply).toBe(false);
-    expect(replyThreadTs).toBeUndefined();
-    expect(statusThreadTs).toBeUndefined();
+    expect(messageThreadId).toBeUndefined();
   }
 
   it("threads replies when message is already threaded", () => {
-    const { replyThreadTs, statusThreadTs } = resolveSlackThreadTargets({
+    const context = resolveSlackThreadContext({
       replyToMode: "off",
       message: {
         type: "message",
@@ -29,47 +29,14 @@ describe("resolveSlackThreadTargets", () => {
       },
     });
 
-    expect(replyThreadTs).toBe("456");
-    expect(statusThreadTs).toBe("456");
+    expect(context).toMatchObject({
+      isThreadReply: true,
+      messageThreadId: "456",
+      replyToId: "456",
+    });
   });
 
   it("threads top-level replies when mode is all", () => {
-    const { replyThreadTs, statusThreadTs } = resolveSlackThreadTargets({
-      replyToMode: "all",
-      message: {
-        type: "message",
-        channel: "C1",
-        ts: "123",
-      },
-    });
-
-    expect(replyThreadTs).toBe("123");
-    expect(statusThreadTs).toBe("123");
-  });
-
-  it("does not thread status indicator when reply threading is off", () => {
-    const { replyThreadTs, statusThreadTs } = resolveSlackThreadTargets({
-      replyToMode: "off",
-      message: {
-        type: "message",
-        channel: "C1",
-        ts: "123",
-      },
-    });
-
-    expect(replyThreadTs).toBeUndefined();
-    expect(statusThreadTs).toBeUndefined();
-  });
-
-  it("does not treat auto-created top-level thread_ts as a real thread when mode is off", () => {
-    expectAutoCreatedTopLevelThreadTsBehavior("off");
-  });
-
-  it("keeps first-mode behavior for auto-created top-level thread_ts", () => {
-    expectAutoCreatedTopLevelThreadTsBehavior("first");
-  });
-
-  it("sets messageThreadId for top-level messages when replyToMode is all", () => {
     const context = resolveSlackThreadContext({
       replyToMode: "all",
       message: {
@@ -81,22 +48,32 @@ describe("resolveSlackThreadTargets", () => {
 
     expect(context.isThreadReply).toBe(false);
     expect(context.messageThreadId).toBe("123");
-    expect(context.replyToId).toBe("123");
+    expect(context.replyToId).toBeUndefined();
   });
 
-  it("prefers thread_ts as messageThreadId for replies", () => {
-    const context = resolveSlackThreadContext({
-      replyToMode: "off",
-      message: {
-        type: "message",
-        channel: "C1",
-        ts: "123",
-        thread_ts: "456",
-      },
-    });
+  it("does not treat auto-created top-level thread_ts as a real thread when mode is off", () => {
+    expectAutoCreatedTopLevelThreadTsBehavior("off");
+  });
 
-    expect(context.isThreadReply).toBe(true);
-    expect(context.messageThreadId).toBe("456");
-    expect(context.replyToId).toBe("456");
+  it("uses normalized direct-message state for DM assistant thread-root messages", () => {
+    for (const channelType of ["channel", undefined] as const) {
+      const message = {
+        type: "message",
+        channel: "D1",
+        ts: "123",
+        thread_ts: "123",
+        ...(channelType ? { channel_type: channelType } : {}),
+      } as const;
+
+      const context = resolveSlackThreadContext({
+        replyToMode: "off",
+        isDirectMessage: true,
+        message,
+      });
+
+      expect(context.isThreadReply).toBe(false);
+      expect(context.messageThreadId).toBe("123");
+      expect(context.replyToId).toBeUndefined();
+    }
   });
 });

@@ -4,12 +4,12 @@ export type PollInput = {
   maxSelections?: number;
   /**
    * Poll duration in seconds.
-   * Channel-specific limits apply (e.g. Telegram open_period is 5-600s).
+   * Channel-specific limits apply in each owning plugin.
    */
   durationSeconds?: number;
   /**
    * Poll duration in hours.
-   * Used by channels that model duration in hours (e.g. Discord).
+   * Used by channels that model duration in hours.
    */
   durationHours?: number;
 };
@@ -25,6 +25,15 @@ export type NormalizedPollInput = {
 type NormalizePollOptions = {
   maxOptions?: number;
 };
+
+function normalizePollInteger(value: number | undefined, field: string): number | undefined {
+  const normalized =
+    typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : undefined;
+  if (normalized !== undefined && normalized < 1) {
+    throw new Error(`${field} must be at least 1`);
+  }
+  return normalized;
+}
 
 export function resolvePollMaxSelections(
   optionCount: number,
@@ -49,35 +58,13 @@ export function normalizePollInput(
   if (options.maxOptions !== undefined && cleaned.length > options.maxOptions) {
     throw new Error(`Poll supports at most ${options.maxOptions} options`);
   }
-  const maxSelectionsRaw = input.maxSelections;
-  const maxSelections =
-    typeof maxSelectionsRaw === "number" && Number.isFinite(maxSelectionsRaw)
-      ? Math.floor(maxSelectionsRaw)
-      : 1;
-  if (maxSelections < 1) {
-    throw new Error("maxSelections must be at least 1");
-  }
+  const maxSelections = normalizePollInteger(input.maxSelections, "maxSelections") ?? 1;
   if (maxSelections > cleaned.length) {
     throw new Error("maxSelections cannot exceed option count");
   }
 
-  const durationSecondsRaw = input.durationSeconds;
-  const durationSeconds =
-    typeof durationSecondsRaw === "number" && Number.isFinite(durationSecondsRaw)
-      ? Math.floor(durationSecondsRaw)
-      : undefined;
-  if (durationSeconds !== undefined && durationSeconds < 1) {
-    throw new Error("durationSeconds must be at least 1");
-  }
-
-  const durationRaw = input.durationHours;
-  const durationHours =
-    typeof durationRaw === "number" && Number.isFinite(durationRaw)
-      ? Math.floor(durationRaw)
-      : undefined;
-  if (durationHours !== undefined && durationHours < 1) {
-    throw new Error("durationHours must be at least 1");
-  }
+  const durationSeconds = normalizePollInteger(input.durationSeconds, "durationSeconds");
+  const durationHours = normalizePollInteger(input.durationHours, "durationHours");
   if (durationSeconds !== undefined && durationHours !== undefined) {
     throw new Error("durationSeconds and durationHours are mutually exclusive");
   }

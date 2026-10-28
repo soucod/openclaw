@@ -1,188 +1,388 @@
-import type { PollInput } from "../runtime-api.js";
-import { getMatrixRuntime } from "../runtime.js";
+import { parseBuffer, type IFileInfo } from "music-metadata";
+import type { MessageReceiptPartKind } from "openclaw/plugin-sdk/channel-outbound";
+import { isVoiceMessageCompatibleAudio } from "openclaw/plugin-sdk/media-runtime";
+import { loadOutboundMediaFromUrl } from "openclaw/plugin-sdk/outbound-media";
+import { requireRuntimeConfig } from "openclaw/plugin-sdk/plugin-config-runtime";
+import type { PollInput } from "openclaw/plugin-sdk/poll-runtime";
+import { asOptionalObjectRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { CoreConfig } from "../types.js";
+import {
+  createMatrixPlannedEvents,
+  loadMatrixDeliveryPlan,
+  persistMatrixDeliveryPlan,
+  resolveMatrixDurableDeliveryIdentity,
+  type MatrixPreparedEvent,
+} from "./delivery-plan.js";
 import { buildPollStartContent, M_POLL_START } from "./poll-types.js";
 import { buildMatrixReactionContent } from "./reaction-common.js";
-import type { MatrixClient } from "./sdk.js";
-import { resolveMediaMaxBytes, withResolvedMatrixClient } from "./send/client.js";
+import { buildMatrixMessageRelation, resolveMatrixReplyToEventId } from "./relations.js";
+import type { MatrixClient, MatrixRawEvent } from "./sdk.js";
+import { chunkMatrixText, prepareMatrixSingleText } from "./send/chunking.js";
 import {
-  buildReplyRelation,
+  resolveMediaMaxBytes,
+  withResolvedMatrixControlClient,
+  withResolvedMatrixSendClient,
+} from "./send/client.js";
+import { resolveMatrixEditContent } from "./send/edit-content.js";
+import {
   buildTextContent,
-  buildThreadRelation,
+  diffMatrixMentions,
+  enrichMatrixFormattedContent,
+  extractMatrixMentions,
+  resolveMatrixMentionsForBody,
   resolveMatrixMsgType,
-  resolveMatrixVoiceDecision,
 } from "./send/formatting.js";
-import {
-  buildMediaContent,
-  prepareImageInfo,
-  resolveMediaDurationMs,
-  uploadMediaMaybeEncrypted,
-} from "./send/media.js";
+import { prepareImageInfo, uploadMediaWithEncryption } from "./send/media.js";
+import { createMatrixSendReceipt, type MatrixReceiptEvent } from "./send/receipt.js";
 import { normalizeThreadId, resolveMatrixRoomId } from "./send/targets.js";
 import {
   EventType,
+  MSC4357_LIVE_KEY,
   MsgType,
+  RelationType,
+  type MatrixExtraContentFields,
+  type MatrixMediaContent,
   type MatrixOutboundContent,
   type MatrixSendOpts,
   type MatrixSendResult,
+  type MatrixTextMsgType,
 } from "./send/types.js";
 
-const MATRIX_TEXT_LIMIT = 4000;
-const getCore = () => getMatrixRuntime();
-
-export type { MatrixSendOpts, MatrixSendResult } from "./send/types.js";
+export { chunkMatrixText, prepareMatrixSingleText } from "./send/chunking.js";
+export { resolveMatrixMentionsForBody } from "./send/formatting.js";
 export { resolveMatrixRoomId } from "./send/targets.js";
 
-type MatrixClientResolveOpts = {
-  client?: MatrixClient;
-  cfg?: CoreConfig;
-  timeoutMs?: number;
-  accountId?: string | null;
-};
+type MatrixClientResolveOpts = Parameters<typeof withResolvedMatrixControlClient>[0];
 
-function isMatrixClient(value: MatrixClient | MatrixClientResolveOpts): value is MatrixClient {
-  return typeof (value as { sendEvent?: unknown }).sendEvent === "function";
+const AIFC_IMA4_BYTES_PER_CHANNEL_PACKET = 34;
+const AIFC_IMA4_FRAMES_PER_PACKET = 64;
+
+function resolveAifcIma4DurationSeconds(buffer: Buffer, sampleRate?: number): number | undefined {
+  if (
+    !sampleRate ||
+    !Number.isFinite(sampleRate) ||
+    buffer.length < 12 ||
+    buffer.toString("ascii", 0, 4) !== "FORM" ||
+    buffer.toString("ascii", 8, 12) !== "AIFC"
+  ) {
+    return undefined;
+  }
+
+  let channels: number | undefined;
+  let declaredFrameCount: number | undefined;
+  let soundDataBytes: number | undefined;
+  for (let offset = 12; offset + 8 <= buffer.length;) {
+    const chunkType = buffer.toString("ascii", offset, offset + 4);
+    const chunkSize = buffer.readUInt32BE(offset + 4);
+    const chunkStart = offset + 8;
+    if (chunkSize > buffer.length - chunkStart) {
+      return undefined;
+    }
+    if (chunkType === "COMM") {
+      if (chunkSize < 22 || buffer.toString("ascii", chunkStart + 18, chunkStart + 22) !== "ima4") {
+        return undefined;
+      }
+      channels = buffer.readUInt16BE(chunkStart);
+      declaredFrameCount = buffer.readUInt32BE(chunkStart + 2);
+    } else if (chunkType === "SSND") {
+      if (chunkSize < 8) {
+        return undefined;
+      }
+      const soundDataOffset = buffer.readUInt32BE(chunkStart);
+      if (soundDataOffset > chunkSize - 8) {
+        return undefined;
+      }
+      soundDataBytes = chunkSize - 8 - soundDataOffset;
+    }
+    offset = chunkStart + chunkSize + (chunkSize & 1);
+  }
+
+  if (!channels || !declaredFrameCount || !soundDataBytes) {
+    return undefined;
+  }
+  const packetSize = channels * AIFC_IMA4_BYTES_PER_CHANNEL_PACKET;
+  if (soundDataBytes % packetSize !== 0) {
+    return undefined;
+  }
+  const packetCount = soundDataBytes / packetSize;
+  if (packetCount !== declaredFrameCount) {
+    return undefined;
+  }
+  // Apple AIFC stores IMA4 packet count in COMM; each packet decodes to 64
+  // sample frames. Other encoders can store decoded frames, so verify SSND first.
+  return (packetCount * AIFC_IMA4_FRAMES_PER_PACKET) / sampleRate;
 }
 
-function normalizeMatrixClientResolveOpts(
-  opts?: MatrixClient | MatrixClientResolveOpts,
-): MatrixClientResolveOpts {
-  if (!opts) {
+function resolvePreviousThreadId(previousEvent: unknown): string | undefined {
+  const content = asOptionalObjectRecord(asOptionalObjectRecord(previousEvent)?.content);
+  const relation = asOptionalObjectRecord(content?.["m.relates_to"]);
+  if (relation?.rel_type !== RelationType.Thread || typeof relation.event_id !== "string") {
+    return undefined;
+  }
+  return normalizeThreadId(relation.event_id) ?? undefined;
+}
+
+function withMatrixExtraContentFields<T extends Record<string, unknown>>(
+  content: T,
+  extraContent?: MatrixExtraContentFields,
+): T {
+  if (!extraContent) {
+    return content;
+  }
+  return { ...content, ...extraContent };
+}
+
+async function resolvePreviousEditMentions(params: {
+  client: MatrixClient;
+  roomId: string;
+  event: MatrixRawEvent | null;
+}) {
+  const content = await resolveMatrixEditContent(params);
+  if (content && Object.hasOwn(content, "m.mentions")) {
+    return extractMatrixMentions(content);
+  }
+  const body = typeof content?.body === "string" ? content.body : "";
+  if (!body) {
     return {};
   }
-  if (isMatrixClient(opts)) {
-    return { client: opts };
-  }
-  return {
-    client: opts.client,
-    cfg: opts.cfg,
-    timeoutMs: opts.timeoutMs,
-    accountId: opts.accountId,
-  };
+  return await resolveMatrixMentionsForBody({
+    client: params.client,
+    body,
+  });
 }
 
 export async function sendMessageMatrix(
   to: string,
   message: string | undefined,
-  opts: MatrixSendOpts = {},
+  opts: MatrixSendOpts,
 ): Promise<MatrixSendResult> {
-  const trimmedMessage = message?.trim() ?? "";
-  if (!trimmedMessage && !opts.mediaUrl) {
+  const messageText = message?.trimEnd() ?? "";
+  if (!messageText.trim() && !opts.mediaUrl) {
     throw new Error("Matrix send requires text or media");
   }
-  return await withResolvedMatrixClient(
+  const durableIdentity = resolveMatrixDurableDeliveryIdentity({
+    queueId: opts.deliveryQueueId,
+    partIndex: opts.deliveryPartIndex,
+    partCount: opts.deliveryPartCount,
+  });
+  return await withResolvedMatrixSendClient(
     {
       client: opts.client,
       cfg: opts.cfg,
       timeoutMs: opts.timeoutMs,
       accountId: opts.accountId,
+      signal: opts.signal,
+      assertDirectAdapterHandoff: opts.assertDirectAdapterHandoff,
     },
     async (client) => {
       const roomId = await resolveMatrixRoomId(client, to);
-      const cfg = opts.cfg ?? getCore().config.loadConfig();
-      const tableMode = getCore().channel.text.resolveMarkdownTableMode({
-        cfg,
-        channel: "matrix",
-        accountId: opts.accountId,
-      });
-      const convertedMessage = getCore().channel.text.convertMarkdownTables(
-        trimmedMessage,
-        tableMode,
-      );
-      const textLimit = getCore().channel.text.resolveTextChunkLimit(cfg, "matrix", opts.accountId);
-      const chunkLimit = Math.min(textLimit, MATRIX_TEXT_LIMIT);
-      const chunkMode = getCore().channel.text.resolveChunkMode(cfg, "matrix", opts.accountId);
-      const chunks = getCore().channel.text.chunkMarkdownTextWithMode(
-        convertedMessage,
-        chunkLimit,
-        chunkMode,
-      );
+      const wireEventType = await client.prepareRoomForMessageSend(roomId);
+      const cfg = requireRuntimeConfig(opts.cfg, "Matrix send") as CoreConfig;
       const threadId = normalizeThreadId(opts.threadId);
-      const relation = threadId
-        ? buildThreadRelation(threadId, opts.replyToId)
-        : buildReplyRelation(opts.replyToId);
-      const sendContent = async (content: MatrixOutboundContent) => {
-        const eventId = await client.sendMessage(roomId, content);
-        return eventId;
-      };
+      const transactionScopeId = durableIdentity ? await client.getTransactionScopeId() : undefined;
+      const storedPlan = durableIdentity
+        ? await loadMatrixDeliveryPlan({
+            identity: durableIdentity,
+            accountId: opts.accountId,
+            roomId,
+            transactionScopeId: transactionScopeId!,
+            wireEventType: wireEventType!,
+          })
+        : null;
+      let plannedEvents: readonly MatrixPreparedEvent[] | undefined = storedPlan?.events;
+      if (!plannedEvents) {
+        const preparedText = chunkMatrixText(messageText, {
+          cfg,
+          accountId: opts.accountId,
+        });
+        const { chunks, convertedText, preparedBody, fitsInSingleEvent, tableMode } = preparedText;
+        const singleEventBody = fitsInSingleEvent ? preparedBody : undefined;
+        const relation = buildMatrixMessageRelation({ ...opts, threadId });
+        let textChunks = chunks;
+        let textRelation = relation;
+        let pendingExtraContent = opts.extraContent;
+        const events: Omit<MatrixPreparedEvent, "transactionId">[] = [];
+        const prepareContent = async (
+          content: MatrixOutboundContent,
+          receiptKind: MessageReceiptPartKind,
+          markdown: string,
+        ) => {
+          await enrichMatrixFormattedContent({
+            client,
+            content,
+            markdown,
+            preparedBody: markdown === convertedText ? singleEventBody : undefined,
+            tableMode,
+          });
+          events.push({
+            content: withMatrixExtraContentFields(content, pendingExtraContent),
+            receiptKind,
+          });
+          pendingExtraContent = undefined;
+        };
 
-      let lastMessageId = "";
-      if (opts.mediaUrl) {
-        const maxBytes = resolveMediaMaxBytes(opts.accountId, cfg);
-        const media = await getCore().media.loadWebMedia(opts.mediaUrl, {
-          maxBytes,
-          localRoots: opts.mediaLocalRoots,
-        });
-        const uploaded = await uploadMediaMaybeEncrypted(client, roomId, media.buffer, {
-          contentType: media.contentType,
-          filename: media.fileName,
-        });
-        const durationMs = await resolveMediaDurationMs({
-          buffer: media.buffer,
-          contentType: media.contentType,
-          fileName: media.fileName,
-          kind: media.kind ?? "unknown",
-        });
-        const baseMsgType = resolveMatrixMsgType(media.contentType, media.fileName);
-        const { useVoice } = resolveMatrixVoiceDecision({
-          wantsVoice: opts.audioAsVoice === true,
-          contentType: media.contentType,
-          fileName: media.fileName,
-        });
-        const msgtype = useVoice ? MsgType.Audio : baseMsgType;
-        const isImage = msgtype === MsgType.Image;
-        const imageInfo = isImage
-          ? await prepareImageInfo({
-              buffer: media.buffer,
-              client,
-              encrypted: Boolean(uploaded.file),
-            })
-          : undefined;
-        const [firstChunk, ...rest] = chunks;
-        const body = useVoice ? "Voice message" : (firstChunk ?? media.fileName ?? "(file)");
-        const content = buildMediaContent({
-          msgtype,
-          body,
-          url: uploaded.url,
-          file: uploaded.file,
-          filename: media.fileName,
-          mimetype: media.contentType,
-          size: media.buffer.byteLength,
-          durationMs,
-          relation,
-          isVoice: useVoice,
-          imageInfo,
-        });
-        const eventId = await sendContent(content);
-        lastMessageId = eventId ?? lastMessageId;
-        const textChunks = useVoice ? chunks : rest;
-        // Voice messages use a generic media body ("Voice message"), so keep any
-        // transcript follow-up attached to the same reply/thread context.
-        const followupRelation = useVoice || threadId ? relation : undefined;
+        if (opts.mediaUrl) {
+          const maxBytes = resolveMediaMaxBytes(opts.accountId, cfg);
+          const media = await loadOutboundMediaFromUrl(opts.mediaUrl, {
+            maxBytes,
+            mediaAccess: opts.mediaAccess,
+            mediaLocalRoots: opts.mediaLocalRoots,
+            mediaReadFile: opts.mediaReadFile,
+          });
+          const uploaded = await uploadMediaWithEncryption(client, roomId, media.buffer, {
+            contentType: media.contentType,
+            filename: media.fileName,
+          });
+          let durationMs: number | undefined;
+          if (media.kind === "audio" || media.kind === "video") {
+            try {
+              const fileInfo: IFileInfo | string | undefined =
+                media.contentType || media.fileName
+                  ? {
+                      mimeType: media.contentType,
+                      size: media.buffer.byteLength,
+                      path: media.fileName,
+                    }
+                  : undefined;
+              const metadata = await parseBuffer(media.buffer, fileInfo, {
+                duration: true,
+                skipCovers: true,
+              });
+              const durationSeconds =
+                resolveAifcIma4DurationSeconds(media.buffer, metadata.format.sampleRate) ??
+                metadata.format.duration;
+              if (typeof durationSeconds === "number" && Number.isFinite(durationSeconds)) {
+                durationMs = Math.max(0, Math.round(durationSeconds * 1000));
+              }
+            } catch {
+              // Duration is optional; ignore parse failures.
+            }
+          }
+          const baseMsgType = resolveMatrixMsgType(media.contentType);
+          const useVoice = opts.audioAsVoice === true && isVoiceMessageCompatibleAudio(media);
+          const msgtype = useVoice ? MsgType.Audio : baseMsgType;
+          const receiptKind: MessageReceiptPartKind = useVoice ? "voice" : "media";
+          const imageInfo =
+            msgtype === MsgType.Image
+              ? await prepareImageInfo({
+                  buffer: media.buffer,
+                  client,
+                  roomId,
+                })
+              : undefined;
+          const [firstChunk, ...rest] = chunks;
+          const captionMarkdown = useVoice ? "" : (firstChunk ?? "");
+          const content: MatrixMediaContent = {
+            msgtype,
+            body: useVoice ? "Voice message" : captionMarkdown || media.fileName || "(file)",
+            filename: media.fileName,
+            info: {
+              size: media.buffer.byteLength,
+              ...(media.contentType ? { mimetype: media.contentType } : {}),
+              ...imageInfo,
+              ...(typeof durationMs === "number" ? { duration: durationMs } : {}),
+            },
+          };
+          // Encrypted media should only include the "file" payload, not top-level "url".
+          if (!uploaded.file && uploaded.url) {
+            content.url = uploaded.url;
+          }
+          if (uploaded.file) {
+            content.file = uploaded.file;
+          }
+          if (useVoice) {
+            content["org.matrix.msc3245.voice"] = {};
+            if (typeof durationMs === "number") {
+              content["org.matrix.msc1767.audio"] = {
+                duration: durationMs,
+              };
+            }
+          }
+          if (relation) {
+            content["m.relates_to"] = relation;
+          }
+          await prepareContent(content, receiptKind, captionMarkdown);
+          textChunks = useVoice ? chunks : rest;
+          textRelation = useVoice || threadId ? relation : undefined;
+        }
         for (const chunk of textChunks) {
-          const text = chunk.trim();
-          if (!text) {
+          if (!chunk.trim()) {
             continue;
           }
-          const followup = buildTextContent(text, followupRelation);
-          const followupEventId = await sendContent(followup);
-          lastMessageId = followupEventId ?? lastMessageId;
+          await prepareContent(buildTextContent(chunk, textRelation), "text", chunk);
         }
-      } else {
-        for (const chunk of chunks.length ? chunks : [""]) {
-          const text = chunk.trim();
-          if (!text) {
-            continue;
-          }
-          const content = buildTextContent(text, relation);
-          const eventId = await sendContent(content);
-          lastMessageId = eventId ?? lastMessageId;
+        plannedEvents = durableIdentity
+          ? createMatrixPlannedEvents({ identity: durableIdentity, events })
+          : events.map((event) => ({
+              content: event.content,
+              receiptKind: event.receiptKind,
+              transactionId: "",
+            }));
+      }
+
+      if (opts.mediaUrl) {
+        await client.prepareRoomForMessageSend(roomId, plannedEvents[0]?.content);
+      }
+      const acceptedEvents: MatrixReceiptEvent[] = [];
+      const acceptedContents: string[] = [];
+      let lastMessageId = "";
+      for (const planned of plannedEvents) {
+        const eventId = await client.sendMessage(
+          roomId,
+          planned.content,
+          planned.transactionId || undefined,
+          durableIdentity
+            ? async (dispatch) => {
+                await persistMatrixDeliveryPlan({
+                  identity: durableIdentity,
+                  accountId: opts.accountId,
+                  roomId,
+                  transactionScopeId: transactionScopeId!,
+                  wireEventType: dispatch.eventType,
+                  events: plannedEvents,
+                  dispatch,
+                });
+                await opts.onPlatformSendDispatch?.();
+              }
+            : opts.onPlatformSendDispatch,
+        );
+        lastMessageId = eventId || lastMessageId;
+        if (!eventId) {
+          continue;
         }
+        // Media captions and text follow-ups can intentionally have different reply relations.
+        const eventReplyToId = resolveMatrixReplyToEventId(planned.content);
+        const acceptedEvent: MatrixReceiptEvent = {
+          messageId: eventId,
+          kind: planned.receiptKind,
+          ...(eventReplyToId ? { replyToId: eventReplyToId } : {}),
+        };
+        acceptedEvents.push(acceptedEvent);
+        const visibleContent = planned.content.body ?? "";
+        acceptedContents.push(visibleContent);
+        await opts.onDeliveryResult?.({
+          messageId: eventId,
+          roomId,
+          primaryMessageId: eventId,
+          receipt: createMatrixSendReceipt({
+            roomId,
+            events: [acceptedEvent],
+            threadId,
+          }),
+          content: visibleContent,
+        });
       }
 
       return {
         messageId: lastMessageId || "unknown",
         roomId,
+        primaryMessageId: acceptedEvents[0]?.messageId ?? (lastMessageId || "unknown"),
+        receipt: createMatrixSendReceipt({
+          roomId,
+          events: acceptedEvents,
+          threadId,
+        }),
+        content: acceptedContents.join("\n"),
       };
     },
   );
@@ -191,7 +391,7 @@ export async function sendMessageMatrix(
 export async function sendPollMatrix(
   to: string,
   poll: PollInput,
-  opts: MatrixSendOpts = {},
+  opts: MatrixSendOpts,
 ): Promise<{ eventId: string; roomId: string }> {
   if (!poll.question?.trim()) {
     throw new Error("Matrix poll requires a question");
@@ -199,7 +399,7 @@ export async function sendPollMatrix(
   if (!poll.options?.length) {
     throw new Error("Matrix poll requires options");
   }
-  return await withResolvedMatrixClient(
+  return await withResolvedMatrixSendClient(
     {
       client: opts.client,
       cfg: opts.cfg,
@@ -209,10 +409,17 @@ export async function sendPollMatrix(
     async (client) => {
       const roomId = await resolveMatrixRoomId(client, to);
       const pollContent = buildPollStartContent(poll);
+      const fallbackText =
+        pollContent["m.text"] ?? pollContent["org.matrix.msc1767.text"] ?? poll.question ?? "";
+      const mentions = await resolveMatrixMentionsForBody({
+        client,
+        body: fallbackText,
+      });
       const threadId = normalizeThreadId(opts.threadId);
-      const pollPayload = threadId
-        ? { ...pollContent, "m.relates_to": buildThreadRelation(threadId) }
-        : pollContent;
+      const pollPayload: Record<string, unknown> = threadId
+        ? { ...pollContent, "m.relates_to": buildMatrixMessageRelation({ threadId }) }
+        : { ...pollContent };
+      pollPayload["m.mentions"] = mentions;
       const eventId = await client.sendEvent(roomId, M_POLL_START, pollPayload);
 
       return {
@@ -226,20 +433,13 @@ export async function sendPollMatrix(
 export async function sendTypingMatrix(
   roomId: string,
   typing: boolean,
-  timeoutMs?: number,
-  client?: MatrixClient,
+  opts: MatrixClientResolveOpts = {},
 ): Promise<void> {
-  await withResolvedMatrixClient(
-    {
-      client,
-      timeoutMs,
-    },
-    async (resolved) => {
-      const resolvedRoom = await resolveMatrixRoomId(resolved, roomId);
-      const resolvedTimeoutMs = typeof timeoutMs === "number" ? timeoutMs : 30_000;
-      await resolved.setTyping(resolvedRoom, typing, resolvedTimeoutMs);
-    },
-  );
+  await withResolvedMatrixControlClient(opts, async (resolved) => {
+    const resolvedRoom = await resolveMatrixRoomId(resolved, roomId);
+    const resolvedTimeoutMs = typeof opts.timeoutMs === "number" ? opts.timeoutMs : 30_000;
+    await resolved.setTyping(resolvedRoom, typing, resolvedTimeoutMs);
+  });
 }
 
 export async function sendReadReceiptMatrix(
@@ -250,25 +450,210 @@ export async function sendReadReceiptMatrix(
   if (!eventId?.trim()) {
     return;
   }
-  await withResolvedMatrixClient({ client }, async (resolved) => {
+  await withResolvedMatrixControlClient({ client }, async (resolved) => {
     const resolvedRoom = await resolveMatrixRoomId(resolved, roomId);
     await resolved.sendReadReceipt(resolvedRoom, eventId.trim());
   });
+}
+
+export async function sendSingleTextMessageMatrix(
+  roomId: string,
+  text: string,
+  opts: {
+    client?: MatrixClient;
+    cfg: CoreConfig;
+    replyToId?: string;
+    threadId?: string;
+    accountId?: string;
+    msgtype?: MatrixTextMsgType;
+    includeMentions?: boolean;
+    extraContent?: MatrixExtraContentFields;
+    /** When true, marks the message as a live/streaming update (MSC4357). */
+    live?: boolean;
+  },
+): Promise<MatrixSendResult> {
+  const {
+    trimmedText,
+    convertedText,
+    preparedBody,
+    singleEventLimit,
+    eventTextLength,
+    fitsInSingleEvent,
+    tableMode,
+  } = prepareMatrixSingleText(text.trimEnd(), {
+    cfg: opts.cfg,
+    accountId: opts.accountId,
+  });
+  if (!trimmedText.trim()) {
+    throw new Error("Matrix single-message send requires text");
+  }
+  if (!fitsInSingleEvent) {
+    throw new Error(
+      `Matrix single-message text exceeds limit (${eventTextLength} > ${singleEventLimit})`,
+    );
+  }
+  return await withResolvedMatrixSendClient(
+    {
+      client: opts.client,
+      cfg: opts.cfg,
+      accountId: opts.accountId,
+    },
+    async (client) => {
+      const resolvedRoom = await resolveMatrixRoomId(client, roomId);
+      const normalizedThreadId = normalizeThreadId(opts.threadId);
+      const relation = buildMatrixMessageRelation({ ...opts, threadId: normalizedThreadId });
+      const content = withMatrixExtraContentFields(
+        buildTextContent(convertedText, relation, {
+          msgtype: opts.msgtype,
+        }),
+        opts.extraContent,
+      );
+      await enrichMatrixFormattedContent({
+        client,
+        content,
+        markdown: convertedText,
+        preparedBody,
+        includeMentions: opts.includeMentions,
+        tableMode,
+      });
+      // MSC4357: mark the initial message as live so supporting clients start
+      // rendering a streaming animation immediately.
+      if (opts.live) {
+        (content as Record<string, unknown>)[MSC4357_LIVE_KEY] = {};
+      }
+      const eventId = await client.sendMessage(resolvedRoom, content);
+      const replyToId = resolveMatrixReplyToEventId(content);
+      return {
+        messageId: eventId ?? "unknown",
+        roomId: resolvedRoom,
+        primaryMessageId: eventId ?? "unknown",
+        receipt: createMatrixSendReceipt({
+          roomId: resolvedRoom,
+          events: eventId
+            ? [{ messageId: eventId, kind: "text", ...(replyToId ? { replyToId } : {}) }]
+            : [],
+          threadId: normalizedThreadId,
+        }),
+        content: content.body,
+      };
+    },
+  );
+}
+
+export async function editMessageMatrix(
+  roomId: string,
+  originalEventId: string,
+  newText: string,
+  opts: {
+    client?: MatrixClient;
+    cfg: CoreConfig;
+    threadId?: string;
+    accountId?: string;
+    timeoutMs?: number;
+    msgtype?: MatrixTextMsgType;
+    includeMentions?: boolean;
+    extraContent?: MatrixExtraContentFields;
+    /** When true, marks the edit as a live/streaming update (MSC4357). */
+    live?: boolean;
+  },
+): Promise<string> {
+  return await withResolvedMatrixSendClient(
+    {
+      client: opts.client,
+      cfg: opts.cfg,
+      accountId: opts.accountId,
+      timeoutMs: opts.timeoutMs,
+    },
+    async (client) => {
+      const resolvedRoom = await resolveMatrixRoomId(client, roomId);
+      const cfg = requireRuntimeConfig(opts.cfg, "Matrix message edit") as CoreConfig;
+      const { convertedText, preparedBody, tableMode } = prepareMatrixSingleText(newText, {
+        cfg,
+        accountId: opts.accountId,
+      });
+      const newContent = withMatrixExtraContentFields(
+        buildTextContent(convertedText, undefined, {
+          msgtype: opts.msgtype,
+        }),
+        opts.extraContent,
+      );
+      await enrichMatrixFormattedContent({
+        client,
+        content: newContent,
+        markdown: convertedText,
+        preparedBody,
+        includeMentions: opts.includeMentions,
+        tableMode,
+      });
+      const threadId = normalizeThreadId(opts.threadId);
+      const previousEvent =
+        opts.includeMentions !== false || threadId
+          ? ((await client.getEvent(resolvedRoom, originalEventId)) as MatrixRawEvent)
+          : null;
+      const replaceMentions =
+        opts.includeMentions === false
+          ? undefined
+          : diffMatrixMentions(
+              extractMatrixMentions(newContent),
+              await resolvePreviousEditMentions({
+                client,
+                roomId: resolvedRoom,
+                event: previousEvent,
+              }),
+            );
+
+      const replaceRelation: Record<string, unknown> = {
+        rel_type: RelationType.Replace,
+        event_id: originalEventId,
+      };
+      if (threadId) {
+        // Matrix applies m.new_content while preserving the original relation.
+        // Edits can update threaded events, but cannot add or move thread membership.
+        if (resolvePreviousThreadId(previousEvent) !== threadId) {
+          throw new Error("Matrix edit cannot add or change the original event thread relation.");
+        }
+      }
+
+      // Spread newContent into the outer event so clients that don't support
+      // m.new_content still see properly formatted text (with HTML).
+      const content: Record<string, unknown> = {
+        ...newContent,
+        body: `* ${newContent.body}`,
+        ...(typeof newContent.formatted_body === "string"
+          ? { formatted_body: `* ${newContent.formatted_body}` }
+          : {}),
+        "m.new_content": newContent,
+        "m.relates_to": replaceRelation,
+      };
+      if (replaceMentions !== undefined) {
+        content["m.mentions"] = replaceMentions;
+      }
+
+      // MSC4357: mark in-progress edits so supporting clients can render a
+      // streaming animation. The marker is placed in both the outer content
+      // (for unencrypted rooms / server-side aggregation) and inside
+      // m.new_content (for E2EE rooms where only decrypted content is read).
+      if (opts.live) {
+        content[MSC4357_LIVE_KEY] = {};
+        (content["m.new_content"] as Record<string, unknown>)[MSC4357_LIVE_KEY] = {};
+      }
+
+      const eventId = await client.sendMessage(resolvedRoom, content);
+      return eventId ?? "";
+    },
+  );
 }
 
 export async function reactMatrixMessage(
   roomId: string,
   messageId: string,
   emoji: string,
-  opts?: MatrixClient | MatrixClientResolveOpts,
+  opts: MatrixClientResolveOpts = {},
 ): Promise<void> {
-  const clientOpts = normalizeMatrixClientResolveOpts(opts);
-  await withResolvedMatrixClient(
+  await withResolvedMatrixSendClient(
     {
-      client: clientOpts.client,
-      cfg: clientOpts.cfg,
-      timeoutMs: clientOpts.timeoutMs,
-      accountId: clientOpts.accountId ?? undefined,
+      ...opts,
+      accountId: opts.accountId ?? undefined,
     },
     async (resolved) => {
       const resolvedRoom = await resolveMatrixRoomId(resolved, roomId);

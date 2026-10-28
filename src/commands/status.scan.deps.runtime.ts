@@ -1,34 +1,7 @@
-import type { OpenClawConfig } from "../config/config.js";
-import { getTailnetHostname } from "../infra/tailscale.js";
-import { getMemorySearchManager as getMemorySearchManagerImpl } from "../memory/index.js";
-import type { MemoryProviderStatus } from "../memory/types.js";
+// Keeps plugin/runtime modules outside the core scan files until a caller needs them.
 
-export { getTailnetHostname };
-
-type StatusMemoryManager = {
-  probeVectorAvailability(): Promise<boolean>;
-  status(): MemoryProviderStatus;
-  close?(): Promise<void>;
-};
-
-export async function getMemorySearchManager(params: {
-  cfg: OpenClawConfig;
-  agentId: string;
-  purpose: "status";
-}): Promise<{ manager: StatusMemoryManager | null }> {
-  const { manager } = await getMemorySearchManagerImpl(params);
-  if (!manager) {
-    return { manager: null };
-  }
-  return {
-    manager: {
-      async probeVectorAvailability() {
-        return await manager.probeVectorAvailability();
-      },
-      status() {
-        return manager.status();
-      },
-      close: manager.close ? async () => await manager.close?.() : undefined,
-    },
-  };
-}
+export {
+  getActiveMemoryProviderCore as getMemoryProvider,
+  getActiveMemorySearchManagerCore as getMemorySearchManager,
+  isActiveMemoryProviderNative as isMemoryProviderNative,
+} from "../plugins/memory-runtime.js";

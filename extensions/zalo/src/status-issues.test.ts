@@ -1,11 +1,15 @@
-import { describe, expect, it } from "vitest";
-import { expectOpenDmPolicyConfigIssue } from "../../../test/helpers/extensions/status-issues.js";
-import { collectZaloStatusIssues } from "./status-issues.js";
+// Zalo tests cover status issues plugin behavior.
+import assert from "node:assert/strict";
+import { expectOpenDmPolicyConfigIssue } from "openclaw/plugin-sdk/channel-test-helpers";
+import { describe, it } from "vitest";
+import { zaloPlugin } from "./channel.js";
 
 describe("collectZaloStatusIssues", () => {
   it("warns when dmPolicy is open", () => {
+    const collectIssues = zaloPlugin.status?.collectStatusIssues;
+    assert(collectIssues);
     expectOpenDmPolicyConfigIssue({
-      collectIssues: collectZaloStatusIssues,
+      collectIssues,
       account: {
         accountId: "default",
         enabled: true,
@@ -13,17 +17,5 @@ describe("collectZaloStatusIssues", () => {
         dmPolicy: "open",
       },
     });
-  });
-
-  it("skips unconfigured accounts", () => {
-    const issues = collectZaloStatusIssues([
-      {
-        accountId: "default",
-        enabled: true,
-        configured: false,
-        dmPolicy: "open",
-      },
-    ]);
-    expect(issues).toHaveLength(0);
   });
 });

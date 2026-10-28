@@ -2,14 +2,10 @@ import fs from "node:fs";
 import fsPromises from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { createRuntimeSpies } from "../../test-support/runtime-spies.js";
 
-const runtime = {
-  log: vi.fn(),
-  error: vi.fn(),
-  exit: vi.fn(),
-};
-const WEB_LOGOUT_TEST_TIMEOUT_MS = 15_000;
+const runtime = createRuntimeSpies();
 
 describe("web logout", () => {
   let fixtureRoot = "";
@@ -18,47 +14,39 @@ describe("web logout", () => {
 
   beforeAll(async () => {
     fixtureRoot = await fsPromises.mkdtemp(path.join(os.tmpdir(), "openclaw-test-web-logout-"));
+    vi.stubEnv("OPENCLAW_OAUTH_DIR", path.join(fixtureRoot, "oauth"));
     ({ logoutWeb } = await import("./auth-store.js"));
   });
 
   afterAll(async () => {
+    vi.unstubAllEnvs();
     await fsPromises.rm(fixtureRoot, { recursive: true, force: true });
   });
 
-  const makeCaseDir = async () => {
-    const dir = path.join(fixtureRoot, `case-${caseId++}`);
+  const createAuthCase = async (files: Record<string, string> = {}, external = false) => {
+    const parent = external ? "external" : "oauth/whatsapp";
+    const dir = path.join(fixtureRoot, parent, `case-${caseId++}`);
     await fsPromises.mkdir(dir, { recursive: true });
+    await Promise.all(
+      Object.entries(files).map(async ([name, contents]) => {
+        await fsPromises.mkdir(path.dirname(path.join(dir, name)), { recursive: true });
+        await fsPromises.writeFile(path.join(dir, name), contents, "utf-8");
+      }),
+    );
     return dir;
   };
 
-  const createAuthCase = async (files: Record<string, string>) => {
-    const authDir = await makeCaseDir();
-    await Promise.all(
-      Object.entries(files).map(async ([name, contents]) => {
-        await fsPromises.writeFile(path.join(authDir, name), contents, "utf-8");
-      }),
-    );
-    return authDir;
+  const expectPreserved = async (authDir: string, targetDir: string, files: string[]) => {
+    expect(await logoutWeb({ authDir, runtime })).toBe(false);
+    for (const file of [authDir, ...files.map((name) => path.join(targetDir, name))]) {
+      expect(fs.existsSync(file)).toBe(true);
+    }
   };
 
   beforeEach(() => {
+    vi.stubEnv("OPENCLAW_OAUTH_DIR", path.join(fixtureRoot, "oauth"));
     vi.clearAllMocks();
   });
-
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
-
-  it(
-    "deletes cached credentials when present",
-    { timeout: WEB_LOGOUT_TEST_TIMEOUT_MS },
-    async () => {
-      const authDir = await createAuthCase({ "creds.json": "{}" });
-      const result = await logoutWeb({ authDir, runtime: runtime as never });
-      expect(result).toBe(true);
-      expect(fs.existsSync(authDir)).toBe(false);
-    },
-  );
 
   it("removes oauth.json too when not using legacy auth dir", async () => {
     const authDir = await createAuthCase({
@@ -66,33 +54,43 @@ describe("web logout", () => {
       "oauth.json": '{"token":true}',
       "session-abc.json": "{}",
     });
-    const result = await logoutWeb({ authDir, runtime: runtime as never });
-    expect(result).toBe(true);
+    expect(await logoutWeb({ authDir, runtime })).toBe(true);
     expect(fs.existsSync(authDir)).toBe(false);
   });
 
-  it("no-ops when nothing to delete", { timeout: WEB_LOGOUT_TEST_TIMEOUT_MS }, async () => {
-    const authDir = await makeCaseDir();
-    const result = await logoutWeb({ authDir, runtime: runtime as never });
-    expect(result).toBe(false);
+  it("no-ops when nothing to delete", { timeout: 15_000 }, async () => {
+    expect(await logoutWeb({ authDir: await createAuthCase(), runtime })).toBe(false);
     expect(runtime.log).toHaveBeenCalled();
   });
 
-  it("keeps shared oauth.json when using legacy auth dir", async () => {
-    const credsDir = await createAuthCase({
+  it("does not delete custom auth directories outside the OpenClaw auth root", async () => {
+    const files = {
       "creds.json": "{}",
       "oauth.json": '{"token":true}',
-      "session-abc.json": "{}",
-    });
+      "notes.txt": "keep",
+      "nested/session-abc.json": "keep",
+    };
+    const authDir = await createAuthCase(files, true);
+    await expectPreserved(authDir, authDir, Object.keys(files));
+  });
 
-    const result = await logoutWeb({
-      authDir: credsDir,
-      isLegacyAuthDir: true,
-      runtime: runtime as never,
-    });
-    expect(result).toBe(true);
-    expect(fs.existsSync(path.join(credsDir, "oauth.json"))).toBe(true);
-    expect(fs.existsSync(path.join(credsDir, "creds.json"))).toBe(false);
-    expect(fs.existsSync(path.join(credsDir, "session-abc.json"))).toBe(false);
+  it.each([
+    { kind: "auth-directory", suffix: "" },
+    { kind: "intermediate", suffix: "default" },
+  ])("does not delete through $kind symlinks inside the auth root", async ({ suffix }) => {
+    const externalRoot = await createAuthCase(
+      {
+        [path.join(suffix, "creds.json")]: "{}",
+        [path.join(suffix, "notes.txt")]: "keep",
+      },
+      true,
+    );
+    const link = path.join(fixtureRoot, "oauth", "whatsapp", `linked-${caseId++}`);
+    await fsPromises.mkdir(path.dirname(link), { recursive: true });
+    await fsPromises.symlink(externalRoot, link, "dir");
+    await expectPreserved(path.join(link, suffix), path.join(externalRoot, suffix), [
+      "creds.json",
+      "notes.txt",
+    ]);
   });
 });

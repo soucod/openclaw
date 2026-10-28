@@ -1,4 +1,5 @@
 import { normalizeCommandBody, type CommandNormalizeOptions } from "../commands-registry.js";
+import { matchSlashCommandToken } from "./commands-slash-parse.js";
 
 const BTW_COMMAND_RE = /^\/btw(?::|\s|$)/i;
 
@@ -10,17 +11,9 @@ export function isBtwRequestText(text?: string, options?: CommandNormalizeOption
   return BTW_COMMAND_RE.test(normalized);
 }
 
-export function extractBtwQuestion(
-  text?: string,
-  options?: CommandNormalizeOptions,
-): string | null {
+export function extractBtwQuestion(text?: string): string | null {
   if (!text) {
     return null;
   }
-  const normalized = normalizeCommandBody(text, options).trim();
-  const match = normalized.match(/^\/btw(?:\s+(.*))?$/i);
-  if (!match) {
-    return null;
-  }
-  return match[1]?.trim() ?? "";
+  return matchSlashCommandToken(normalizeCommandBody(text), "/btw");
 }

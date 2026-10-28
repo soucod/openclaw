@@ -1,32 +1,46 @@
-import type { AssistantMessage } from "@mariozechner/pi-ai";
-import type { OpenClawConfig } from "../../config/config.js";
+import { asPositiveFiniteNumber } from "@openclaw/normalization-core/number-coercion";
+import {
+  filterStringEntries,
+  normalizeUniqueTrimmedStringList,
+} from "@openclaw/normalization-core/string-normalization";
 import {
   resolveAgentModelFallbackValues,
   resolveAgentModelPrimaryValue,
 } from "../../config/model-input.js";
-import { extractAssistantText } from "../pi-embedded-utils.js";
+import type { AgentModelConfig } from "../../config/types.agents-shared.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import type { Context } from "../../llm/types.js";
+import { renderDocumentTruncationNotice } from "../../media/document-extraction-metadata.js";
+import type { PdfExtractedContent } from "../../media/pdf-extract.js";
+import { wrapExternalContent } from "../../security/external-content.js";
 
-export type PdfModelConfig = { primary?: string; fallbacks?: string[] };
+type PdfModelConfig = Exclude<AgentModelConfig, string>;
 
-/**
- * Providers known to support native PDF document input.
- * When the model's provider is in this set, the tool sends raw PDF bytes
- * via provider-specific API calls instead of extracting text/images first.
- */
-export const NATIVE_PDF_PROVIDERS = new Set(["anthropic", "google"]);
-
-/**
- * Check whether a provider supports native PDF document input.
- */
-export function providerSupportsNativePdf(provider: string): boolean {
-  return NATIVE_PDF_PROVIDERS.has(provider.toLowerCase().trim());
+export function resolvePdfInputs(record: Record<string, unknown>): string[] {
+  const pdfInputs = normalizeUniqueTrimmedStringList([
+    record.pdf,
+    ...filterStringEntries(record.pdfs),
+  ]);
+  if (pdfInputs.length === 0) {
+    throw new Error("pdf required: provide a path or URL to a PDF document");
+  }
+  return pdfInputs;
 }
 
-/**
- * Parse a page range string (e.g. "1-5", "3", "1-3,7-9") into an array of 1-based page numbers.
- */
-export function parsePageRange(range: string, maxPages: number): number[] {
-  const pages = new Set<number>();
+function readPageNumber(value: string, errorLabel: string): number {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
+    throw new Error(`${errorLabel}: "${value}"`);
+  }
+  return parsed;
+}
+
+/** Parses a page range into at most `maxPages` sorted, unique, 1-based page numbers. */
+export function parsePageRange(
+  range: string,
+  maxPages: number,
+): { pages: number[]; truncated: boolean } {
+  const ranges: [number, number][] = [];
   const parts = range.split(",").map((p) => p.trim());
   for (const part of parts) {
     if (!part) {
@@ -34,51 +48,34 @@ export function parsePageRange(range: string, maxPages: number): number[] {
     }
     const dashMatch = /^(\d+)\s*-\s*(\d+)$/.exec(part);
     if (dashMatch) {
-      const start = Number(dashMatch[1]);
-      const end = Number(dashMatch[2]);
-      if (!Number.isFinite(start) || !Number.isFinite(end) || start < 1 || end < start) {
+      const start = readPageNumber(dashMatch[1] ?? "", "Invalid page range");
+      const end = readPageNumber(dashMatch[2] ?? "", "Invalid page range");
+      if (end < start) {
         throw new Error(`Invalid page range: "${part}"`);
       }
-      for (let i = start; i <= Math.min(end, maxPages); i++) {
-        pages.add(i);
-      }
+      ranges.push([start, end]);
     } else {
-      const num = Number(part);
-      if (!Number.isFinite(num) || num < 1) {
+      if (!/^\d+$/.test(part)) {
         throw new Error(`Invalid page number: "${part}"`);
       }
-      if (num <= maxPages) {
-        pages.add(num);
-      }
+      const num = readPageNumber(part, "Invalid page number");
+      ranges.push([num, num]);
     }
   }
-  return Array.from(pages).toSorted((a, b) => a - b);
-}
-
-export function coercePdfAssistantText(params: {
-  message: AssistantMessage;
-  provider: string;
-  model: string;
-}): string {
-  const label = `${params.provider}/${params.model}`;
-  const errorMessage = params.message.errorMessage?.trim();
-  const fail = (message?: string) => {
-    throw new Error(
-      message ? `PDF model failed (${label}): ${message}` : `PDF model failed (${label})`,
-    );
-  };
-  if (params.message.stopReason === "error" || params.message.stopReason === "aborted") {
-    fail(errorMessage);
+  ranges.sort(([left], [right]) => left - right);
+  const pages: number[] = [];
+  for (const [start, end] of ranges) {
+    for (let page = Math.max(start, (pages.at(-1) ?? 0) + 1); page <= end; page++) {
+      if (pages.length >= maxPages) {
+        return { pages, truncated: true };
+      }
+      pages.push(page);
+    }
   }
-  if (errorMessage) {
-    fail(errorMessage);
+  if (pages.length === 0) {
+    throw new Error(`No PDF pages matched requested range "${range}"`);
   }
-  const text = extractAssistantText(params.message);
-  const trimmed = text.trim();
-  if (trimmed) {
-    return trimmed;
-  }
-  throw new Error(`PDF model returned no text (${label}).`);
+  return { pages, truncated: false };
 }
 
 export function coercePdfModelConfig(cfg?: OpenClawConfig): PdfModelConfig {
@@ -94,16 +91,47 @@ export function coercePdfModelConfig(cfg?: OpenClawConfig): PdfModelConfig {
   return modelConfig;
 }
 
-export function resolvePdfToolMaxTokens(
-  modelMaxTokens: number | undefined,
-  requestedMaxTokens = 4096,
-) {
-  if (
-    typeof modelMaxTokens !== "number" ||
-    !Number.isFinite(modelMaxTokens) ||
-    modelMaxTokens <= 0
-  ) {
-    return requestedMaxTokens;
+export function resolvePdfToolMaxTokens(modelMaxTokens: number | undefined) {
+  return Math.min(4096, asPositiveFiniteNumber(modelMaxTokens) ?? 4096);
+}
+
+const CODEX_PDF_INSTRUCTIONS =
+  "Analyze the provided PDF content and answer the user's request accurately.";
+
+export function buildPdfExtractionContext(
+  prompt: string,
+  extractions: PdfExtractedContent[],
+  explicitSelectionLimit?: number,
+  model?: { api?: string },
+): Context {
+  const content: Array<
+    { type: "text"; text: string } | { type: "image"; data: string; mimeType: string }
+  > = [];
+
+  for (const [i, extraction] of extractions.entries()) {
+    const notice = renderDocumentTruncationNotice(extraction.metadata, explicitSelectionLimit);
+    if (extraction.text.trim() || notice) {
+      const label = extractions.length > 1 ? `[PDF ${i + 1} text]\n` : "[PDF text]\n";
+      const text = extraction.text.trim()
+        ? wrapExternalContent(extraction.text, { source: "unknown", includeWarning: false })
+        : undefined;
+      content.push({
+        type: "text",
+        text: label + [notice, text].filter(Boolean).join("\n"),
+      });
+    }
+    for (const img of extraction.images) {
+      content.push({ type: "image", data: img.data, mimeType: img.mimeType });
+    }
   }
-  return Math.min(requestedMaxTokens, modelMaxTokens);
+
+  content.push({ type: "text", text: prompt });
+
+  const systemPrompt =
+    model?.api === "openai-chatgpt-responses" ? CODEX_PDF_INSTRUCTIONS : undefined;
+
+  return {
+    ...(systemPrompt ? { systemPrompt } : {}),
+    messages: [{ role: "user", content, timestamp: Date.now() }],
+  };
 }

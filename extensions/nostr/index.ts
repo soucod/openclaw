@@ -1,48 +1,59 @@
-import { defineChannelPluginEntry } from "openclaw/plugin-sdk/core";
-import { nostrPlugin } from "./src/channel.js";
-import type { NostrProfile } from "./src/config-schema.js";
-import { createNostrProfileHttpHandler } from "./src/nostr-profile-http.js";
-import { getNostrRuntime, setNostrRuntime } from "./src/runtime.js";
-import { resolveNostrAccount } from "./src/types.js";
+import {
+  defineBundledChannelEntry,
+  loadBundledEntryExportSync,
+} from "openclaw/plugin-sdk/channel-entry-contract";
 
-export { nostrPlugin } from "./src/channel.js";
-export { setNostrRuntime } from "./src/runtime.js";
-
-export default defineChannelPluginEntry({
+export default defineBundledChannelEntry({
   id: "nostr",
   name: "Nostr",
   description: "Nostr DM channel plugin via NIP-04",
-  plugin: nostrPlugin,
-  setRuntime: setNostrRuntime,
+  importMetaUrl: import.meta.url,
+  plugin: {
+    specifier: "./channel-plugin-api.js",
+    exportName: "nostrPlugin",
+  },
+  secrets: {
+    specifier: "./secret-contract-api.js",
+    exportName: "channelSecrets",
+  },
+  runtime: {
+    specifier: "./api.js",
+    exportName: "setNostrRuntime",
+  },
   registerFull(api) {
+    const { createNostrProfileHttpHandler, getNostrRuntime, resolveNostrAccount } =
+      loadBundledEntryExportSync<typeof import("./api.js")>(import.meta.url, {
+        specifier: "./api.js",
+      });
     const httpHandler = createNostrProfileHttpHandler({
-      getConfigProfile: (accountId: string) => {
+      getConfigProfile: (accountId) => {
         const runtime = getNostrRuntime();
-        const cfg = runtime.config.loadConfig();
+        const cfg = runtime.config.current();
         const account = resolveNostrAccount({ cfg, accountId });
         return account.profile;
       },
-      updateConfigProfile: async (accountId: string, profile: NostrProfile) => {
+      updateConfigProfile: async (_accountId, profile) => {
         const runtime = getNostrRuntime();
-        const cfg = runtime.config.loadConfig();
 
-        const channels = (cfg.channels ?? {}) as Record<string, unknown>;
-        const nostrConfig = (channels.nostr ?? {}) as Record<string, unknown>;
+        await runtime.config.mutateConfigFile({
+          afterWrite: { mode: "auto" },
+          mutate: (draft) => {
+            const channels = (draft.channels ?? {}) as Record<string, unknown>;
+            const nostrConfig = (channels.nostr ?? {}) as Record<string, unknown>;
 
-        await runtime.config.writeConfigFile({
-          ...cfg,
-          channels: {
-            ...channels,
-            nostr: {
-              ...nostrConfig,
-              profile,
-            },
+            draft.channels = {
+              ...channels,
+              nostr: {
+                ...nostrConfig,
+                profile,
+              },
+            };
           },
         });
       },
-      getAccountInfo: (accountId: string) => {
+      getAccountInfo: (accountId) => {
         const runtime = getNostrRuntime();
-        const cfg = runtime.config.loadConfig();
+        const cfg = runtime.config.current();
         const account = resolveNostrAccount({ cfg, accountId });
         if (!account.configured || !account.publicKey) {
           return null;
@@ -59,6 +70,7 @@ export default defineChannelPluginEntry({
       path: "/api/channels/nostr",
       auth: "gateway",
       match: "prefix",
+      gatewayRuntimeScopeSurface: "trusted-operator",
       handler: httpHandler,
     });
   },

@@ -1,26 +1,29 @@
-import {
-  describeImageWithModel,
-  describeImagesWithModel,
-  transcribeOpenAiCompatibleAudio,
-  type AudioTranscriptionRequest,
-  type MediaUnderstandingProvider,
-} from "openclaw/plugin-sdk/media-understanding";
-import { OPENAI_DEFAULT_AUDIO_TRANSCRIPTION_MODEL } from "openclaw/plugin-sdk/provider-models";
-
-export const DEFAULT_OPENAI_AUDIO_BASE_URL = "https://api.openai.com/v1";
-
-export async function transcribeOpenAiAudio(params: AudioTranscriptionRequest) {
-  return await transcribeOpenAiCompatibleAudio({
-    ...params,
-    defaultBaseUrl: DEFAULT_OPENAI_AUDIO_BASE_URL,
-    defaultModel: OPENAI_DEFAULT_AUDIO_TRANSCRIPTION_MODEL,
-  });
-}
+import type { MediaUnderstandingProvider } from "openclaw/plugin-sdk/media-understanding";
+import { OPENAI_DEFAULT_AUDIO_TRANSCRIPTION_MODEL } from "./default-models.js";
 
 export const openaiMediaUnderstandingProvider: MediaUnderstandingProvider = {
   id: "openai",
   capabilities: ["image", "audio"],
-  describeImage: describeImageWithModel,
-  describeImages: describeImagesWithModel,
-  transcribeAudio: transcribeOpenAiAudio,
+  defaultModels: { image: "gpt-6-astra", audio: OPENAI_DEFAULT_AUDIO_TRANSCRIPTION_MODEL },
+  autoPriority: { image: 20, audio: 20 },
+  async describeImage(req) {
+    const { describeImageWithModel } = await import("openclaw/plugin-sdk/media-understanding");
+    return describeImageWithModel(req);
+  },
+  async describeImages(req) {
+    const { describeImagesWithModel } = await import("openclaw/plugin-sdk/media-understanding");
+    return describeImagesWithModel(req);
+  },
+  async transcribeAudio(req) {
+    const { transcribeOpenAiAudio } = await import("./audio-transcription.js");
+    return transcribeOpenAiAudio(req);
+  },
+  async transcribeAudioWithContext(context) {
+    const { transcribeOpenAiAudioWithContext } = await import("./audio-transcription.js");
+    return transcribeOpenAiAudioWithContext(context);
+  },
+  async isAudioConfigured(context) {
+    const { isOpenAiAudioConfigured } = await import("./audio-transcription.js");
+    return isOpenAiAudioConfigured(context);
+  },
 };

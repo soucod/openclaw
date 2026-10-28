@@ -8,91 +8,59 @@ const repoRoot = resolve(fileURLToPath(new URL(".", import.meta.url)), "..");
 
 const DIGEST_PINNED_DOCKERFILES = [
   "Dockerfile",
-  "Dockerfile.sandbox",
-  "Dockerfile.sandbox-browser",
+  "scripts/docker/sandbox/Dockerfile",
+  "scripts/docker/sandbox/Dockerfile.browser",
   "scripts/docker/cleanup-smoke/Dockerfile",
   "scripts/docker/install-sh-e2e/Dockerfile",
   "scripts/docker/install-sh-nonroot/Dockerfile",
   "scripts/docker/install-sh-smoke/Dockerfile",
   "scripts/e2e/Dockerfile",
   "scripts/e2e/Dockerfile.qr-import",
+  "scripts/e2e/plugin-binding-command-escape.Dockerfile",
 ] as const;
 
-type DependabotDockerGroup = {
-  patterns?: string[];
-};
-
-type DependabotUpdate = {
-  "package-ecosystem"?: string;
-  directory?: string;
-  schedule?: { interval?: string };
-  groups?: Record<string, DependabotDockerGroup>;
-};
-
-type DependabotConfig = {
-  updates?: DependabotUpdate[];
-};
-
-function resolveFirstFromReference(dockerfile: string): string | undefined {
+function digestReferences(dockerfile: string): string[] {
+  const lines = dockerfile.split(/\r?\n/).map((line) => line.trim());
   const argDefaults = new Map<string, string>();
-
-  for (const line of dockerfile.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed) {
-      continue;
+  for (const line of lines) {
+    const match = line.match(/^ARG\s+([A-Z0-9_]+)=(.+)$/);
+    if (match?.[1] && match[2]) {
+      argDefaults.set(match[1], match[2].replace(/^["']|["']$/g, ""));
     }
-    if (trimmed.startsWith("FROM ")) {
-      break;
-    }
-    const argMatch = trimmed.match(/^ARG\s+([A-Z0-9_]+)=(.+)$/);
-    if (!argMatch) {
-      continue;
-    }
-    const [, name, rawValue] = argMatch;
-    const value = rawValue.replace(/^["']|["']$/g, "");
-    argDefaults.set(name, value);
   }
-
-  const fromLine = dockerfile.split(/\r?\n/).find((line) => line.trimStart().startsWith("FROM "));
-  if (!fromLine) {
-    return undefined;
-  }
-
-  const fromMatch = fromLine.trim().match(/^FROM\s+(\S+?)(?:\s+AS\s+\S+)?$/);
-  if (!fromMatch) {
-    return undefined;
-  }
-  const imageRef = fromMatch[1];
-  const argName =
-    imageRef.match(/^\$\{([A-Z0-9_]+)\}$/)?.[1] ?? imageRef.match(/^\$([A-Z0-9_]+)$/)?.[1];
-
-  if (!argName) {
-    return imageRef;
-  }
-  return argDefaults.get(argName);
+  const fromLines = lines.filter((line) => line.startsWith("FROM "));
+  expect(fromLines.length, "Dockerfile should define a FROM line").toBeGreaterThan(0);
+  // Check the base and every ARG-backed stage; later literal stages may be scratch or aliases.
+  return fromLines
+    .filter((line, index) => index === 0 || /FROM\s+\$(?:\{[A-Z0-9_]+\}|[A-Z0-9_]+)/.test(line))
+    .map((line) => {
+      const image = line.match(/^FROM\s+(\S+?)(?:\s+AS\s+\S+)?$/)?.[1] ?? line;
+      const arg = image.match(/^\$(?:\{([A-Z0-9_]+)\}|([A-Z0-9_]+))$/);
+      return arg ? (argDefaults.get(arg[1] ?? arg[2] ?? "") ?? image) : image;
+    });
 }
 
 describe("docker base image pinning", () => {
-  it("pins selected Dockerfile FROM lines to immutable sha256 digests", async () => {
+  it("pins the base and every ARG-backed FROM stage to immutable sha256 digests", async () => {
     for (const dockerfilePath of DIGEST_PINNED_DOCKERFILES) {
       const dockerfile = await readFile(resolve(repoRoot, dockerfilePath), "utf8");
-      const imageRef = resolveFirstFromReference(dockerfile);
-      expect(imageRef, `${dockerfilePath} should define a FROM line`).toBeDefined();
-      expect(imageRef, `${dockerfilePath} FROM must be digest-pinned`).toMatch(
-        /^\S+@sha256:[a-f0-9]{64}$/,
-      );
+      for (const imageRef of digestReferences(dockerfile)) {
+        expect(imageRef, `${dockerfilePath} FROM ${imageRef} must be digest-pinned`).toMatch(
+          /^\S+@sha256:[a-f0-9]{64}$/,
+        );
+      }
     }
   });
 
   it("keeps Dependabot Docker updates enabled for root Dockerfiles", async () => {
     const raw = await readFile(resolve(repoRoot, ".github/dependabot.yml"), "utf8");
-    const config = parse(raw) as DependabotConfig;
+    const config: { updates?: { "package-ecosystem"?: string; directory?: string }[] } = parse(raw);
     const dockerUpdate = config.updates?.find(
       (update) => update["package-ecosystem"] === "docker" && update.directory === "/",
     );
-
-    expect(dockerUpdate).toBeDefined();
-    expect(dockerUpdate?.schedule?.interval).toBe("weekly");
-    expect(dockerUpdate?.groups?.["docker-images"]?.patterns).toContain("*");
+    expect(dockerUpdate).toMatchObject({
+      schedule: { interval: "weekly" },
+      groups: { "docker-images": { patterns: expect.arrayContaining(["*"]) } },
+    });
   });
 });

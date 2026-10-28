@@ -1,379 +1,438 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { GATEWAY_CLIENT_MODES, GATEWAY_CLIENT_NAMES } from "../../utils/message-channel.js";
+import { beforeEach, expect, it, vi } from "vitest";
+import type { ReplyPayload } from "../../auto-reply/reply-payload.js";
+import type { ChannelPlugin } from "../../channels/plugins/types.public.js";
+import { setActivePluginRegistry } from "../../plugins/runtime.js";
+import {
+  createChannelTestPluginBase,
+  createTestRegistry,
+} from "../../test-utils/channel-plugins.js";
+import { executePollAction, executeSendAction } from "./outbound-send-service.js";
 
 const mocks = vi.hoisted(() => ({
-  getDefaultMediaLocalRoots: vi.fn(() => []),
-  dispatchChannelMessageAction: vi.fn(),
-  sendMessage: vi.fn(),
-  sendPoll: vi.fn(),
-  getAgentScopedMediaLocalRoots: vi.fn(() => ["/tmp/agent-roots"]),
-  appendAssistantMessageToSessionTranscript: vi.fn(async () => ({ ok: true, sessionFile: "x" })),
+  dispatch: vi.fn(),
+  send: vi.fn<typeof import("./message.js").sendMessage>(),
+  poll: vi.fn(),
+  access: { localRoots: ["/agent"], readFile: async () => Buffer.from("capability") },
+  resolveAccess:
+    vi.fn<typeof import("../../media/read-capability.js").resolveAgentScopedOutboundMediaAccess>(),
+  commit: vi.fn<
+    typeof import("../../sessions/confirmed-visible-message.js").commitConfirmedVisibleMessage
+  >(async () => ({ ok: true })),
 }));
-
+// mock-isolation: Exercise send-service routing without invoking real channel actions.
 vi.mock("../../channels/plugins/message-action-dispatch.js", () => ({
-  dispatchChannelMessageAction: mocks.dispatchChannelMessageAction,
+  dispatchChannelMessageAction: mocks.dispatch,
+}));
+// mock-isolation: Capture outbound sends and polls without contacting a provider.
+vi.mock("./message.js", () => ({ sendMessage: mocks.send, sendPoll: mocks.poll }));
+// mock-isolation: Use fixture-owned media access without reading host files.
+vi.mock("../../media/read-capability.js", () => ({
+  createAgentScopedHostMediaReadFile: () => mocks.access.readFile,
+  resolveAgentScopedOutboundMediaAccess: mocks.resolveAccess,
+}));
+// mock-isolation: Capture destination history without a session store.
+vi.mock("../../sessions/confirmed-visible-message.js", () => ({
+  commitConfirmedVisibleMessage: mocks.commit,
 }));
 
-vi.mock("./message.js", () => ({
-  sendMessage: mocks.sendMessage,
-  sendPoll: mocks.sendPoll,
-}));
+type Send = Parameters<typeof executeSendAction>[0];
+type Context = Omit<Partial<Send["ctx"]>, "input"> & { input?: Partial<Send["ctx"]["input"]> };
+const destination = { to: "channel:123", message: "hello" };
+const basePlugin = createChannelTestPluginBase({ id: "demo" });
+const sent = { channel: "demo", to: destination.to, via: "direct" as const, mediaUrl: null };
+const poll = {
+  to: destination.to,
+  question: "Lunch?",
+  options: ["Pizza", "Sushi"],
+  maxSelections: 1,
+};
+const gateway: NonNullable<Context["gateway"]> = {
+  url: "http://127.0.0.1:18789",
+  token: "tok",
+  clientName: "gateway-client",
+  mode: "backend",
+};
+const requester = {
+  requesterSenderId: "attacker",
+  requesterSenderName: "Alice",
+  requesterSenderUsername: "alice_u",
+  requesterSenderE164: "+15551234567",
+};
+const sourceSession = "agent:main:directchat:group:ops";
+const transcriptRoute = {
+  sessionKey: "agent:main:demo:channel:123",
+  baseSessionKey: "agent:main:demo:channel:123",
+  peer: { kind: "channel" as const, id: "123" },
+  chatType: "channel" as const,
+  from: "demo:channel:123",
+  to: destination.to,
+};
+const chart: ReplyPayload["presentation"] = {
+  blocks: [
+    {
+      type: "chart",
+      chartType: "pie",
+      title: "Revenue",
+      segments: [{ label: "Product", value: 60 }],
+    },
+  ],
+};
+const presentation: ReplyPayload["presentation"] = { blocks: [{ type: "text", text: "Portable" }] };
 
-vi.mock("../../media/local-roots.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../../media/local-roots.js")>();
+function context({ input, ...overrides }: Context = {}): Send["ctx"] {
+  const cfg = overrides.cfg ?? {};
+  const params = overrides.params ?? destination;
   return {
-    ...actual,
-    getDefaultMediaLocalRoots: mocks.getDefaultMediaLocalRoots,
-    getAgentScopedMediaLocalRoots: mocks.getAgentScopedMediaLocalRoots,
+    channelPlugin: basePlugin,
+    channel: overrides.channelPlugin?.id ?? basePlugin.id,
+    dryRun: false,
+    ...overrides,
+    cfg,
+    params,
+    input: { cfg, action: "send", params, ...input },
   };
+}
+function send(ctx: Context = {}, input: Partial<Omit<Send, "ctx">> = {}) {
+  return executeSendAction({ ...destination, ...input, ctx: context(ctx) });
+}
+function plugin(
+  mode?: "direct" | "gateway",
+  actions: Partial<NonNullable<ChannelPlugin["actions"]>> = {},
+): ChannelPlugin {
+  return {
+    ...basePlugin,
+    actions: { describeMessageTool: () => ({ actions: ["send"] }), ...actions },
+    ...(mode
+      ? {
+          outbound: {
+            deliveryMode: mode,
+            sendText: async () => ({ channel: "demo", messageId: "sent" }),
+          },
+        }
+      : {}),
+  };
+}
+function expectCall(mock: { mock: { calls: unknown[][] } }, expected: Record<string, unknown>) {
+  expect(mock).toHaveBeenCalledWith(expect.objectContaining(expected));
+}
+
+beforeEach(() => {
+  setActivePluginRegistry(createTestRegistry([]));
+  vi.clearAllMocks();
+  mocks.dispatch.mockResolvedValue({ ok: true, value: { messageId: "plugin" } });
+  mocks.send.mockResolvedValue(sent);
+  mocks.resolveAccess.mockReturnValue(mocks.access);
 });
 
-vi.mock("../../config/sessions.js", () => ({
-  appendAssistantMessageToSessionTranscript: mocks.appendAssistantMessageToSessionTranscript,
-}));
+it("reports the transport's effective text", async () => {
+  mocks.dispatch.mockResolvedValue(null);
+  mocks.send.mockImplementationOnce(async ({ onDeliveredPayload }) => {
+    onDeliveredPayload?.({ text: "[Peer] hello", mediaUrls: [] });
+    return { ...sent, deliveryStatus: "sent" };
+  });
+  expect((await send()).deliveredText).toBe("[Peer] hello");
+});
 
-type OutboundSendServiceModule = typeof import("./outbound-send-service.js");
+it("forces durable core delivery and accepts the route before publishing its receipt", async () => {
+  const order: string[] = [];
+  const evidence = { channel: "demo", messageId: "sent" };
+  const onDeliveryIntent = vi.fn();
+  const onDeliveryResult = vi.fn(async () => {
+    order.push("receipt");
+  });
+  mocks.send.mockImplementationOnce(async (params) => {
+    await params.onDeliveryResult?.(evidence);
+    return sent;
+  });
+  await send({
+    onSendAccepted: async () => {
+      order.push("route");
+    },
+    input: { requireQueuePersistence: true, onDeliveryIntent, onDeliveryResult },
+  });
+  expect(mocks.dispatch).not.toHaveBeenCalled();
+  expectCall(mocks.send, {
+    queuePolicy: "required",
+    requireUnknownSendReconciliation: false,
+    onDeliveryIntent,
+  });
+  expect(order).toEqual(["route", "receipt"]);
+  expect(onDeliveryResult).toHaveBeenCalledWith(evidence);
+});
 
-let executePollAction: OutboundSendServiceModule["executePollAction"];
-let executeSendAction: OutboundSendServiceModule["executeSendAction"];
-
-describe("executeSendAction", () => {
-  function pluginActionResult(messageId: string) {
-    return {
-      ok: true,
-      value: { messageId },
-      continuePrompt: "",
-      output: "",
-      sessionId: "s1",
-      model: "gpt-5.4",
-      usage: {},
-    };
+it.each([
+  ["core", "source-account"],
+  ["core", undefined],
+  ["plugin", "source-account"],
+  ["plugin", undefined],
+] as const)("scopes %s media to requester %s", async (route, account) => {
+  if (route === "core") {
+    mocks.dispatch.mockResolvedValue(null);
   }
-
-  function expectMirrorWrite(
-    expected: Partial<{
-      agentId: string;
-      sessionKey: string;
-      text: string;
-      idempotencyKey: string;
-      mediaUrls: string[];
-    }>,
-  ) {
-    expect(mocks.appendAssistantMessageToSessionTranscript).toHaveBeenCalledWith(
-      expect.objectContaining(expected),
-    );
-  }
-
-  async function executePluginMirroredSend(params: {
-    mirror?: Partial<{
-      sessionKey: string;
-      agentId?: string;
-      idempotencyKey?: string;
-    }>;
-    mediaUrls?: string[];
-  }) {
-    mocks.dispatchChannelMessageAction.mockResolvedValue(pluginActionResult("msg-plugin"));
-
-    await executeSendAction({
-      ctx: {
-        cfg: {},
-        channel: "discord",
-        params: { to: "channel:123", message: "hello" },
-        dryRun: false,
-        mirror: {
-          sessionKey: "agent:main:discord:channel:123",
-          ...params.mirror,
-        },
-      },
-      to: "channel:123",
-      message: "hello",
-      mediaUrls: params.mediaUrls,
-    });
-  }
-
-  beforeEach(async () => {
-    vi.resetModules();
-    ({ executePollAction, executeSendAction } = await import("./outbound-send-service.js"));
-    mocks.dispatchChannelMessageAction.mockClear();
-    mocks.sendMessage.mockClear();
-    mocks.sendPoll.mockClear();
-    mocks.getDefaultMediaLocalRoots.mockClear();
-    mocks.getAgentScopedMediaLocalRoots.mockClear();
-    mocks.appendAssistantMessageToSessionTranscript.mockClear();
+  await send({
+    accountId: "destination-account",
+    agentId: "work",
+    conversationType: "channel",
+    params: { media: "/host.png" },
+    input: { sessionKey: sourceSession, requesterAccountId: account, ...requester },
   });
-
-  it("forwards ctx.agentId to sendMessage on core outbound path", async () => {
-    mocks.dispatchChannelMessageAction.mockResolvedValue(null);
-    mocks.sendMessage.mockResolvedValue({
-      channel: "discord",
-      to: "channel:123",
-      via: "direct",
-      mediaUrl: null,
-    });
-
-    await executeSendAction({
-      ctx: {
-        cfg: {},
-        channel: "discord",
-        params: {},
-        agentId: "work",
-        dryRun: false,
-      },
-      to: "channel:123",
-      message: "hello",
-    });
-
-    expect(mocks.sendMessage).toHaveBeenCalledWith(
-      expect.objectContaining({
-        agentId: "work",
-        channel: "discord",
-        to: "channel:123",
-        content: "hello",
-      }),
-    );
-  });
-
-  it("uses plugin poll action when available", async () => {
-    mocks.dispatchChannelMessageAction.mockResolvedValue(pluginActionResult("poll-plugin"));
-
-    const result = await executePollAction({
-      ctx: {
-        cfg: {},
-        channel: "discord",
-        params: {},
-        dryRun: false,
-      },
-      resolveCorePoll: () => ({
-        to: "channel:123",
-        question: "Lunch?",
-        options: ["Pizza", "Sushi"],
-        maxSelections: 1,
-      }),
-    });
-
-    expect(result.handledBy).toBe("plugin");
-    expect(mocks.sendPoll).not.toHaveBeenCalled();
-  });
-
-  it("does not invoke shared poll parsing before plugin poll dispatch", async () => {
-    mocks.dispatchChannelMessageAction.mockResolvedValue(pluginActionResult("poll-plugin"));
-    const resolveCorePoll = vi.fn(() => {
-      throw new Error("shared poll fallback should not run");
-    });
-
-    const result = await executePollAction({
-      ctx: {
-        cfg: {},
-        channel: "discord",
-        params: {
-          pollQuestion: "Lunch?",
-          pollOption: ["Pizza", "Sushi"],
-          pollDurationSeconds: 90,
-          pollPublic: true,
-        },
-        dryRun: false,
-      },
-      resolveCorePoll,
-    });
-
-    expect(result.handledBy).toBe("plugin");
-    expect(resolveCorePoll).not.toHaveBeenCalled();
-    expect(mocks.sendPoll).not.toHaveBeenCalled();
-  });
-
-  it("passes agent-scoped media local roots to plugin dispatch", async () => {
-    mocks.dispatchChannelMessageAction.mockResolvedValue(pluginActionResult("msg-plugin"));
-
-    await executeSendAction({
-      ctx: {
-        cfg: {},
-        channel: "discord",
-        params: { to: "channel:123", message: "hello" },
-        agentId: "agent-1",
-        dryRun: false,
-      },
-      to: "channel:123",
-      message: "hello",
-    });
-
-    expect(mocks.getAgentScopedMediaLocalRoots).toHaveBeenCalledWith({}, "agent-1");
-    expect(mocks.dispatchChannelMessageAction).toHaveBeenCalledWith(
-      expect.objectContaining({
-        mediaLocalRoots: ["/tmp/agent-roots"],
-      }),
-    );
-  });
-
-  it("passes mirror idempotency keys through plugin-handled sends", async () => {
-    await executePluginMirroredSend({
-      mirror: {
-        idempotencyKey: "idem-plugin-send-1",
-      },
-    });
-
-    expectMirrorWrite({
-      sessionKey: "agent:main:discord:channel:123",
-      text: "hello",
-      idempotencyKey: "idem-plugin-send-1",
-    });
-  });
-
-  it("falls back to message and media params for plugin-handled mirror writes", async () => {
-    await executePluginMirroredSend({
-      mirror: {
-        agentId: "agent-9",
-      },
-      mediaUrls: ["https://example.com/a.png", "https://example.com/b.png"],
-    });
-
-    expectMirrorWrite({
-      agentId: "agent-9",
-      sessionKey: "agent:main:discord:channel:123",
-      text: "hello",
-      mediaUrls: ["https://example.com/a.png", "https://example.com/b.png"],
-    });
-  });
-
-  it("skips plugin dispatch during dry-run sends and forwards gateway + silent to sendMessage", async () => {
-    mocks.sendMessage.mockResolvedValue({
-      channel: "discord",
-      to: "channel:123",
-      via: "gateway",
-      mediaUrl: null,
-    });
-
-    await executeSendAction({
-      ctx: {
-        cfg: {},
-        channel: "discord",
-        params: { to: "channel:123", message: "hello" },
-        dryRun: true,
-        silent: true,
-        gateway: {
-          url: "http://127.0.0.1:18789",
-          token: "tok",
-          timeoutMs: 5000,
-          clientName: GATEWAY_CLIENT_NAMES.GATEWAY_CLIENT,
-          mode: GATEWAY_CLIENT_MODES.BACKEND,
-        },
-      },
-      to: "channel:123",
-      message: "hello",
-    });
-
-    expect(mocks.dispatchChannelMessageAction).not.toHaveBeenCalled();
-    expect(mocks.sendMessage).toHaveBeenCalledWith(
-      expect.objectContaining({
-        to: "channel:123",
-        content: "hello",
-        dryRun: true,
-        silent: true,
-        gateway: expect.objectContaining({
-          url: "http://127.0.0.1:18789",
-          token: "tok",
-          timeoutMs: 5000,
+  expectCall(route === "core" ? mocks.send : mocks.resolveAccess, {
+    ...requester,
+    ...(route === "core"
+      ? {
+          requesterSessionKey: sourceSession,
+          requesterAccountId: account ?? "destination-account",
+          accountId: "destination-account",
+          agentId: "work",
+          conversationType: "channel",
+        }
+      : {
+          sessionKey: sourceSession,
+          accountId: account ?? "destination-account",
+          messageProvider: undefined,
         }),
-      }),
-    );
   });
+});
 
-  it("forwards poll args to sendPoll on core outbound path", async () => {
-    mocks.dispatchChannelMessageAction.mockResolvedValue(null);
-    mocks.sendPoll.mockResolvedValue({
-      channel: "discord",
-      to: "channel:123",
-      question: "Lunch?",
-      options: ["Pizza", "Sushi"],
-      maxSelections: 1,
-      durationSeconds: null,
-      durationHours: null,
-      via: "gateway",
-    });
-
-    await executePollAction({
-      ctx: {
-        cfg: {},
-        channel: "discord",
-        params: {},
-        accountId: "acc-1",
-        dryRun: false,
+it.each([
+  ["direct", "", presentation, ""],
+  ["gateway", "Trend", chart, "Trend\n\nRevenue (pie chart)\n- Product: 60"],
+] as const)(
+  "routes %s presentations through core delivery",
+  async (mode, message, value, content) => {
+    const payload = { text: message, presentation: value };
+    const result = await send(
+      {
+        channelPlugin: plugin(mode),
+        params: { to: destination.to, presentation: value },
+        transcriptRoute,
+        input: { runId: "presentation" },
       },
-      resolveCorePoll: () => ({
-        to: "channel:123",
-        question: "Lunch?",
-        options: ["Pizza", "Sushi"],
-        maxSelections: 1,
+      { message, payload },
+    );
+    expect(result.handledBy).toBe("core");
+    expect(mocks.dispatch).not.toHaveBeenCalled();
+    expectCall(mocks.send, {
+      content,
+      payloads: [payload],
+      transcriptRoute,
+      runId: "presentation",
+    });
+  },
+);
+
+it("materializes charts for action-only plugins", async () => {
+  const result = await send(
+    {
+      channelPlugin: plugin(),
+      params: { presentation: chart },
+    },
+    { message: "", payload: { text: "", presentation: chart } },
+  );
+  expect(result.handledBy).toBe("plugin");
+  expect(mocks.send).not.toHaveBeenCalled();
+  expectCall(mocks.dispatch, {
+    params: expect.objectContaining({
+      presentation: chart,
+      message: "Revenue (pie chart)\n- Product: 60",
+    }),
+  });
+});
+
+it.each([
+  { source: "implicit", replyToId: "source-1", mode: "first" },
+  { source: "explicit", replyToId: "explicit-1" },
+] as const)("preserves host-owned $source replies through plugin fallback", async (reply) => {
+  const components = () => [];
+  const result = await send(
+    {
+      channelPlugin: plugin("direct", {
+        prepareSendPayload: ({ ctx }) => {
+          expect(ctx.reply).toEqual(reply);
+          return null;
+        },
+      }),
+      params: { ...destination, components, presentation, replyTo: reply.replyToId },
+    },
+    { reply, message: "Summary", payload: { text: "Summary", presentation } },
+  );
+  expect(result.handledBy).toBe("plugin");
+  expectCall(mocks.dispatch, {
+    reply,
+    params: expect.objectContaining({
+      components,
+      replyTo: reply.replyToId,
+      presentation,
+      message: "Summary\n\nPortable",
+    }),
+  });
+  expect(mocks.send).not.toHaveBeenCalled();
+  expectCall(mocks.commit, {
+    payload: expect.objectContaining({ text: "Summary\n\nPortable", presentation }),
+  });
+});
+
+it.each([
+  { params: {}, sources: [] },
+  { params: { media: "/photo.png" }, sources: ["/photo.png"] },
+  {
+    params: { mediaUrls: ["/chart.png", ""], attachments: [{ filePath: "/report.md" }] },
+    sources: ["/chart.png", "/report.md"],
+  },
+])("resolves plugin media sources $sources before dispatch", async ({ params, sources }) => {
+  await send({ params, agentId: "agent-1" });
+  expectCall(mocks.resolveAccess, { agentId: "agent-1", mediaSources: sources });
+  expectCall(mocks.dispatch, {
+    mediaLocalRoots: mocks.access.localRoots,
+    mediaReadFile: mocks.access.readFile,
+  });
+});
+
+it("preserves explicitly supplied media access", async () => {
+  const mediaAccess = { localRoots: ["/explicit"], readFile: async () => Buffer.from("explicit") };
+  mocks.resolveAccess.mockReturnValueOnce(mediaAccess);
+  await send({ params: { mediaUrls: ["/chart.png"] }, mediaAccess });
+  expectCall(mocks.resolveAccess, { mediaAccess, mediaSources: ["/chart.png"] });
+  expectCall(mocks.dispatch, {
+    mediaLocalRoots: mediaAccess.localRoots,
+    mediaReadFile: mediaAccess.readFile,
+  });
+});
+
+it("records plain plugin sends with fallback media under their delivery identity", async () => {
+  const mediaUrls = ["https://example.com/a.png", "https://example.com/b.png"];
+  const result = await send(
+    { transcriptRoute, idempotencyKey: "idem-plugin-send-1" },
+    { mediaUrls },
+  );
+  expect(result.handledBy).toBe("plugin");
+  expect(result.deliveredText).toBeUndefined();
+  expect(mocks.send).not.toHaveBeenCalled();
+  expectCall(mocks.commit, {
+    route: transcriptRoute,
+    payload: expect.objectContaining({ text: "hello", mediaUrls }),
+    deliveryId: "idem-plugin-send-1",
+    payloadIndex: 0,
+  });
+});
+
+it("keeps a confirmed plugin send when its history write fails", async () => {
+  mocks.commit.mockRejectedValueOnce(new Error("transcript unavailable"));
+  await expect(send()).resolves.toMatchObject({ handledBy: "plugin" });
+  expect(mocks.send).not.toHaveBeenCalled();
+});
+
+it("leaves destination history to a delegating client on both send paths", async () => {
+  const input = { callerRecordsDestinationHistory: true };
+  await send({ input });
+  expect(mocks.commit).not.toHaveBeenCalled();
+  mocks.dispatch.mockResolvedValueOnce(null);
+  await send({ input });
+  expectCall(mocks.send, { skipDestinationHistory: true });
+});
+
+it("bypasses plugin sends during dry runs", async () => {
+  await send({ dryRun: true, silent: true, gateway, idempotencyKey: "stable-send" });
+  expect(mocks.dispatch).not.toHaveBeenCalled();
+  expectCall(mocks.send, { dryRun: true, silent: true, gateway, idempotencyKey: "stable-send" });
+});
+
+it.each([undefined, false])("queues prepared payloads (bestEffort: %s)", async (bestEffort) => {
+  const reply = { replyToId: "reply-1", source: "explicit" as const };
+  const prepareSendPayload = vi.fn<
+    NonNullable<NonNullable<ChannelPlugin["actions"]>["prepareSendPayload"]>
+  >(({ payload }) => ({ ...payload, channelData: { prepared: true } }));
+  const selected = {
+    ...plugin(undefined, { prepareSendPayload }),
+    outbound: { deliveryMode: "direct" as const },
+  };
+  await send(
+    {
+      channelPlugin: selected,
+      input: {
+        sessionKey: "discord-session",
+        inboundEventKind: "room_event",
+        conversationReadOrigin: "delegated",
+      },
+    },
+    { payload: { text: "hello", presentation }, bestEffort, reply, threadId: "thread-1" },
+  );
+  expectCall(prepareSendPayload, {
+    ctx: expect.objectContaining({
+      sessionKey: "discord-session",
+      inboundEventKind: "room_event",
+    }),
+    replyToIdSource: "explicit",
+  });
+  expect(mocks.dispatch).not.toHaveBeenCalled();
+  expectCall(mocks.send, {
+    queuePolicy: bestEffort === false ? "required" : "best_effort",
+    reply,
+    threadId: "thread-1",
+    conversationReadOrigin: "delegated",
+    preparedPlugin: selected,
+    payloads: [expect.objectContaining({ channelData: { prepared: true }, presentation })],
+  });
+});
+
+it("dispatches plugin polls before attempting shared parsing", async () => {
+  const resolveCorePoll = vi.fn(() => {
+    throw new Error("shared poll fallback should not run");
+  });
+  const result = await executePollAction({
+    ctx: context({
+      params: {
+        pollQuestion: "Lunch?",
+        pollOption: poll.options,
+        pollDurationSeconds: 90,
+        pollPublic: true,
+      },
+    }),
+    resolveCorePoll,
+  });
+  expect(result.handledBy).toBe("plugin");
+  expect(resolveCorePoll).not.toHaveBeenCalled();
+  expect(mocks.poll).not.toHaveBeenCalled();
+});
+
+it.each([false, true])("forwards core polls (dryRun: %s)", async (dryRun) => {
+  if (!dryRun) {
+    mocks.dispatch.mockResolvedValue(null);
+  }
+  mocks.poll.mockResolvedValue({
+    ...poll,
+    channel: "demo",
+    via: "gateway",
+    durationHours: 6,
+    durationSeconds: null,
+  });
+  const corePoll = dryRun
+    ? { ...poll, durationHours: 6 }
+    : {
+        ...poll,
+        content: "Vote now",
         durationSeconds: 300,
         threadId: "thread-1",
         isAnonymous: true,
-      }),
-    });
-
-    expect(mocks.sendPoll).toHaveBeenCalledWith(
-      expect.objectContaining({
-        channel: "discord",
+      };
+  const policy = dryRun
+    ? { dryRun, silent: true, gateway, idempotencyKey: "stable-poll" }
+    : {
         accountId: "acc-1",
-        to: "channel:123",
-        question: "Lunch?",
-        options: ["Pizza", "Sushi"],
-        maxSelections: 1,
-        durationSeconds: 300,
-        threadId: "thread-1",
-        isAnonymous: true,
-      }),
-    );
-  });
-
-  it("skips plugin dispatch during dry-run polls and forwards durationHours + silent", async () => {
-    mocks.sendPoll.mockResolvedValue({
-      channel: "discord",
-      to: "channel:123",
-      question: "Lunch?",
-      options: ["Pizza", "Sushi"],
-      maxSelections: 1,
-      durationSeconds: null,
-      durationHours: 6,
-      via: "gateway",
-    });
-
-    await executePollAction({
-      ctx: {
-        cfg: {},
-        channel: "discord",
-        params: {},
-        dryRun: true,
-        silent: true,
-        gateway: {
-          url: "http://127.0.0.1:18789",
-          token: "tok",
-          timeoutMs: 5000,
-          clientName: GATEWAY_CLIENT_NAMES.GATEWAY_CLIENT,
-          mode: GATEWAY_CLIENT_MODES.BACKEND,
-        },
-      },
-      resolveCorePoll: () => ({
-        to: "channel:123",
-        question: "Lunch?",
-        options: ["Pizza", "Sushi"],
-        maxSelections: 1,
-        durationHours: 6,
-      }),
-    });
-
-    expect(mocks.dispatchChannelMessageAction).not.toHaveBeenCalled();
-    expect(mocks.sendPoll).toHaveBeenCalledWith(
-      expect.objectContaining({
-        to: "channel:123",
-        question: "Lunch?",
-        durationHours: 6,
-        dryRun: true,
-        silent: true,
-        gateway: expect.objectContaining({
-          url: "http://127.0.0.1:18789",
-          token: "tok",
-          timeoutMs: 5000,
+        input: { sessionKey: transcriptRoute.sessionKey, inboundEventKind: "room_event" as const },
+      };
+  await executePollAction({ ctx: context(policy), resolveCorePoll: () => corePoll });
+  if (dryRun) {
+    expect(mocks.dispatch).not.toHaveBeenCalled();
+  }
+  expectCall(mocks.poll, {
+    ...corePoll,
+    ...(dryRun
+      ? { dryRun, silent: true, gateway, idempotencyKey: "stable-poll" }
+      : {
+          accountId: "acc-1",
+          sessionKey: transcriptRoute.sessionKey,
+          inboundEventKind: "room_event",
         }),
-      }),
-    );
   });
 });

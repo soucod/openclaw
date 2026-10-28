@@ -68,7 +68,7 @@ openclaw plugins install @openclaw/nostr
 - **open**: Anyone can message the bot (use with caution)
 - **disabled**: DMs are disabled
 
-Policy enforcement happens before signature verification and NIP-04 decryption.
+Inbound event signatures are verified before policy enforcement and NIP-04 decryption.
 Unknown senders in `pairing` mode can receive a pairing reply, but their original DM body is not
 processed unless approved.
 
@@ -128,7 +128,7 @@ docker run -p 7777:7777 ghcr.io/hoytech/strfry
 
 1. Verify private key is correctly configured
 2. Check relay connectivity
-3. Ensure `enabled` is not set to `false`
+3. Check that `enabled` is not set to `false`
 4. Check the bot's public key matches what you're sending to
 
 ### Messages not being delivered

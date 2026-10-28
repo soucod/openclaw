@@ -1,57 +1,53 @@
+// Telegram tests cover voice plugin behavior.
 import { describe, expect, it, vi } from "vitest";
+import { splitTelegramCaption } from "./caption.js";
 import { resolveTelegramVoiceSend } from "./voice.js";
 
-describe("resolveTelegramVoiceSend", () => {
-  it("skips voice when wantsVoice is false", () => {
-    const logFallback = vi.fn();
-    const result = resolveTelegramVoiceSend({
-      wantsVoice: false,
-      contentType: "audio/ogg",
-      fileName: "voice.ogg",
-      logFallback,
+const TELEGRAM_CAPTION_LIMIT = 1024;
+
+describe("splitTelegramCaption", () => {
+  it("returns empty parts for blank captions", () => {
+    expect(splitTelegramCaption("   ")).toEqual({
+      caption: undefined,
+      followUpText: undefined,
     });
-    expect(result.useVoice).toBe(false);
-    expect(logFallback).not.toHaveBeenCalled();
   });
 
-  it("logs fallback for incompatible media", () => {
-    const logFallback = vi.fn();
-    const result = resolveTelegramVoiceSend({
-      wantsVoice: true,
-      contentType: "audio/wav",
-      fileName: "track.wav",
-      logFallback,
+  it("moves oversized captions into follow-up text", () => {
+    const text = "x".repeat(TELEGRAM_CAPTION_LIMIT + 1);
+    expect(splitTelegramCaption(text)).toEqual({
+      caption: undefined,
+      followUpText: text,
     });
-    expect(result.useVoice).toBe(false);
-    expect(logFallback).toHaveBeenCalledWith(
-      "Telegram voice requested but media is audio/wav (track.wav); sending as audio file instead.",
-    );
-  });
-
-  it("keeps voice when compatible", () => {
-    const logFallback = vi.fn();
-    const result = resolveTelegramVoiceSend({
-      wantsVoice: true,
-      contentType: "audio/ogg",
-      fileName: "voice.ogg",
-      logFallback,
-    });
-    expect(result.useVoice).toBe(true);
-    expect(logFallback).not.toHaveBeenCalled();
   });
 
   it.each([
-    { contentType: "audio/mpeg", fileName: "track.mp3" },
-    { contentType: "audio/mp4", fileName: "track.m4a" },
-  ])("keeps voice for compatible MIME $contentType", ({ contentType, fileName }) => {
-    const logFallback = vi.fn();
-    const result = resolveTelegramVoiceSend({
-      wantsVoice: true,
-      contentType,
-      fileName,
-      logFallback,
+    {
+      mode: "HTML entities and links",
+      text: `&amp;<a href="https://example.com/long-path">${"x".repeat(1022)}</a>`,
+      renderedHtml: `&amp;<a href="https://example.com/long-path">${"x".repeat(1022)}</a>`,
+    },
+  ])("budgets $mode after Telegram parses entities", ({ text, renderedHtml }) => {
+    expect(splitTelegramCaption(text, renderedHtml)).toEqual({
+      caption: text,
+      followUpText: undefined,
     });
-    expect(result.useVoice).toBe(true);
-    expect(logFallback).not.toHaveBeenCalled();
   });
+});
+
+describe("resolveTelegramVoiceSend", () => {
+  it.each([{ contentType: "audio/mp4", fileName: "track.m4a" }])(
+    "keeps voice for compatible MIME $contentType",
+    ({ contentType, fileName }) => {
+      const logFallback = vi.fn();
+      const result = resolveTelegramVoiceSend({
+        wantsVoice: true,
+        contentType,
+        fileName,
+        logFallback,
+      });
+      expect(result.useVoice).toBe(true);
+      expect(logFallback).not.toHaveBeenCalled();
+    },
+  );
 });

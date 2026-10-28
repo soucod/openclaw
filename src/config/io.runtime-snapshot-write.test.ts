@@ -1,255 +1,182 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
-import { withTempHome } from "./home-env.test-harness.js";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import {
-  clearConfigCache,
-  clearRuntimeConfigSnapshot,
-  getRuntimeConfigSourceSnapshot,
-  loadConfig,
-  projectConfigOntoRuntimeSourceSnapshot,
+  registerConfigWriteListener,
+  resetConfigRuntimeState,
   setRuntimeConfigSnapshotRefreshHandler,
   setRuntimeConfigSnapshot,
   writeConfigFile,
 } from "./io.js";
+import { hashConfigRaw } from "./io.read-helpers.js";
+import { replaceConfigFile, type ConfigMutationIO } from "./mutate.js";
+import { createSnapshot } from "./mutate.test-support.js";
+import { getResolvedConfigEnvSecretRef } from "./resolution-facts.js";
+import {
+  registerManagedRuntimeConfigWriteOwner,
+  registerRuntimeConfigWriteListener,
+  type RuntimeConfigWriteNotification,
+  type RuntimeConfigWritePreparedCandidate,
+} from "./runtime-snapshot.js";
+import { withTempHomeConfig } from "./test-helpers.js";
 import type { OpenClawConfig } from "./types.js";
-
-function createSourceConfig(): OpenClawConfig {
-  return {
-    models: {
-      providers: {
-        openai: {
-          baseUrl: "https://api.openai.com/v1",
-          apiKey: { source: "env", provider: "default", id: "OPENAI_API_KEY" },
-          models: [],
-        },
-      },
-    },
-  };
-}
-
-function createRuntimeConfig(): OpenClawConfig {
-  return {
-    models: {
-      providers: {
-        openai: {
-          baseUrl: "https://api.openai.com/v1",
-          apiKey: "sk-runtime-resolved", // pragma: allowlist secret
-          models: [],
-        },
-      },
-    },
-  };
-}
 
 function resetRuntimeConfigState(): void {
   setRuntimeConfigSnapshotRefreshHandler(null);
-  clearRuntimeConfigSnapshot();
-  clearConfigCache();
+  resetConfigRuntimeState();
 }
+beforeEach(resetRuntimeConfigState);
+afterEach(resetRuntimeConfigState);
 
-describe("runtime config snapshot writes", () => {
-  it("returns the source snapshot when runtime snapshot is active", async () => {
-    await withTempHome("openclaw-config-runtime-source-", async () => {
-      const sourceConfig = createSourceConfig();
-      const runtimeConfig = createRuntimeConfig();
-      try {
-        setRuntimeConfigSnapshot(runtimeConfig, sourceConfig);
-        expect(getRuntimeConfigSourceSnapshot()).toEqual(sourceConfig);
-      } finally {
-        resetRuntimeConfigState();
-      }
+it.each(["root", "include"])("publishes managed %s writes with auth-store scope", async (mode) => {
+  const include = mode === "include";
+  const initial: OpenClawConfig = include
+    ? { plugins: { entries: {} } }
+    : {
+        env: { vars: { CONFIG_PUBLICATION_BIN: "jq" } },
+        gateway: { mode: "local" },
+        logging: { level: "info" },
+        tools: { exec: { safeBins: ["jq"] } },
+      };
+  const authoredTools = { exec: { safeBins: ["${CONFIG_PUBLICATION_BIN}"] } };
+  const authored = include
+    ? { plugins: { $include: "./config/plugins.json5" } }
+    : { ...initial, tools: { $include: "./tools.json5" } };
+  await withTempHomeConfig(authored, async ({ configPath: file }) => {
+    const includeFile = path.join(
+      path.dirname(file),
+      include ? "config/plugins.json5" : "tools.json5",
+    );
+    await fs.mkdir(path.dirname(includeFile), { recursive: true });
+    await fs.writeFile(
+      includeFile,
+      JSON.stringify(include ? { entries: {} } : authoredTools),
+      "utf-8",
+    );
+    const raw = await fs.readFile(file, "utf-8");
+    const snapshot = createSnapshot({
+      path: file,
+      hash: hashConfigRaw(raw),
+      parsed: authored,
+      sourceConfig: initial,
+      raw,
     });
-  });
-
-  it("skips source projection for non-runtime-derived configs", async () => {
-    await withTempHome("openclaw-config-runtime-projection-shape-", async () => {
-      const sourceConfig: OpenClawConfig = {
-        ...createSourceConfig(),
-        gateway: {
-          auth: {
-            mode: "token",
-          },
-        },
-      };
-      const runtimeConfig: OpenClawConfig = {
-        ...createRuntimeConfig(),
-        gateway: {
-          auth: {
-            mode: "token",
-          },
-        },
-      };
-      const independentConfig: OpenClawConfig = {
-        models: {
-          providers: {
-            openai: {
-              baseUrl: "https://api.openai.com/v1",
-              apiKey: "sk-independent-config", // pragma: allowlist secret
-              models: [],
-            },
-          },
-        },
-      };
-
-      try {
-        setRuntimeConfigSnapshot(runtimeConfig, sourceConfig);
-        const projected = projectConfigOntoRuntimeSourceSnapshot(independentConfig);
-        expect(projected).toBe(independentConfig);
-      } finally {
-        resetRuntimeConfigState();
+    const next: OpenClawConfig = include
+      ? { plugins: { entries: { demo: { enabled: true } } } }
+      : { ...initial, logging: { level: "debug" } };
+    const runtime: OpenClawConfig = include ? { ...next, logging: { level: "debug" } } : next;
+    const metadata = Symbol("prepared metadata");
+    let prepared: (RuntimeConfigWritePreparedCandidate & { [metadata]: string }) | undefined;
+    const preflight = async (
+      source: OpenClawConfig,
+      options?: { includeAuthStoreRefs?: boolean },
+    ) => {
+      if (options?.includeAuthStoreRefs !== false) {
+        throw new Error("unavailable auth-profile SecretRef");
       }
-    });
-  });
-
-  it("clears runtime source snapshot when runtime snapshot is cleared", async () => {
-    const sourceConfig = createSourceConfig();
-    const runtimeConfig = createRuntimeConfig();
-
-    setRuntimeConfigSnapshot(runtimeConfig, sourceConfig);
-    resetRuntimeConfigState();
-    expect(getRuntimeConfigSourceSnapshot()).toBeNull();
-  });
-
-  it("preserves source secret refs when writeConfigFile receives runtime-resolved config", async () => {
-    await withTempHome("openclaw-config-runtime-write-", async (home) => {
-      const configPath = path.join(home, ".openclaw", "openclaw.json");
-      const sourceConfig = createSourceConfig();
-      const runtimeConfig = createRuntimeConfig();
-
-      await fs.mkdir(path.dirname(configPath), { recursive: true });
-      await fs.writeFile(configPath, `${JSON.stringify(sourceConfig, null, 2)}\n`, "utf8");
-
-      try {
-        setRuntimeConfigSnapshot(runtimeConfig, sourceConfig);
-        expect(loadConfig().models?.providers?.openai?.apiKey).toBe("sk-runtime-resolved");
-
-        await writeConfigFile(loadConfig());
-
-        const persisted = JSON.parse(await fs.readFile(configPath, "utf8")) as {
-          models?: { providers?: { openai?: { apiKey?: unknown } } };
-        };
-        expect(persisted.models?.providers?.openai?.apiKey).toEqual({
-          source: "env",
-          provider: "default",
-          id: "OPENAI_API_KEY",
-        });
-      } finally {
-        resetRuntimeConfigState();
-      }
-    });
-  });
-
-  it("refreshes the runtime snapshot after writes so follow-up reads see persisted changes", async () => {
-    await withTempHome("openclaw-config-runtime-write-refresh-", async (home) => {
-      const configPath = path.join(home, ".openclaw", "openclaw.json");
-      const sourceConfig: OpenClawConfig = {
-        models: {
-          providers: {
-            openai: {
-              baseUrl: "https://api.openai.com/v1",
-              apiKey: { source: "env", provider: "default", id: "OPENAI_API_KEY" },
-              models: [],
-            },
-          },
+      return (prepared = {
+        runtimeConfig: include ? snapshot.runtimeConfig : source,
+        compareConfig: include ? snapshot.sourceConfig : source,
+        [metadata]: "preserved",
+        reapplyRuntimeOverlays(config) {
+          expect(this).toBe(prepared);
+          return { ...config, logging: { level: "warn" } };
         },
-      };
-      const runtimeConfig: OpenClawConfig = {
-        models: {
-          providers: {
-            openai: {
-              baseUrl: "https://api.openai.com/v1",
-              apiKey: "sk-runtime-resolved", // pragma: allowlist secret
-              models: [],
-            },
-          },
+        reapplyCompareOverlays(config) {
+          expect(this).toBe(prepared);
+          return { ...config, logging: { level: "error" } };
         },
-      };
-      const nextRuntimeConfig: OpenClawConfig = {
-        ...runtimeConfig,
-        gateway: { auth: { mode: "token" as const } },
-      };
-
-      await fs.mkdir(path.dirname(configPath), { recursive: true });
-      await fs.writeFile(configPath, `${JSON.stringify(sourceConfig, null, 2)}\n`, "utf8");
-
-      try {
-        setRuntimeConfigSnapshot(runtimeConfig, sourceConfig);
-        expect(loadConfig().gateway?.auth).toBeUndefined();
-
-        await writeConfigFile(nextRuntimeConfig);
-
-        expect(loadConfig().gateway?.auth).toEqual({ mode: "token" });
-        expect(loadConfig().models?.providers?.openai?.apiKey).toBeDefined();
-
-        let persisted = JSON.parse(await fs.readFile(configPath, "utf8")) as {
-          gateway?: { auth?: unknown };
-          models?: { providers?: { openai?: { apiKey?: unknown } } };
-        };
-        expect(persisted.gateway?.auth).toEqual({ mode: "token" });
-        // Post-write secret-ref: apiKey must stay as source ref (not plaintext).
-        expect(persisted.models?.providers?.openai?.apiKey).toEqual({
-          source: "env",
-          provider: "default",
-          id: "OPENAI_API_KEY",
-        });
-
-        // Follow-up write: runtimeConfigSourceSnapshot must be restored so second write
-        // still runs secret-preservation merge-patch and keeps apiKey as ref (not plaintext).
-        await writeConfigFile(loadConfig());
-        persisted = JSON.parse(await fs.readFile(configPath, "utf8")) as {
-          gateway?: { auth?: unknown };
-          models?: { providers?: { openai?: { apiKey?: unknown } } };
-        };
-        expect(persisted.models?.providers?.openai?.apiKey).toEqual({
-          source: "env",
-          provider: "default",
-          id: "OPENAI_API_KEY",
-        });
-      } finally {
-        clearRuntimeConfigSnapshot();
-        clearConfigCache();
-      }
-    });
-  });
-
-  it("keeps the last-known-good runtime snapshot active while a specialized refresh is pending", async () => {
-    await withTempHome("openclaw-config-runtime-refresh-pending-", async (home) => {
-      const configPath = path.join(home, ".openclaw", "openclaw.json");
-      const sourceConfig = createSourceConfig();
-      const runtimeConfig = createRuntimeConfig();
-      const nextRuntimeConfig: OpenClawConfig = {
-        ...runtimeConfig,
-        gateway: { auth: { mode: "token" as const } },
-      };
-
-      await fs.mkdir(path.dirname(configPath), { recursive: true });
-      await fs.writeFile(configPath, `${JSON.stringify(sourceConfig, null, 2)}\n`, "utf8");
-
-      let releaseRefresh!: () => void;
-      const refreshPending = new Promise<boolean>((resolve) => {
-        releaseRefresh = () => resolve(true);
       });
-
-      try {
-        setRuntimeConfigSnapshot(runtimeConfig, sourceConfig);
-        setRuntimeConfigSnapshotRefreshHandler({
-          refresh: async ({ sourceConfig: refreshedSource }) => {
-            expect(refreshedSource.gateway?.auth).toEqual({ mode: "token" });
-            expect(loadConfig().gateway?.auth).toBeUndefined();
-            return await refreshPending;
-          },
-        });
-
-        const writePromise = writeConfigFile(nextRuntimeConfig);
-        await Promise.resolve();
-
-        expect(loadConfig().gateway?.auth).toBeUndefined();
-        releaseRefresh();
-        await writePromise;
-      } finally {
-        resetRuntimeConfigState();
+    };
+    const fallback = {
+      runtimeConfig: snapshot.runtimeConfig,
+      compareConfig: snapshot.sourceConfig,
+    };
+    const owner = include ? registerManagedRuntimeConfigWriteOwner(file, preflight) : undefined;
+    const backup = include
+      ? registerManagedRuntimeConfigWriteOwner(file, async () => fallback)
+      : undefined;
+    const events: RuntimeConfigWriteNotification[] = [];
+    const record = (event: RuntimeConfigWriteNotification) => {
+      if (event.configPath === file) {
+        events.push(event);
       }
+    };
+    const stop = include
+      ? registerRuntimeConfigWriteListener(record)
+      : registerConfigWriteListener(record, {
+          ownsRuntimeActivationFor: file,
+          preCommitRuntimePreflight: preflight,
+        });
+    try {
+      if (include) {
+        // Only the reread is controlled; include containment, hashing and writes are real.
+        const io = {
+          readConfigFileSnapshotForWrite: async () => ({
+            snapshot: { ...snapshot, sourceConfig: next, runtimeConfig: runtime, config: runtime },
+            writeOptions: { expectedConfigPath: file },
+          }),
+          writeConfigFile: vi.fn<ConfigMutationIO["writeConfigFile"]>(),
+        } satisfies ConfigMutationIO;
+        await replaceConfigFile({
+          baseHash: snapshot.hash ?? undefined,
+          snapshot,
+          writeOptions: {
+            expectedConfigPath: file,
+            assertConfigPathForWrite: () => {},
+            includeFileTargetsForWrite: { [includeFile]: await fs.realpath(includeFile) },
+            runtimeRefresh: { includeAuthStoreRefs: false },
+          },
+          nextConfig: next,
+          io,
+        });
+        expect(io.writeConfigFile).not.toHaveBeenCalled();
+      } else {
+        setRuntimeConfigSnapshot(initial, initial);
+        await writeConfigFile(next, { runtimeRefresh: { includeAuthStoreRefs: false } });
+      }
+    } finally {
+      stop();
+      backup?.();
+      owner?.();
+    }
+    expect(events).toHaveLength(1);
+    const [event] = events;
+    const candidates = event?.preparedCandidatesByOwner;
+    expect(event?.runtimeRefresh).toEqual({ includeAuthStoreRefs: false });
+    expect(event?.snapshot).toMatchObject({ path: file, sourceConfig: next });
+    const projected = owner ? candidates?.get(owner.ownerId) : event?.preparedCandidate;
+    expect(projected).toMatchObject({
+      runtimeConfig: { ...runtime, logging: { level: "warn" } },
+      compareConfig: { ...next, logging: { level: "error" } },
     });
+    if (include) {
+      expect(event?.snapshot).toMatchObject({ raw, parsed: authored, runtimeConfig: runtime });
+      expect(projected).toMatchObject({ [metadata]: "preserved" });
+      expect(prepared?.runtimeConfig).toBe(snapshot.runtimeConfig);
+      expect(prepared?.compareConfig).toBe(snapshot.sourceConfig);
+      const unchanged = backup && candidates?.get(backup.ownerId);
+      expect(unchanged?.runtimeConfig).toBe(fallback.runtimeConfig);
+      expect(unchanged?.compareConfig).toBe(fallback.compareConfig);
+      expect(JSON.parse(await fs.readFile(includeFile, "utf-8"))).toMatchObject({
+        entries: { demo: { enabled: true } },
+      });
+      await expect(fs.readFile(file, "utf-8")).resolves.toBe(raw);
+    } else {
+      expect(event?.snapshot).toMatchObject({
+        parsed: { tools: { $include: "./tools.json5" } },
+        authoredConfig: { tools: authoredTools },
+        includeProvenance: expect.arrayContaining([
+          expect.objectContaining({ path: ["tools"], kind: "single", targetPath: includeFile }),
+        ]),
+        hash: event?.persistedHash,
+      });
+      expect(event?.snapshot.raw).toBe(await fs.readFile(file, "utf-8"));
+      expect(
+        getResolvedConfigEnvSecretRef(event?.snapshot.sourceConfig, "tools.exec.safeBins[0]"),
+      ).toEqual({ source: "env", provider: "default", id: "CONFIG_PUBLICATION_BIN" });
+      expect(prepared?.runtimeConfig.logging?.level).toBe("debug");
+      expect(prepared?.compareConfig.logging?.level).toBe("debug");
+    }
   });
 });

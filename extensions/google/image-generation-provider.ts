@@ -1,72 +1,39 @@
-import type { ImageGenerationProvider } from "openclaw/plugin-sdk/image-generation";
 import {
-  assertOkOrThrowHttpError,
-  normalizeBaseUrl,
-  postJsonRequest,
-} from "openclaw/plugin-sdk/media-understanding";
-import { resolveApiKeyForProvider } from "openclaw/plugin-sdk/provider-auth";
-import { normalizeGoogleModelId, parseGeminiAuth } from "openclaw/plugin-sdk/provider-google";
+  generatedImageAssetFromBase64,
+  resolveInlineImageJsonResponseMaxBytes,
+  type GeneratedImageAsset,
+  type ImageGenerationProvider,
+} from "openclaw/plugin-sdk/image-generation";
+import { resolveGeneratedImageDownloadMaxBytes } from "openclaw/plugin-sdk/media-generation-runtime";
+import { parseStrictPositiveInteger } from "openclaw/plugin-sdk/number-runtime";
+import { isProviderApiKeyConfiguredAsync } from "openclaw/plugin-sdk/provider-auth";
+import {
+  postJsonResponse,
+  sanitizeConfiguredModelProviderRequest,
+} from "openclaw/plugin-sdk/provider-http";
+import {
+  isRecord,
+  normalizeLowercaseStringOrEmpty,
+  normalizeOptionalString,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
+import { toStandardGoogleProviderBase64 } from "./base64.js";
+import { resolveGoogleGenerationApiKey } from "./generation-auth.js";
+import {
+  createGoogleImageGenerationProviderMetadata,
+  DEFAULT_GOOGLE_IMAGE_MODEL,
+  GOOGLE_MAX_IMAGE_RESULTS,
+} from "./generation-provider-metadata.js";
+import { resolveGoogleGenerativeAiHttpRequestConfig } from "./http-request.js";
+import { normalizeGoogleModelId } from "./model-id.js";
 
-const DEFAULT_GOOGLE_IMAGE_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
-const DEFAULT_GOOGLE_IMAGE_MODEL = "gemini-3.1-flash-image-preview";
+const DEFAULT_IMAGE_TIMEOUT_MS = 180_000;
 const DEFAULT_OUTPUT_MIME = "image/png";
-const GOOGLE_SUPPORTED_SIZES = [
-  "1024x1024",
-  "1024x1536",
-  "1536x1024",
-  "1024x1792",
-  "1792x1024",
-] as const;
-const GOOGLE_SUPPORTED_ASPECT_RATIOS = [
-  "1:1",
-  "2:3",
-  "3:2",
-  "3:4",
-  "4:3",
-  "4:5",
-  "5:4",
-  "9:16",
-  "16:9",
-  "21:9",
-] as const;
-
-type GoogleInlineDataPart = {
-  mimeType?: string;
-  mime_type?: string;
-  data?: string;
-};
-
-type GoogleGenerateImageResponse = {
-  candidates?: Array<{
-    content?: {
-      parts?: Array<{
-        text?: string;
-        inlineData?: GoogleInlineDataPart;
-        inline_data?: GoogleInlineDataPart;
-      }>;
-    };
-  }>;
-};
-
-function resolveGoogleBaseUrl(cfg: Parameters<typeof resolveApiKeyForProvider>[0]["cfg"]): string {
-  const direct = cfg?.models?.providers?.google?.baseUrl?.trim();
-  return direct || DEFAULT_GOOGLE_IMAGE_BASE_URL;
-}
-
-function normalizeGoogleImageModel(model: string | undefined): string {
-  const trimmed = model?.trim();
-  return normalizeGoogleModelId(trimmed || DEFAULT_GOOGLE_IMAGE_MODEL);
-}
+const GOOGLE_IMAGE_MALFORMED_RESPONSE = "Google image generation response malformed";
 
 function mapSizeToImageConfig(
   size: string | undefined,
 ): { aspectRatio?: string; imageSize?: "2K" | "4K" } | undefined {
-  const trimmed = size?.trim();
-  if (!trimmed) {
-    return undefined;
-  }
-
-  const normalized = trimmed.toLowerCase();
+  const normalized = normalizeLowercaseStringOrEmpty(size);
   const mapping = new Map<string, string>([
     ["1024x1024", "1:1"],
     ["1024x1536", "2:3"],
@@ -77,8 +44,11 @@ function mapSizeToImageConfig(
   const aspectRatio = mapping.get(normalized);
 
   const [widthRaw, heightRaw] = normalized.split("x");
-  const width = Number.parseInt(widthRaw ?? "", 10);
-  const height = Number.parseInt(heightRaw ?? "", 10);
+  const width = parseStrictPositiveInteger(widthRaw);
+  const height = parseStrictPositiveInteger(heightRaw);
+  if (width === undefined || height === undefined) {
+    return undefined;
+  }
   const longestEdge = Math.max(width, height);
   const imageSize = longestEdge >= 3072 ? "4K" : longestEdge >= 1536 ? "2K" : undefined;
 
@@ -92,122 +62,153 @@ function mapSizeToImageConfig(
   };
 }
 
-export function buildGoogleImageGenerationProvider(): ImageGenerationProvider {
-  return {
-    id: "google",
-    label: "Google",
-    defaultModel: DEFAULT_GOOGLE_IMAGE_MODEL,
-    models: [DEFAULT_GOOGLE_IMAGE_MODEL, "gemini-3-pro-image-preview"],
-    capabilities: {
-      generate: {
-        maxCount: 4,
-        supportsSize: true,
-        supportsAspectRatio: true,
-        supportsResolution: true,
-      },
-      edit: {
-        enabled: true,
-        maxCount: 4,
-        maxInputImages: 5,
-        supportsSize: true,
-        supportsAspectRatio: true,
-        supportsResolution: true,
-      },
-      geometry: {
-        sizes: [...GOOGLE_SUPPORTED_SIZES],
-        aspectRatios: [...GOOGLE_SUPPORTED_ASPECT_RATIOS],
-        resolutions: ["1K", "2K", "4K"],
-      },
-    },
-    async generateImage(req) {
-      const auth = await resolveApiKeyForProvider({
-        provider: "google",
-        cfg: req.cfg,
-        agentDir: req.agentDir,
-        store: req.authStore,
-      });
-      if (!auth.apiKey) {
-        throw new Error("Google API key missing");
-      }
+function googleResponseParts(payload: unknown): unknown[] {
+  if (!isRecord(payload)) {
+    throw new Error(GOOGLE_IMAGE_MALFORMED_RESPONSE);
+  }
+  const candidates = payload.candidates;
+  if (candidates === undefined || candidates === null) {
+    return [];
+  }
+  if (!Array.isArray(candidates)) {
+    throw new Error(GOOGLE_IMAGE_MALFORMED_RESPONSE);
+  }
 
-      const model = normalizeGoogleImageModel(req.model);
-      const baseUrl = normalizeBaseUrl(
-        resolveGoogleBaseUrl(req.cfg),
-        DEFAULT_GOOGLE_IMAGE_BASE_URL,
-      );
-      const allowPrivate = Boolean(req.cfg?.models?.providers?.google?.baseUrl?.trim());
-      const authHeaders = parseGeminiAuth(auth.apiKey);
-      const headers = new Headers(authHeaders.headers);
-      const imageConfig = mapSizeToImageConfig(req.size);
-      const inputParts = (req.inputImages ?? []).map((image) => ({
-        inlineData: {
-          mimeType: image.mimeType,
-          data: image.buffer.toString("base64"),
-        },
-      }));
-      const resolvedImageConfig = {
-        ...imageConfig,
-        ...(req.aspectRatio?.trim() ? { aspectRatio: req.aspectRatio.trim() } : {}),
-        ...(req.resolution ? { imageSize: req.resolution } : {}),
-      };
-
-      const { response: res, release } = await postJsonRequest({
-        url: `${baseUrl}/models/${model}:generateContent`,
-        headers,
-        body: {
-          contents: [
-            {
-              role: "user",
-              parts: [...inputParts, { text: req.prompt }],
-            },
-          ],
-          generationConfig: {
-            responseModalities: ["TEXT", "IMAGE"],
-            ...(Object.keys(resolvedImageConfig).length > 0
-              ? { imageConfig: resolvedImageConfig }
-              : {}),
-          },
-        },
-        timeoutMs: 60_000,
-        fetchFn: fetch,
-        allowPrivateNetwork: allowPrivate,
-      });
-
-      try {
-        await assertOkOrThrowHttpError(res, "Google image generation failed");
-
-        const payload = (await res.json()) as GoogleGenerateImageResponse;
-        let imageIndex = 0;
-        const images = (payload.candidates ?? [])
-          .flatMap((candidate) => candidate.content?.parts ?? [])
-          .map((part) => {
-            const inline = part.inlineData ?? part.inline_data;
-            const data = inline?.data?.trim();
-            if (!data) {
-              return null;
-            }
-            const mimeType = inline?.mimeType ?? inline?.mime_type ?? DEFAULT_OUTPUT_MIME;
-            const extension = mimeType.includes("jpeg") ? "jpg" : (mimeType.split("/")[1] ?? "png");
-            imageIndex += 1;
-            return {
-              buffer: Buffer.from(data, "base64"),
-              mimeType,
-              fileName: `image-${imageIndex}.${extension}`,
-            };
-          })
-          .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
-
-        if (images.length === 0) {
-          throw new Error("Google image generation response missing image data");
-        }
-
-        return {
-          images,
-          model,
-        };
-      } finally {
-        await release();
-      }
-    },
-  };
+  const parts: unknown[] = [];
+  for (const candidate of candidates) {
+    if (!isRecord(candidate)) {
+      throw new Error(GOOGLE_IMAGE_MALFORMED_RESPONSE);
+    }
+    const content = candidate.content;
+    if (content === undefined || content === null) {
+      continue;
+    }
+    if (!isRecord(content)) {
+      throw new Error(GOOGLE_IMAGE_MALFORMED_RESPONSE);
+    }
+    const candidateParts = content.parts;
+    if (candidateParts === undefined || candidateParts === null) {
+      continue;
+    }
+    if (!Array.isArray(candidateParts)) {
+      throw new Error(GOOGLE_IMAGE_MALFORMED_RESPONSE);
+    }
+    parts.push(...candidateParts);
+  }
+  return parts;
 }
+
+function googleInlineDataFromPart(part: unknown): Record<string, unknown> | undefined {
+  if (!isRecord(part)) {
+    throw new Error(GOOGLE_IMAGE_MALFORMED_RESPONSE);
+  }
+  const inline = part.inlineData ?? part.inline_data;
+  if (inline === undefined || inline === null) {
+    return undefined;
+  }
+  if (!isRecord(inline)) {
+    throw new Error(GOOGLE_IMAGE_MALFORMED_RESPONSE);
+  }
+  return inline;
+}
+
+export const googleImageGenerationProvider: ImageGenerationProvider = {
+  ...createGoogleImageGenerationProviderMetadata(),
+  isConfiguredAsync: (ctx) => isProviderApiKeyConfiguredAsync({ provider: "google", ...ctx }),
+  async generateImage(req) {
+    const apiKey = await resolveGoogleGenerationApiKey(req);
+
+    const model = normalizeGoogleModelId(req.model?.trim() || DEFAULT_GOOGLE_IMAGE_MODEL);
+    const { baseUrl, allowPrivateNetwork, headers, dispatcherPolicy } =
+      resolveGoogleGenerativeAiHttpRequestConfig({
+        apiKey,
+        baseUrl: req.cfg?.models?.providers?.google?.baseUrl,
+        request: sanitizeConfiguredModelProviderRequest(
+          req.cfg?.models?.providers?.google?.request,
+        ),
+        capability: "image",
+        transport: "http",
+      });
+    const imageConfig = mapSizeToImageConfig(req.size);
+    const inputParts = (req.inputImages ?? []).map((image) => ({
+      inlineData: {
+        mimeType: image.mimeType,
+        data: image.buffer.toString("base64"),
+      },
+    }));
+    const resolvedImageConfig = {
+      ...imageConfig,
+      ...(req.aspectRatio?.trim() ? { aspectRatio: req.aspectRatio.trim() } : {}),
+      ...(req.resolution ? { imageSize: req.resolution } : {}),
+    };
+
+    const payload = await postJsonResponse<unknown>({
+      url: `${baseUrl}/models/${model}:generateContent`,
+      headers,
+      body: {
+        contents: [
+          {
+            role: "user",
+            parts: [...inputParts, { text: req.prompt }],
+          },
+        ],
+        generationConfig: {
+          responseModalities: ["TEXT", "IMAGE"],
+          ...(Object.keys(resolvedImageConfig).length > 0
+            ? { imageConfig: resolvedImageConfig }
+            : {}),
+        },
+      },
+      timeoutMs: req.timeoutMs ?? DEFAULT_IMAGE_TIMEOUT_MS,
+      fetchFn: fetch,
+      pinDns: false,
+      allowPrivateNetwork,
+      ssrfPolicy: req.ssrfPolicy,
+      dispatcherPolicy,
+      errorLabel: "Google image generation failed",
+      responseLabel: "google.image-generation",
+      readOptions: {
+        maxBytes: resolveInlineImageJsonResponseMaxBytes(
+          GOOGLE_MAX_IMAGE_RESULTS,
+          resolveGeneratedImageDownloadMaxBytes(req.cfg),
+        ),
+      },
+    });
+    const images: GeneratedImageAsset[] = [];
+    for (const part of googleResponseParts(payload)) {
+      const inline = googleInlineDataFromPart(part);
+      if (!inline) {
+        continue;
+      }
+      const data = normalizeOptionalString(inline.data);
+      if (!data) {
+        throw new Error(GOOGLE_IMAGE_MALFORMED_RESPONSE);
+      }
+      const standardData = toStandardGoogleProviderBase64(data);
+      if (!standardData) {
+        throw new Error(GOOGLE_IMAGE_MALFORMED_RESPONSE);
+      }
+      const image = generatedImageAssetFromBase64({
+        base64: standardData,
+        index: images.length,
+        mimeType:
+          normalizeOptionalString(inline.mimeType) ??
+          normalizeOptionalString(inline.mime_type) ??
+          DEFAULT_OUTPUT_MIME,
+      });
+      if (!image) {
+        throw new Error(GOOGLE_IMAGE_MALFORMED_RESPONSE);
+      }
+      images.push(image);
+    }
+
+    if (images.length === 0) {
+      throw new Error("Google image generation response missing image data");
+    }
+
+    return {
+      images,
+      model,
+    };
+  },
+};

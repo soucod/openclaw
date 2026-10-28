@@ -1,75 +1,73 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { buildOutboundSessionContext } from "./session-context.js";
 
 const resolveSessionAgentIdMock = vi.hoisted(() => vi.fn());
 
-type SessionContextModule = typeof import("./session-context.js");
+const buildContext = (params: Omit<Parameters<typeof buildOutboundSessionContext>[0], "cfg">) =>
+  buildOutboundSessionContext({ cfg: {}, ...params });
 
-let buildOutboundSessionContext: SessionContextModule["buildOutboundSessionContext"];
+vi.mock("../../agents/agent-scope.js", () => ({
+  resolveSessionAgentId: (...args: unknown[]) => resolveSessionAgentIdMock(...args),
+}));
 
-beforeEach(async () => {
-  vi.resetModules();
+beforeEach(() => {
   resolveSessionAgentIdMock.mockReset();
-  vi.doMock("../../agents/agent-scope.js", () => ({
-    resolveSessionAgentId: (...args: unknown[]) => resolveSessionAgentIdMock(...args),
-  }));
-  ({ buildOutboundSessionContext } = await import("./session-context.js"));
 });
 
 describe("buildOutboundSessionContext", () => {
-  it("returns undefined when both session key and agent id are blank", () => {
-    expect(
-      buildOutboundSessionContext({
-        cfg: {} as never,
-        sessionKey: "  ",
-        agentId: null,
-      }),
-    ).toBeUndefined();
-    expect(resolveSessionAgentIdMock).not.toHaveBeenCalled();
-  });
+  it("passes explicit ownership when resolving an unscoped session key", () => {
+    resolveSessionAgentIdMock.mockImplementationOnce(({ agentId }: { agentId?: string }) => {
+      if (!agentId) {
+        throw new Error("missing explicit agent ownership");
+      }
+      return agentId;
+    });
 
-  it("returns only the explicit trimmed agent id when no session key is present", () => {
     expect(
       buildOutboundSessionContext({
-        cfg: {} as never,
-        sessionKey: "  ",
+        cfg: { agents: {} },
+        sessionKey: "cron:job-123:failure",
         agentId: "  explicit-agent  ",
       }),
-    ).toEqual({
-      agentId: "explicit-agent",
-    });
-    expect(resolveSessionAgentIdMock).not.toHaveBeenCalled();
-  });
-
-  it("derives the agent id from the trimmed session key when no explicit agent is given", () => {
-    resolveSessionAgentIdMock.mockReturnValueOnce("derived-agent");
-
-    expect(
-      buildOutboundSessionContext({
-        cfg: { agents: {} } as never,
-        sessionKey: "  session:main:123  ",
-      }),
-    ).toEqual({
-      key: "session:main:123",
-      agentId: "derived-agent",
-    });
+    ).toEqual({ key: "cron:job-123:failure", agentId: "explicit-agent" });
     expect(resolveSessionAgentIdMock).toHaveBeenCalledWith({
-      sessionKey: "session:main:123",
+      sessionKey: "cron:job-123:failure",
       config: { agents: {} },
+      agentId: "explicit-agent",
     });
   });
 
-  it("prefers an explicit trimmed agent id over the derived one", () => {
-    resolveSessionAgentIdMock.mockReturnValueOnce("derived-agent");
+  it("falls back to isGroup when no explicit conversation type is provided", () => {
+    expect(buildContext({ sessionKey: "agent:main:generic", isGroup: true })).toEqual({
+      key: "agent:main:generic",
+      conversationType: "group",
+      conversationKind: "group",
+    });
+    expect(buildContext({ isGroup: false })).toEqual({
+      conversationType: "direct",
+      conversationKind: "direct",
+    });
+  });
 
+  it("never derives the audit conversation kind from session-key parsing", () => {
+    // A policy key can name an acted-on session that is not the delivery
+    // destination; conversationKind must stay unset without declared facts.
     expect(
-      buildOutboundSessionContext({
-        cfg: {} as never,
-        sessionKey: "session:main:123",
-        agentId: "  explicit-agent  ",
+      buildContext({
+        sessionKey: "agent:main:discord:dm:U123",
+        policySessionKey: "agent:main:whatsapp:default:direct:+15551234567",
       }),
     ).toEqual({
-      key: "session:main:123",
-      agentId: "explicit-agent",
+      key: "agent:main:discord:dm:U123",
+      policyKey: "agent:main:whatsapp:default:direct:+15551234567",
+      conversationType: "direct",
+    });
+  });
+
+  it("keeps an explicit conversation type authoritative over a direct fallback", () => {
+    expect(buildContext({ conversationType: "channel", isGroup: false })).toEqual({
+      conversationType: "group",
+      conversationKind: "channel",
     });
   });
 });

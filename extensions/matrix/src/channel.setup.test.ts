@@ -1,276 +1,125 @@
+import { createRuntimeEnv } from "openclaw/plugin-sdk/plugin-test-runtime";
+import { withEnv, withEnvAsync } from "openclaw/plugin-sdk/test-env";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { RuntimeEnv } from "../runtime-api.js";
 
-const verificationMocks = vi.hoisted(() => ({
-  bootstrapMatrixVerification: vi.fn(),
-}));
+const verificationMocks = vi.hoisted(() => ({ bootstrapMatrixVerification: vi.fn() }));
 
 vi.mock("./matrix/actions/verification.js", () => ({
   bootstrapMatrixVerification: verificationMocks.bootstrapMatrixVerification,
 }));
+const bootstrap = verificationMocks.bootstrapMatrixVerification;
 
-import { matrixPlugin } from "./channel.js";
+import { matrixSetupPlugin } from "./channel.setup.js";
+import { runMatrixSetupBootstrapAfterConfigWrite } from "./setup-bootstrap.js";
+import { matrixSetupAdapter } from "./setup-core.js";
 import { installMatrixTestRuntime } from "./test-runtime.js";
 import type { CoreConfig } from "./types.js";
+function config(matrix: NonNullable<CoreConfig["channels"]>["matrix"]): CoreConfig {
+  return { channels: { matrix } };
+}
+const auth = { homeserver: "https://matrix.example.org", userId: "@flurry:example.org" };
+const authEnv = { MATRIX_HOMESERVER: auth.homeserver, MATRIX_ACCESS_TOKEN: "env-token" };
 
 describe("matrix setup post-write bootstrap", () => {
-  const log = vi.fn();
-  const error = vi.fn();
-  const exit = vi.fn((code: number): never => {
-    throw new Error(`exit ${code}`);
-  });
-  const runtime: RuntimeEnv = {
-    log,
-    error,
-    exit,
-  };
+  const runtime = createRuntimeEnv();
+  const { log, error } = runtime;
+
+  async function runBootstrap(
+    input: Record<string, unknown>,
+    previousCfg = config({ encryption: true }),
+    accountId = "default",
+  ) {
+    const cfg = matrixSetupAdapter.applyAccountConfig({
+      cfg: previousCfg,
+      accountId,
+      input,
+    }) as CoreConfig;
+    await runMatrixSetupBootstrapAfterConfigWrite({ previousCfg, cfg, accountId, runtime });
+    return cfg;
+  }
 
   beforeEach(() => {
-    verificationMocks.bootstrapMatrixVerification.mockReset();
-    log.mockClear();
-    error.mockClear();
-    exit.mockClear();
+    bootstrap.mockReset();
+    vi.mocked(log).mockClear();
+    vi.mocked(error).mockClear();
     installMatrixTestRuntime();
   });
 
-  it("bootstraps verification for newly added encrypted accounts", async () => {
-    const previousCfg = {
-      channels: {
-        matrix: {
-          encryption: true,
-        },
-      },
-    } as CoreConfig;
-    const input = {
-      homeserver: "https://matrix.example.org",
-      userId: "@flurry:example.org",
-      password: "secret", // pragma: allowlist secret
-    };
-    const nextCfg = matrixPlugin.setup!.applyAccountConfig({
-      cfg: previousCfg,
-      accountId: "default",
-      input,
-    }) as CoreConfig;
-    verificationMocks.bootstrapMatrixVerification.mockResolvedValue({
-      success: true,
-      verification: {
-        backupVersion: "7",
-      },
-      crossSigning: {},
-      pendingVerifications: 0,
-      cryptoBootstrap: null,
-    });
-
-    await matrixPlugin.setup!.afterAccountConfigWritten?.({
-      previousCfg,
-      cfg: nextCfg,
-      accountId: "default",
-      input,
-      runtime,
-    });
-
-    expect(verificationMocks.bootstrapMatrixVerification).toHaveBeenCalledWith({
-      accountId: "default",
-    });
-    expect(log).toHaveBeenCalledWith('Matrix verification bootstrap: complete for "default".');
-    expect(log).toHaveBeenCalledWith('Matrix backup version for "default": 7');
-    expect(error).not.toHaveBeenCalled();
-  });
-
-  it("does not bootstrap verification for already configured accounts", async () => {
-    const previousCfg = {
-      channels: {
-        matrix: {
-          accounts: {
-            flurry: {
-              encryption: true,
-              homeserver: "https://matrix.example.org",
-              userId: "@flurry:example.org",
-              accessToken: "token",
+  it("uses the supplied scoped account environment for configured state", async () => {
+    await withEnvAsync(
+      { ...authEnv, MATRIX_HOMESERVER: "https://ambient.example.org" },
+      async () => {
+        await expect(
+          matrixSetupPlugin.config.hasConfiguredStateAsync!({
+            cfg: config({}),
+            env: {
+              MATRIX_OPS_HOMESERVER: "https://matrix.example.org",
+              MATRIX_OPS_ACCESS_TOKEN: "scoped-token",
             },
-          },
-        },
+          }),
+        ).resolves.toBe(true);
       },
-    } as CoreConfig;
-    const input = {
-      homeserver: "https://matrix.example.org",
-      userId: "@flurry:example.org",
-      accessToken: "new-token",
-    };
-    const nextCfg = matrixPlugin.setup!.applyAccountConfig({
-      cfg: previousCfg,
-      accountId: "flurry",
-      input,
-    }) as CoreConfig;
-
-    await matrixPlugin.setup!.afterAccountConfigWritten?.({
-      previousCfg,
-      cfg: nextCfg,
-      accountId: "flurry",
-      input,
-      runtime,
-    });
-
-    expect(verificationMocks.bootstrapMatrixVerification).not.toHaveBeenCalled();
-    expect(log).not.toHaveBeenCalled();
-    expect(error).not.toHaveBeenCalled();
-  });
-
-  it("logs a warning when verification bootstrap fails", async () => {
-    const previousCfg = {
-      channels: {
-        matrix: {
-          encryption: true,
-        },
-      },
-    } as CoreConfig;
-    const input = {
-      homeserver: "https://matrix.example.org",
-      userId: "@flurry:example.org",
-      password: "secret", // pragma: allowlist secret
-    };
-    const nextCfg = matrixPlugin.setup!.applyAccountConfig({
-      cfg: previousCfg,
-      accountId: "default",
-      input,
-    }) as CoreConfig;
-    verificationMocks.bootstrapMatrixVerification.mockResolvedValue({
-      success: false,
-      error: "no room-key backup exists on the homeserver",
-      verification: {
-        backupVersion: null,
-      },
-      crossSigning: {},
-      pendingVerifications: 0,
-      cryptoBootstrap: null,
-    });
-
-    await matrixPlugin.setup!.afterAccountConfigWritten?.({
-      previousCfg,
-      cfg: nextCfg,
-      accountId: "default",
-      input,
-      runtime,
-    });
-
-    expect(error).toHaveBeenCalledWith(
-      'Matrix verification bootstrap warning for "default": no room-key backup exists on the homeserver',
     );
   });
 
-  it("bootstraps a newly added env-backed default account when encryption is already enabled", async () => {
-    const previousEnv = {
-      MATRIX_HOMESERVER: process.env.MATRIX_HOMESERVER,
-      MATRIX_ACCESS_TOKEN: process.env.MATRIX_ACCESS_TOKEN,
-    };
-    process.env.MATRIX_HOMESERVER = "https://matrix.example.org";
-    process.env.MATRIX_ACCESS_TOKEN = "env-token";
-    try {
-      const previousCfg = {
-        channels: {
-          matrix: {
-            encryption: true,
-          },
-        },
-      } as CoreConfig;
-      const input = {
-        useEnv: true,
-      };
-      const nextCfg = matrixPlugin.setup!.applyAccountConfig({
-        cfg: previousCfg,
-        accountId: "default",
-        input,
-      }) as CoreConfig;
-      verificationMocks.bootstrapMatrixVerification.mockResolvedValue({
-        success: true,
-        verification: {
-          backupVersion: "9",
-        },
-        crossSigning: {},
-        pendingVerifications: 0,
-        cryptoBootstrap: null,
-      });
+  it.each([false, true])("leaves existing accounts alone (encryption=%s)", async (encryption) => {
+    const previousCfg = config({
+      accounts: { flurry: { ...auth, encryption, accessToken: "token" } },
+    });
+    await runBootstrap({ ...auth, accessToken: "new-token" }, previousCfg, "flurry");
 
-      await matrixPlugin.setup!.afterAccountConfigWritten?.({
-        previousCfg,
-        cfg: nextCfg,
-        accountId: "default",
-        input,
-        runtime,
-      });
+    expect(bootstrap).not.toHaveBeenCalled();
+  });
 
-      expect(verificationMocks.bootstrapMatrixVerification).toHaveBeenCalledWith({
-        accountId: "default",
+  it.each([false, true])("reports bootstrap success=%s", async (success) => {
+    await withEnvAsync(authEnv, async () => {
+      const warning = "no room-key backup exists on the homeserver";
+      bootstrap.mockResolvedValue({
+        success,
+        error: warning,
+        verification: { backupVersion: "9" },
       });
-      expect(log).toHaveBeenCalledWith('Matrix verification bootstrap: complete for "default".');
-    } finally {
-      for (const [key, value] of Object.entries(previousEnv)) {
-        if (value === undefined) {
-          delete process.env[key];
-        } else {
-          process.env[key] = value;
-        }
-      }
-    }
+      const cfg = await runBootstrap(success ? { useEnv: true } : { ...auth, password: "secret" }); // pragma: allowlist secret
+      expect(bootstrap).toHaveBeenCalledWith({ accountId: "default", cfg });
+      expect(success ? log : error).toHaveBeenCalledWith(
+        success
+          ? 'Matrix verification bootstrap: complete for "default".'
+          : `Matrix verification bootstrap warning for "default": ${warning}`,
+      );
+    });
   });
 
   it("rejects default useEnv setup when no Matrix auth env vars are available", () => {
-    const previousEnv = {
-      MATRIX_HOMESERVER: process.env.MATRIX_HOMESERVER,
-      MATRIX_USER_ID: process.env.MATRIX_USER_ID,
-      MATRIX_ACCESS_TOKEN: process.env.MATRIX_ACCESS_TOKEN,
-      MATRIX_PASSWORD: process.env.MATRIX_PASSWORD,
-      MATRIX_DEFAULT_HOMESERVER: process.env.MATRIX_DEFAULT_HOMESERVER,
-      MATRIX_DEFAULT_USER_ID: process.env.MATRIX_DEFAULT_USER_ID,
-      MATRIX_DEFAULT_ACCESS_TOKEN: process.env.MATRIX_DEFAULT_ACCESS_TOKEN,
-      MATRIX_DEFAULT_PASSWORD: process.env.MATRIX_DEFAULT_PASSWORD,
-    };
-    for (const key of Object.keys(previousEnv)) {
-      delete process.env[key];
-    }
-    try {
+    const emptyEnv = Object.fromEntries(
+      ["MATRIX_", "MATRIX_DEFAULT_"].flatMap((prefix) =>
+        ["HOMESERVER", "USER_ID", "ACCESS_TOKEN", "PASSWORD"].map((key) => [
+          `${prefix}${key}`,
+          undefined,
+        ]),
+      ),
+    );
+    withEnv(emptyEnv, () => {
       expect(
-        matrixPlugin.setup!.validateInput?.({
+        matrixSetupAdapter.validateInput?.({
           cfg: {} as CoreConfig,
           accountId: "default",
           input: { useEnv: true },
         }),
       ).toContain("Set Matrix env vars for the default account");
-    } finally {
-      for (const [key, value] of Object.entries(previousEnv)) {
-        if (value === undefined) {
-          delete process.env[key];
-        } else {
-          process.env[key] = value;
-        }
-      }
-    }
+    });
   });
 
-  it("clears allowPrivateNetwork when deleting the default Matrix account config", () => {
-    const updated = matrixPlugin.config.deleteAccount?.({
-      cfg: {
-        channels: {
-          matrix: {
-            homeserver: "http://localhost.localdomain:8008",
-            allowPrivateNetwork: true,
-            accounts: {
-              ops: {
-                enabled: true,
-              },
-            },
-          },
-        },
-      } as CoreConfig,
+  it("clears allowPrivateNetwork and proxy when deleting the default Matrix account config", () => {
+    const updated = matrixSetupPlugin.config.deleteAccount?.({
+      cfg: config({
+        homeserver: "http://localhost.localdomain:8008",
+        network: { dangerouslyAllowPrivateNetwork: true },
+        proxy: "http://127.0.0.1:7890",
+        accounts: { ops: { enabled: true } },
+      }),
       accountId: "default",
     }) as CoreConfig;
 
-    expect(updated.channels?.matrix).toEqual({
-      accounts: {
-        ops: {
-          enabled: true,
-        },
-      },
-    });
+    expect(updated.channels?.matrix).toEqual({ accounts: { ops: { enabled: true } } });
   });
 });

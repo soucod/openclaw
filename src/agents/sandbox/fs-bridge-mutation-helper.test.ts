@@ -1,15 +1,16 @@
+// Guest branch coverage belongs to fs-safe's guest-filesystem, boundary,
+// publication, and recovery suites. Keep OpenClaw launcher composition and
+// the unmatched fault-injection regressions here.
 import { spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
-import { withTempDir } from "../../test-helpers/temp-dir.js";
-import {
-  buildPinnedWritePlan,
-  SANDBOX_PINNED_MUTATION_PYTHON,
-} from "./fs-bridge-mutation-helper.js";
+import { GUEST_FILESYSTEM_PYTHON } from "@openclaw/fs-safe/guest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
+import { buildPinnedMutationPlan } from "./fs-bridge-mutation-helper.js";
 
-function runMutation(args: string[], input?: string) {
-  return spawnSync("python3", ["-c", SANDBOX_PINNED_MUTATION_PYTHON, ...args], {
+function runMutationWithSource(source: string, args: string[], input?: string) {
+  return spawnSync("python3", ["-c", source, ...args], {
     input,
     encoding: "utf8",
     stdio: ["pipe", "pipe", "pipe"],
@@ -17,18 +18,13 @@ function runMutation(args: string[], input?: string) {
 }
 
 function runWritePlan(args: string[], input?: string) {
-  const plan = buildPinnedWritePlan({
-    check: {
-      target: {
-        hostPath: args[1] ?? "",
-        containerPath: args[1] ?? "",
-        relativePath: path.posix.join(args[2] ?? "", args[3] ?? ""),
-        writable: true,
-      },
-      options: {
-        action: "write files",
-        requireWritable: true,
-      },
+  const plan = buildPinnedMutationPlan({
+    kind: "write",
+    target: {
+      hostPath: args[1] ?? "",
+      containerPath: args[1] ?? "",
+      relativePath: path.posix.join(args[2] ?? "", args[3] ?? ""),
+      writable: true,
     },
     pinned: {
       mountRootPath: args[1] ?? "",
@@ -38,149 +34,154 @@ function runWritePlan(args: string[], input?: string) {
     mkdir: args[4] === "1",
   });
 
-  return spawnSync("sh", ["-c", plan.script, "moltbot-sandbox-fs", ...(plan.args ?? [])], {
+  return spawnSync("/bin/sh", ["-c", plan.script, "openclaw-sandbox-fs", ...(plan.args ?? [])], {
     input,
     encoding: "utf8",
     stdio: ["pipe", "pipe", "pipe"],
   });
 }
 
+async function expectPathMissing(targetPath: string): Promise<void> {
+  const err = await fs.access(targetPath).catch((caught: unknown) => caught);
+  expect(err).toBeInstanceOf(Error);
+  expect(err).toMatchObject({ code: "ENOENT" });
+}
+
+const expectFile = (filePath: string, content: string) =>
+  expect(fs.readFile(filePath, "utf8")).resolves.toBe(content);
+
+const FORCED_EXDEV_MUTATION_PYTHON = GUEST_FILESYSTEM_PYTHON.replace(
+  "        os.rename(src_basename, dst_basename, src_dir_fd=src_parent_fd, dst_dir_fd=dst_parent_fd)",
+  "        raise OSError(errno.EXDEV, 'forced EXDEV for test')\n        os.rename(src_basename, dst_basename, src_dir_fd=src_parent_fd, dst_dir_fd=dst_parent_fd)",
+);
+
+const FORCED_COPY_FAILURE_MUTATION_PYTHON = GUEST_FILESYSTEM_PYTHON.replace(
+  "        copy_completed = True",
+  "        raise OSError(errno.ENOSPC, 'forced copy failure')\n        copy_completed = True",
+);
+
+function injectCreatePublicationRace(lines: string[]): string {
+  const publication = "        rename_no_replace(staging_fd, temp_name, parent_fd, basename)";
+  // A changed guest fragment must fail loudly instead of silently dropping the race.
+  expect(GUEST_FILESYSTEM_PYTHON).toContain(publication);
+  return GUEST_FILESYSTEM_PYTHON.replace(publication, [...lines, publication].join("\n"));
+}
+
+const FORCED_CREATE_TEMP_SUBSTITUTION_MUTATION_PYTHON = injectCreatePublicationRace([
+  "        original_fd = os.open(temp_name, os.O_RDONLY, dir_fd=staging_fd)",
+  "        try:",
+  "            os.unlink(temp_name, dir_fd=staging_fd)",
+  "            replacement_fd = os.open(temp_name, WRITE_FLAGS, 0o600, dir_fd=staging_fd)",
+  "        finally:",
+  "            os.close(original_fd)",
+  "        try:",
+  "            os.write(replacement_fd, b'replacement')",
+  "        finally:",
+  "            os.close(replacement_fd)",
+]);
+
 describe("sandbox pinned mutation helper", () => {
-  it("writes through a pinned directory fd", async () => {
-    await withTempDir({ prefix: "openclaw-mutation-helper-" }, async (root) => {
-      const workspace = path.join(root, "workspace");
-      await fs.mkdir(workspace, { recursive: true });
+  const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+  let root: string;
+  let workspace: string;
 
-      const result = runMutation(["write", workspace, "nested/deeper", "note.txt", "1"], "hello");
-
-      expect(result.status).toBe(0);
-      await expect(
-        fs.readFile(path.join(workspace, "nested", "deeper", "note.txt"), "utf8"),
-      ).resolves.toBe("hello");
-    });
+  beforeEach(async () => {
+    root = tempDirs.make("openclaw-mutation-helper-");
+    workspace = path.join(root, "workspace");
+    await fs.mkdir(workspace, { recursive: true });
   });
 
-  it.runIf(process.platform !== "win32")(
-    "preserves stdin payload bytes when the pinned write plan runs through sh",
-    async () => {
-      await withTempDir({ prefix: "openclaw-mutation-helper-" }, async (root) => {
-        const workspace = path.join(root, "workspace");
-        await fs.mkdir(workspace, { recursive: true });
+  const create = (source: string, input = "hello") =>
+    runMutationWithSource(source, ["create", workspace, "", "note.txt", "0"], input);
 
-        const result = runWritePlan(
-          ["write", workspace, "nested/deeper", "note.txt", "1"],
-          "hello",
-        );
+  it("fails when the staged exclusive-create pathname is substituted", async () => {
+    const filePath = path.join(workspace, "note.txt");
 
-        expect(result.status).toBe(0);
-        await expect(
-          fs.readFile(path.join(workspace, "nested", "deeper", "note.txt"), "utf8"),
-        ).resolves.toBe("hello");
-      });
-    },
-  );
+    const result = create(FORCED_CREATE_TEMP_SUBSTITUTION_MUTATION_PYTHON, "expected");
 
-  it.runIf(process.platform !== "win32")(
-    "rejects symlink-parent writes instead of materializing a temp file outside the mount",
-    async () => {
-      await withTempDir({ prefix: "openclaw-mutation-helper-" }, async (root) => {
-        const workspace = path.join(root, "workspace");
-        const outside = path.join(root, "outside");
-        await fs.mkdir(workspace, { recursive: true });
-        await fs.mkdir(outside, { recursive: true });
-        await fs.symlink(outside, path.join(workspace, "alias"));
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("exclusive publication source changed");
+    await expectFile(filePath, "replacement");
+    await expect(fs.readdir(workspace)).resolves.toStrictEqual(["note.txt"]);
+  });
 
-        const result = runMutation(["write", workspace, "alias", "escape.txt", "0"], "owned");
+  describe.runIf(process.platform !== "win32")("POSIX operations", () => {
+    it("copies atomically over a long destination basename and preserves source mode", async () => {
+      const name = `${"d".repeat(235)}.bin`;
+      const destination = path.join(root, "destination");
+      const target = path.join(destination, "nested", name);
+      const source = path.join(workspace, "payload.bin");
+      await fs.mkdir(path.dirname(target), { recursive: true });
+      await fs.writeFile(source, "streamed", "utf8");
+      await fs.chmod(source, 0o640);
+      await fs.writeFile(target, "old", "utf8");
+      const result = runMutationWithSource(GUEST_FILESYSTEM_PYTHON, [
+        "copy",
+        workspace,
+        "",
+        "payload.bin",
+        destination,
+        "nested",
+        name,
+        "1",
+      ]);
+      expect(result.status).toBe(0);
+      await expectFile(target, "streamed");
+      expect((await fs.stat(target)).mode & 0o777).toBe(0o640);
+    });
 
-        expect(result.status).not.toBe(0);
-        await expect(fs.readFile(path.join(outside, "escape.txt"), "utf8")).rejects.toThrow();
-      });
-    },
-  );
+    it("removes a partial temporary file when streaming copy fails", async () => {
+      const destinationRoot = path.join(root, "destination");
+      await fs.mkdir(destinationRoot, { recursive: true });
+      await fs.writeFile(path.join(workspace, "payload.bin"), "streamed", "utf8");
 
-  it.runIf(process.platform !== "win32")("rejects symlink segments during mkdirp", async () => {
-    await withTempDir({ prefix: "openclaw-mutation-helper-" }, async (root) => {
-      const workspace = path.join(root, "workspace");
-      const outside = path.join(root, "outside");
-      await fs.mkdir(workspace, { recursive: true });
-      await fs.mkdir(outside, { recursive: true });
-      await fs.symlink(outside, path.join(workspace, "alias"));
-
-      const result = runMutation(["mkdirp", workspace, "alias/nested"]);
+      const result = runMutationWithSource(FORCED_COPY_FAILURE_MUTATION_PYTHON, [
+        "copy",
+        workspace,
+        "",
+        "payload.bin",
+        destinationRoot,
+        "",
+        "payload.bin",
+        "1",
+      ]);
 
       expect(result.status).not.toBe(0);
-      await expect(fs.readFile(path.join(outside, "nested"), "utf8")).rejects.toThrow();
+      expect(result.stderr).toContain("forced copy failure");
+      await expectPathMissing(path.join(destinationRoot, "payload.bin"));
+      await expect(fs.readdir(destinationRoot)).resolves.toEqual([]);
     });
-  });
 
-  it.runIf(process.platform !== "win32")("remove unlinks the symlink itself", async () => {
-    await withTempDir({ prefix: "openclaw-mutation-helper-" }, async (root) => {
-      const workspace = path.join(root, "workspace");
-      const outside = path.join(root, "outside");
-      await fs.mkdir(workspace, { recursive: true });
-      await fs.mkdir(outside, { recursive: true });
-      await fs.writeFile(path.join(outside, "secret.txt"), "classified", "utf8");
-      await fs.symlink(path.join(outside, "secret.txt"), path.join(workspace, "link.txt"));
-
-      const result = runMutation(["remove", workspace, "", "link.txt", "0", "0"]);
+    it("preserves stdin payload bytes when the pinned write plan runs through sh", async () => {
+      const result = runWritePlan(["write", workspace, "nested/deeper", "note.txt", "1"], "hello");
 
       expect(result.status).toBe(0);
-      await expect(fs.readlink(path.join(workspace, "link.txt"))).rejects.toThrow();
-      await expect(fs.readFile(path.join(outside, "secret.txt"), "utf8")).resolves.toBe(
-        "classified",
-      );
+      await expectFile(path.join(workspace, "nested", "deeper", "note.txt"), "hello");
+    });
+
+    it("rejects hardlinked files during rename EXDEV fallback", async () => {
+      const destRoot = path.join(root, "dest");
+      const outsideRoot = path.join(root, "outside");
+      await fs.mkdir(destRoot, { recursive: true });
+      await fs.mkdir(outsideRoot, { recursive: true });
+      await fs.writeFile(path.join(outsideRoot, "secret.txt"), "classified", "utf8");
+      await fs.link(path.join(outsideRoot, "secret.txt"), path.join(workspace, "linked.txt"));
+
+      const result = runMutationWithSource(FORCED_EXDEV_MUTATION_PYTHON, [
+        "rename",
+        workspace,
+        "",
+        "linked.txt",
+        destRoot,
+        "",
+        "copied.txt",
+        "1",
+      ]);
+
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toMatch(/hardlinked file/i);
+      await expectPathMissing(path.join(destRoot, "copied.txt"));
+      await expectFile(path.join(outsideRoot, "secret.txt"), "classified");
     });
   });
-
-  it.runIf(process.platform !== "win32")(
-    "rejects symlink destination parents during rename",
-    async () => {
-      await withTempDir({ prefix: "openclaw-mutation-helper-" }, async (root) => {
-        const workspace = path.join(root, "workspace");
-        const outside = path.join(root, "outside");
-        await fs.mkdir(workspace, { recursive: true });
-        await fs.mkdir(outside, { recursive: true });
-        await fs.writeFile(path.join(workspace, "from.txt"), "payload", "utf8");
-        await fs.symlink(outside, path.join(workspace, "alias"));
-
-        const result = runMutation([
-          "rename",
-          workspace,
-          "",
-          "from.txt",
-          workspace,
-          "alias",
-          "escape.txt",
-          "1",
-        ]);
-
-        expect(result.status).not.toBe(0);
-        await expect(fs.readFile(path.join(workspace, "from.txt"), "utf8")).resolves.toBe(
-          "payload",
-        );
-        await expect(fs.readFile(path.join(outside, "escape.txt"), "utf8")).rejects.toThrow();
-      });
-    },
-  );
-
-  it.runIf(process.platform !== "win32")(
-    "copies directories across different mount roots during rename fallback",
-    async () => {
-      await withTempDir({ prefix: "openclaw-mutation-helper-" }, async (root) => {
-        const sourceRoot = path.join(root, "source");
-        const destRoot = path.join(root, "dest");
-        await fs.mkdir(path.join(sourceRoot, "dir", "nested"), { recursive: true });
-        await fs.mkdir(destRoot, { recursive: true });
-        await fs.writeFile(path.join(sourceRoot, "dir", "nested", "file.txt"), "payload", "utf8");
-
-        const result = runMutation(["rename", sourceRoot, "", "dir", destRoot, "", "moved", "1"]);
-
-        expect(result.status).toBe(0);
-        await expect(
-          fs.readFile(path.join(destRoot, "moved", "nested", "file.txt"), "utf8"),
-        ).resolves.toBe("payload");
-        await expect(fs.stat(path.join(sourceRoot, "dir"))).rejects.toThrow();
-      });
-    },
-  );
 });

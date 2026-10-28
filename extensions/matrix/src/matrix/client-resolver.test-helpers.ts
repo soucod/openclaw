@@ -1,94 +1,71 @@
-import { vi, type Mock } from "vitest";
+import { expect, vi } from "vitest";
+import type { SharedMatrixClientLease } from "./client/shared.js";
 import type { MatrixClient } from "./sdk.js";
 
-type MatrixClientResolverMocks = {
-  loadConfigMock: Mock<() => unknown>;
-  getMatrixRuntimeMock: Mock<() => unknown>;
-  getActiveMatrixClientMock: Mock<(...args: unknown[]) => MatrixClient | null>;
-  acquireSharedMatrixClientMock: Mock<(...args: unknown[]) => Promise<MatrixClient>>;
-  releaseSharedClientInstanceMock: Mock<(...args: unknown[]) => Promise<boolean>>;
-  isBunRuntimeMock: Mock<() => boolean>;
-  resolveMatrixAuthContextMock: Mock<
-    (params: { cfg: unknown; accountId?: string | null }) => unknown
-  >;
+export const matrixClientResolverMocks = {
+  getMatrixRuntimeMock: vi.fn<() => unknown>(),
+  acquireSharedMatrixClientMock: vi.fn<(...args: unknown[]) => Promise<SharedMatrixClientLease>>(),
+  sharedLeaseReleaseMock: vi.fn<(...args: unknown[]) => Promise<void>>(),
+  sharedLeaseStartMock: vi.fn<(...args: unknown[]) => Promise<void>>(),
 };
-
-export const matrixClientResolverMocks: MatrixClientResolverMocks = {
-  loadConfigMock: vi.fn(() => ({})),
-  getMatrixRuntimeMock: vi.fn(),
-  getActiveMatrixClientMock: vi.fn(),
-  acquireSharedMatrixClientMock: vi.fn(),
-  releaseSharedClientInstanceMock: vi.fn(),
-  isBunRuntimeMock: vi.fn(() => false),
-  resolveMatrixAuthContextMock: vi.fn(),
-};
+const { acquireSharedMatrixClientMock, sharedLeaseReleaseMock, sharedLeaseStartMock } =
+  matrixClientResolverMocks;
 
 export function createMockMatrixClient(): MatrixClient {
   return {
     prepareForOneOff: vi.fn(async () => undefined),
     start: vi.fn(async () => undefined),
-    stop: vi.fn(() => undefined),
-    stopAndPersist: vi.fn(async () => undefined),
   } as unknown as MatrixClient;
 }
 
-export function primeMatrixClientResolverMocks(params?: {
-  cfg?: unknown;
-  accountId?: string;
-  resolved?: Record<string, unknown>;
-  auth?: Record<string, unknown>;
-  client?: MatrixClient;
-}): MatrixClient {
-  const {
-    loadConfigMock,
-    getMatrixRuntimeMock,
-    getActiveMatrixClientMock,
-    acquireSharedMatrixClientMock,
-    releaseSharedClientInstanceMock,
-    isBunRuntimeMock,
-    resolveMatrixAuthContextMock,
-  } = matrixClientResolverMocks;
-
-  const cfg = params?.cfg ?? {};
-  const accountId = params?.accountId ?? "default";
-  const defaultResolved = {
-    homeserver: "https://matrix.example.org",
-    userId: "@bot:example.org",
-    accessToken: "token",
-    password: undefined,
-    deviceId: "DEVICE123",
-    encryption: false,
-  };
-  const client = params?.client ?? createMockMatrixClient();
-
-  vi.clearAllMocks();
-  loadConfigMock.mockReturnValue(cfg);
-  getMatrixRuntimeMock.mockReturnValue({
-    config: {
-      loadConfig: loadConfigMock,
-    },
+export function setAcquiredMatrixClient(client: MatrixClient): SharedMatrixClientLease {
+  sharedLeaseStartMock.mockImplementation(async () => {
+    await client.start();
   });
-  getActiveMatrixClientMock.mockReturnValue(null);
-  isBunRuntimeMock.mockReturnValue(false);
-  releaseSharedClientInstanceMock.mockReset().mockResolvedValue(true);
-  resolveMatrixAuthContextMock.mockImplementation(
-    ({
-      cfg: explicitCfg,
-      accountId: explicitAccountId,
-    }: {
-      cfg: unknown;
-      accountId?: string | null;
-    }) => ({
-      cfg: explicitCfg,
-      env: process.env,
-      accountId: explicitAccountId ?? accountId,
-      resolved: {
-        ...defaultResolved,
-        ...params?.resolved,
-      },
-    }),
-  );
-  acquireSharedMatrixClientMock.mockResolvedValue(client);
+  const lease: SharedMatrixClientLease = {
+    abortSignal: new AbortController().signal,
+    client,
+    role: "transient",
+    registerMonitorRetirement: vi.fn(),
+    start: sharedLeaseStartMock,
+    release: sharedLeaseReleaseMock,
+  };
+  acquireSharedMatrixClientMock.mockResolvedValue(lease);
+  return lease;
+}
 
-  return client;
+export function primeMatrixClientResolverMocks() {
+  vi.clearAllMocks();
+  sharedLeaseReleaseMock.mockReset().mockResolvedValue(undefined);
+  sharedLeaseStartMock.mockReset();
+  acquireSharedMatrixClientMock.mockReset();
+  setAcquiredMatrixClient(createMockMatrixClient());
+}
+
+export async function expectOneOffSharedMatrixClient(params?: {
+  prepareForOneOffCalls?: number;
+  startCalls?: number;
+  releaseMode?: "persist" | "stop" | "discard";
+}) {
+  expect(acquireSharedMatrixClientMock).toHaveBeenCalledExactlyOnceWith({
+    cfg: {},
+    timeoutMs: undefined,
+    accountId: "default",
+    role: "transient",
+  });
+
+  const lease = await acquireSharedMatrixClientMock.mock.results[0]?.value;
+  expect(lease.client.prepareForOneOff).toHaveBeenCalledTimes(params?.prepareForOneOffCalls ?? 1);
+  expect(lease.client.start).toHaveBeenCalledTimes(params?.startCalls ?? 0);
+  expect(sharedLeaseReleaseMock).toHaveBeenCalledWith({ mode: params?.releaseMode ?? "persist" });
+}
+
+export function expectExplicitMatrixClientConfig(params: { cfg: unknown; accountId?: string }) {
+  expect(matrixClientResolverMocks.getMatrixRuntimeMock).not.toHaveBeenCalled();
+  expect(acquireSharedMatrixClientMock).toHaveBeenCalledWith({
+    cfg: params.cfg,
+    timeoutMs: undefined,
+    accountId: params.accountId ?? "default",
+    role: "transient",
+  });
 }

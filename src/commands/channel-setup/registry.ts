@@ -1,47 +1,31 @@
-import { listChannelSetupPlugins } from "../../channels/plugins/setup-registry.js";
+import type { ChannelSetupWizardAdapter } from "../../channels/plugins/setup-wizard-types.js";
 import { buildChannelSetupWizardAdapterFromSetupWizard } from "../../channels/plugins/setup-wizard.js";
-import type { ChannelPlugin } from "../../channels/plugins/types.js";
-import type { ChannelChoice } from "../onboard-types.js";
-import type { ChannelSetupWizardAdapter } from "./types.js";
+import type { AnyChannelPlugin as ChannelPlugin } from "../../channels/plugins/types.plugin.js";
 
 const setupWizardAdapters = new WeakMap<object, ChannelSetupWizardAdapter>();
 
+/** Resolve the setup wizard adapter exposed by one channel plugin, caching declarative adapters. */
 export function resolveChannelSetupWizardAdapterForPlugin(
   plugin?: ChannelPlugin,
 ): ChannelSetupWizardAdapter | undefined {
-  if (plugin?.setupWizard) {
-    const cached = setupWizardAdapters.get(plugin);
-    if (cached) {
-      return cached;
-    }
-    const adapter = buildChannelSetupWizardAdapterFromSetupWizard({
-      plugin,
-      wizard: plugin.setupWizard,
-    });
-    setupWizardAdapters.set(plugin, adapter);
-    return adapter;
+  if (!plugin) {
+    return undefined;
   }
-  return undefined;
-}
-
-const getChannelSetupWizardAdapterMap = () => {
-  const adapters = new Map<ChannelChoice, ChannelSetupWizardAdapter>();
-  for (const plugin of listChannelSetupPlugins()) {
-    const adapter = resolveChannelSetupWizardAdapterForPlugin(plugin);
-    if (!adapter) {
-      continue;
-    }
-    adapters.set(plugin.id, adapter);
+  const { setupWizard } = plugin;
+  if (!setupWizard) {
+    return undefined;
   }
-  return adapters;
-};
-
-export function getChannelSetupWizardAdapter(
-  channel: ChannelChoice,
-): ChannelSetupWizardAdapter | undefined {
-  return getChannelSetupWizardAdapterMap().get(channel);
-}
-
-export function listChannelSetupWizardAdapters(): ChannelSetupWizardAdapter[] {
-  return Array.from(getChannelSetupWizardAdapterMap().values());
+  if ("getStatus" in setupWizard) {
+    return setupWizard;
+  }
+  const cached = setupWizardAdapters.get(plugin);
+  if (cached) {
+    return cached;
+  }
+  const adapter = buildChannelSetupWizardAdapterFromSetupWizard({
+    plugin,
+    wizard: setupWizard,
+  });
+  setupWizardAdapters.set(plugin, adapter);
+  return adapter;
 }

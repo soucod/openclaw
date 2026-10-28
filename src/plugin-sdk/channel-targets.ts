@@ -12,17 +12,28 @@ export {
 export {
   buildMessagingTarget,
   ensureTargetId,
-  normalizeTargetId,
-  parseAtUserTarget,
   parseMentionPrefixOrAtUserTarget,
-  parseTargetMention,
-  parseTargetPrefix,
-  parseTargetPrefixes,
   requireTargetKind,
   type MessagingTarget,
   type MessagingTargetKind,
   type MessagingTargetParseOptions,
 } from "../channels/targets.js";
+export {
+  createAllowedChatSenderMatcher,
+  parseChatAllowTargetPrefixes,
+  parseChatTargetPrefixesOrThrow,
+  resolveServicePrefixedAllowTarget,
+  resolveServicePrefixedChatTarget,
+  resolveServicePrefixedOrChatAllowTarget,
+  resolveServicePrefixedTarget,
+  type ChatSenderAllowParams,
+  type ChatTargetPrefixesParams,
+  type ParsedChatAllowTarget,
+  type ParsedChatTarget,
+  type ServicePrefix,
+} from "../channels/plugins/chat-target-prefixes.js";
+export type { ChannelId } from "../channels/plugins/types.public.js";
+export { normalizeAnyChannelId as normalizeChannelId } from "../channels/registry-normalize.js";
 export {
   buildUnresolvedTargetResults,
   resolveTargetsWithOptionalToken,

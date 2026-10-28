@@ -1,38 +1,136 @@
+/**
+ * Channel config adapter and DM-access helpers for plugin setup.
+ *
+ * Not part of the config-schema facade trio despite the similar name: those
+ * export Zod schema builders, while this subpath owns config CRUD adapters,
+ * config-write authorization, and DM access/policy resolution for accounts.
+ */
+import { normalizeStringEntries } from "../../packages/normalization-core/src/string-normalization.js";
 import {
-  deleteAccountFromConfigSection,
-  setAccountEnabledInConfigSection,
+  clearTopLevelChannelConfigFields,
+  deleteAccountFromConfigSection as deleteAccountFromConfigSectionInSection,
+  setAccountEnabledInConfigSection as setAccountEnabledInConfigSectionInSection,
+  setTopLevelChannelEnabledInConfigSection,
+  writeChannelSection,
 } from "../channels/plugins/config-helpers.js";
 import {
-  authorizeConfigWrite,
-  canBypassConfigWritePolicy,
-  formatConfigWriteDeniedMessage,
-  resolveChannelConfigWrites,
-  type ConfigWriteAuthorizationResult,
-  type ConfigWriteScope,
-  type ConfigWriteTarget,
-} from "../channels/plugins/config-writes.js";
-import {
-  collectAllowlistProviderGroupPolicyWarnings,
-  collectAllowlistProviderRestrictSendersWarnings,
-  collectOpenGroupPolicyConfiguredRouteWarnings,
-  collectOpenGroupPolicyRouteAllowlistWarnings,
-  collectOpenProviderGroupPolicyWarnings,
-} from "../channels/plugins/group-policy-warnings.js";
+  resolveChannelConfigWritesShared,
+  type ConfigWriteAuthorizationResultLike,
+  type ConfigWriteScopeLike,
+  type ConfigWriteTargetLike,
+} from "../channels/plugins/config-write-policy-shared.js";
 import { buildAccountScopedDmSecurityPolicy } from "../channels/plugins/helpers.js";
-import { normalizeWhatsAppAllowFromEntries } from "../channels/plugins/normalize/whatsapp.js";
-import { getChannelPlugin } from "../channels/plugins/registry.js";
 import type { ChannelConfigAdapter } from "../channels/plugins/types.adapters.js";
-import type { OpenClawConfig } from "../config/config.js";
+import type { ChannelSecurityDmPolicy } from "../channels/plugins/types.core.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import type { ChannelAccountKeyPolicy } from "../routing/account-lookup.js";
 import { DEFAULT_ACCOUNT_ID, normalizeAccountId } from "../routing/session-key.js";
-import { normalizeStringEntries } from "../shared/string-normalization.js";
+
+export { clearAccountFieldsFromConfigSection } from "../channels/plugins/config-helpers.js";
+
+export {
+  ensureOpenDmPolicyAllowFromWildcard,
+  normalizeChannelDmPolicy,
+  normalizeLegacyDmAliases,
+  resolveChannelDmAccess,
+  resolveChannelDmAllowFrom,
+  resolveChannelDmPolicy,
+  setCanonicalDmAllowFrom,
+  type ChannelDmAccess,
+  type ChannelDmAllowFromMode,
+  type ChannelDmPolicy,
+  type DmAccessRecord,
+} from "../channels/plugins/dm-access.js";
+
+/** Origin scope used when authorizing channel config writes. */
+export type ConfigWriteScope = ConfigWriteScopeLike;
+/** Target account/channel for a config write authorization check. */
+export type ConfigWriteTarget = ConfigWriteTargetLike;
+/** Decision returned by channel config write policy helpers. */
+export type ConfigWriteAuthorizationResult = ConfigWriteAuthorizationResultLike;
+
+type ChannelCrudConfigAdapter<ResolvedAccount> = Pick<
+  ChannelConfigAdapter<ResolvedAccount>,
+  | "listAccountIds"
+  | "resolveAccount"
+  | "inspectAccount"
+  | "defaultAccountId"
+  | "setAccountEnabled"
+  | "deleteAccount"
+>;
+
+type ChannelConfigAdapterWithAccessors<ResolvedAccount> =
+  ChannelCrudConfigAdapter<ResolvedAccount> &
+    Pick<
+      ChannelConfigAdapter<ResolvedAccount>,
+      "resolveAllowFrom" | "formatAllowFrom" | "resolveDefaultTo"
+    >;
+
+/** Returns whether config writes are enabled for a channel/account target. */
+export function resolveChannelConfigWrites(params: {
+  cfg: OpenClawConfig;
+  channelId?: string | null;
+  accountId?: string | null;
+}): boolean {
+  return resolveChannelConfigWritesShared(params);
+}
 
 export {
   authorizeConfigWrite,
   canBypassConfigWritePolicy,
   formatConfigWriteDeniedMessage,
-  resolveChannelConfigWrites,
+} from "../channels/plugins/config-writes.js";
+
+type ChannelConfigAccessorParams<Config extends OpenClawConfig = OpenClawConfig> = {
+  cfg: Config;
+  accountId?: string | null;
 };
-export type { ConfigWriteAuthorizationResult, ConfigWriteScope, ConfigWriteTarget };
+
+type ChannelAccountAccessors<AccessorAccount> = {
+  resolveAllowFrom: (account: AccessorAccount) => Array<string | number> | null | undefined;
+  formatAllowFrom: (allowFrom: Array<string | number>) => string[];
+  resolveDefaultTo?: (account: AccessorAccount) => string | number | null | undefined;
+};
+
+type ResolvedAccountAccessors<ResolvedAccount> = ChannelAccountAccessors<ResolvedAccount> & {
+  resolveAccessorAccount?: undefined;
+};
+
+type ProjectedAccountAccessors<
+  AccessorAccount,
+  Config extends OpenClawConfig,
+> = ChannelAccountAccessors<AccessorAccount> & {
+  resolveAccessorAccount: (params: ChannelConfigAccessorParams<Config>) => AccessorAccount;
+};
+
+type ChannelAccountAccessorOptions<
+  ResolvedAccount,
+  AccessorAccount,
+  Config extends OpenClawConfig,
+> = ChannelAccountAccessors<AccessorAccount> &
+  ([ResolvedAccount] extends [AccessorAccount]
+    ? { resolveAccessorAccount?: (params: ChannelConfigAccessorParams<Config>) => AccessorAccount }
+    : { resolveAccessorAccount: (params: ChannelConfigAccessorParams<Config>) => AccessorAccount });
+
+type MultiAccountChannelConfigAdapterParams<
+  ResolvedAccount,
+  AccessorAccount,
+  Config extends OpenClawConfig,
+> = NamedAccountChannelConfigBaseParams<ResolvedAccount, Config> &
+  (ResolvedAccountAccessors<ResolvedAccount> | ProjectedAccountAccessors<AccessorAccount, Config>);
+
+type NamedAccountChannelConfigBaseParams<
+  ResolvedAccount,
+  Config extends OpenClawConfig = OpenClawConfig,
+> = {
+  sectionKey: string;
+  accountKeyPolicy?: ChannelAccountKeyPolicy;
+  listAccountIds: (cfg: Config) => string[];
+  resolveAccount: (cfg: Config, accountId?: string | null) => ResolvedAccount;
+  defaultAccountId: (cfg: Config) => string;
+  inspectAccount?: (cfg: Config, accountId?: string | null) => unknown;
+  clearBaseFields: string[];
+};
 
 /** Coerce mixed allowlist config values into plain strings without trimming or deduping. */
 export function mapAllowFromEntries(
@@ -67,23 +165,30 @@ export function adaptScopedAccountAccessor<Result, Config extends OpenClawConfig
 /** Build the shared allowlist/default target adapter surface for account-scoped channel configs. */
 export function createScopedAccountConfigAccessors<
   ResolvedAccount,
+  // oxlint-disable-next-line typescript/no-unnecessary-type-parameters -- Config preserves caller-specific config subtype for account resolvers.
   Config extends OpenClawConfig = OpenClawConfig,
 >(params: {
+  /** Resolves the account used by read-only config accessors from `{ cfg, accountId }`. */
   resolveAccount: (params: { cfg: Config; accountId?: string | null }) => ResolvedAccount;
+  /** Reads raw allowlist entries from the resolved account. */
   resolveAllowFrom: (account: ResolvedAccount) => Array<string | number> | null | undefined;
+  /** Formats allowlist entries for display or config inspection. */
   formatAllowFrom: (allowFrom: Array<string | number>) => string[];
+  /** Optional default destination selector; omitted when the channel has no default target. */
   resolveDefaultTo?: (account: ResolvedAccount) => string | number | null | undefined;
 }): Pick<
   ChannelConfigAdapter<ResolvedAccount>,
   "resolveAllowFrom" | "formatAllowFrom" | "resolveDefaultTo"
 > {
   const base = {
-    resolveAllowFrom: ({ cfg, accountId }: { cfg: OpenClawConfig; accountId?: string | null }) =>
-      mapAllowFromEntries(
+    resolveAllowFrom({ cfg, accountId }: { cfg: OpenClawConfig; accountId?: string | null }) {
+      return mapAllowFromEntries(
         params.resolveAllowFrom(params.resolveAccount({ cfg: cfg as Config, accountId })),
-      ),
-    formatAllowFrom: ({ allowFrom }: { allowFrom: Array<string | number> }) =>
-      params.formatAllowFrom(allowFrom),
+      );
+    },
+    formatAllowFrom({ allowFrom }: { allowFrom: Array<string | number> }) {
+      return params.formatAllowFrom(allowFrom);
+    },
   };
 
   if (!params.resolveDefaultTo) {
@@ -92,10 +197,44 @@ export function createScopedAccountConfigAccessors<
 
   return {
     ...base,
-    resolveDefaultTo: ({ cfg, accountId }) =>
-      resolveOptionalConfigString(
+    resolveDefaultTo({ cfg, accountId }) {
+      return resolveOptionalConfigString(
         params.resolveDefaultTo?.(params.resolveAccount({ cfg: cfg as Config, accountId })),
-      ),
+      );
+    },
+  };
+}
+
+function createChannelConfigAdapterFromBase<
+  ResolvedAccount,
+  AccessorAccount,
+  Config extends OpenClawConfig = OpenClawConfig,
+>(
+  params: {
+    base: ChannelCrudConfigAdapter<ResolvedAccount>;
+    resolveAccountForAccessors: (params: ChannelConfigAccessorParams<Config>) => ResolvedAccount;
+  } & (
+    | ResolvedAccountAccessors<ResolvedAccount>
+    | ProjectedAccountAccessors<AccessorAccount, Config>
+  ),
+): ChannelConfigAdapterWithAccessors<ResolvedAccount> {
+  const accessors =
+    params.resolveAccessorAccount != null
+      ? createScopedAccountConfigAccessors<AccessorAccount, Config>({
+          resolveAccount: params.resolveAccessorAccount,
+          resolveAllowFrom: params.resolveAllowFrom,
+          formatAllowFrom: params.formatAllowFrom,
+          resolveDefaultTo: params.resolveDefaultTo,
+        })
+      : createScopedAccountConfigAccessors<ResolvedAccount, Config>({
+          resolveAccount: params.resolveAccountForAccessors,
+          resolveAllowFrom: params.resolveAllowFrom,
+          formatAllowFrom: params.formatAllowFrom,
+          resolveDefaultTo: params.resolveDefaultTo,
+        });
+  return {
+    ...params.base,
+    ...accessors,
   };
 }
 
@@ -103,154 +242,84 @@ export function createScopedAccountConfigAccessors<
 export function createScopedChannelConfigBase<
   ResolvedAccount,
   Config extends OpenClawConfig = OpenClawConfig,
->(params: {
-  sectionKey: string;
-  listAccountIds: (cfg: Config) => string[];
-  resolveAccount: (cfg: Config, accountId?: string | null) => ResolvedAccount;
-  defaultAccountId: (cfg: Config) => string;
-  inspectAccount?: (cfg: Config, accountId?: string | null) => unknown;
-  clearBaseFields: string[];
-  allowTopLevel?: boolean;
-}): Pick<
-  ChannelConfigAdapter<ResolvedAccount>,
-  | "listAccountIds"
-  | "resolveAccount"
-  | "inspectAccount"
-  | "defaultAccountId"
-  | "setAccountEnabled"
-  | "deleteAccount"
-> {
+>(
+  params: NamedAccountChannelConfigBaseParams<ResolvedAccount, Config> & {
+    allowTopLevel?: boolean;
+  },
+): ChannelCrudConfigAdapter<ResolvedAccount> {
+  const { listAccountIds, resolveAccount, inspectAccount, defaultAccountId } = params;
   return {
-    listAccountIds: (cfg) => params.listAccountIds(cfg as Config),
-    resolveAccount: (cfg, accountId) => params.resolveAccount(cfg as Config, accountId),
-    inspectAccount: params.inspectAccount
-      ? (cfg, accountId) => params.inspectAccount?.(cfg as Config, accountId)
+    listAccountIds: (cfg) => listAccountIds(cfg as Config),
+    resolveAccount: (cfg, accountId) => resolveAccount(cfg as Config, accountId),
+    inspectAccount: inspectAccount
+      ? (cfg, accountId) => inspectAccount(cfg as Config, accountId)
       : undefined,
-    defaultAccountId: (cfg) => params.defaultAccountId(cfg as Config),
-    setAccountEnabled: ({ cfg, accountId, enabled }) =>
-      setAccountEnabledInConfigSection({
-        cfg: cfg as Config,
+    defaultAccountId: (cfg) => defaultAccountId(cfg as Config),
+    setAccountEnabled({ cfg, accountId, enabled }) {
+      return setAccountEnabledInConfigSectionInSection({
+        cfg,
         sectionKey: params.sectionKey,
-        accountId,
+        accountKeyPolicy: params.accountKeyPolicy,
+        accountId: normalizeAccountId(accountId),
         enabled,
         allowTopLevel: params.allowTopLevel ?? true,
-      }),
-    deleteAccount: ({ cfg, accountId }) =>
-      deleteAccountFromConfigSection({
-        cfg: cfg as Config,
+      });
+    },
+    deleteAccount({ cfg, accountId }) {
+      return deleteAccountFromConfigSectionInSection({
+        cfg,
         sectionKey: params.sectionKey,
-        accountId,
+        accountKeyPolicy: params.accountKeyPolicy,
+        accountId: normalizeAccountId(accountId),
         clearBaseFields: params.clearBaseFields,
-      }),
+      });
+    },
   };
 }
 
 /** Build the full shared config adapter for account-scoped channels with allowlist/default target accessors. */
+export function createScopedChannelConfigAdapter<ResolvedAccount>(
+  params: NamedAccountChannelConfigBaseParams<ResolvedAccount> &
+    ResolvedAccountAccessors<ResolvedAccount> & {
+      allowTopLevel?: boolean;
+    },
+): ChannelConfigAdapterWithAccessors<ResolvedAccount>;
 export function createScopedChannelConfigAdapter<
   ResolvedAccount,
   AccessorAccount = ResolvedAccount,
   Config extends OpenClawConfig = OpenClawConfig,
->(params: {
-  sectionKey: string;
-  listAccountIds: (cfg: Config) => string[];
-  resolveAccount: (cfg: Config, accountId?: string | null) => ResolvedAccount;
-  resolveAccessorAccount?: (params: { cfg: Config; accountId?: string | null }) => AccessorAccount;
-  defaultAccountId: (cfg: Config) => string;
-  inspectAccount?: (cfg: Config, accountId?: string | null) => unknown;
-  clearBaseFields: string[];
-  allowTopLevel?: boolean;
-  resolveAllowFrom: (account: AccessorAccount) => Array<string | number> | null | undefined;
-  formatAllowFrom: (allowFrom: Array<string | number>) => string[];
-  resolveDefaultTo?: (account: AccessorAccount) => string | number | null | undefined;
-}): Pick<
-  ChannelConfigAdapter<ResolvedAccount>,
-  | "listAccountIds"
-  | "resolveAccount"
-  | "inspectAccount"
-  | "defaultAccountId"
-  | "setAccountEnabled"
-  | "deleteAccount"
-  | "resolveAllowFrom"
-  | "formatAllowFrom"
-  | "resolveDefaultTo"
-> {
-  const resolveAccessorAccount =
-    params.resolveAccessorAccount ??
-    (({ cfg, accountId }: { cfg: Config; accountId?: string | null }) =>
-      params.resolveAccount(cfg, accountId) as unknown as AccessorAccount);
-
-  return {
-    ...createScopedChannelConfigBase<ResolvedAccount, Config>({
-      sectionKey: params.sectionKey,
-      listAccountIds: params.listAccountIds,
-      resolveAccount: params.resolveAccount,
-      inspectAccount: params.inspectAccount,
-      defaultAccountId: params.defaultAccountId,
-      clearBaseFields: params.clearBaseFields,
-      allowTopLevel: params.allowTopLevel,
-    }),
-    ...createScopedAccountConfigAccessors<AccessorAccount, Config>({
-      resolveAccount: resolveAccessorAccount,
-      resolveAllowFrom: params.resolveAllowFrom,
-      formatAllowFrom: params.formatAllowFrom,
-      resolveDefaultTo: params.resolveDefaultTo,
-    }),
-  };
-}
-
-function setTopLevelChannelEnabledInConfigSection<Config extends OpenClawConfig>(params: {
-  cfg: Config;
-  sectionKey: string;
-  enabled: boolean;
-}): Config {
-  const section = params.cfg.channels?.[params.sectionKey] as Record<string, unknown> | undefined;
-  return {
-    ...params.cfg,
-    channels: {
-      ...params.cfg.channels,
-      [params.sectionKey]: {
-        ...section,
-        enabled: params.enabled,
-      },
+>(
+  params: NamedAccountChannelConfigBaseParams<ResolvedAccount, Config> &
+    ProjectedAccountAccessors<AccessorAccount, Config> & {
+      allowTopLevel?: boolean;
     },
-  } as Config;
-}
-
-function removeTopLevelChannelConfigSection<Config extends OpenClawConfig>(params: {
-  cfg: Config;
-  sectionKey: string;
-}): Config {
-  const nextChannels = { ...params.cfg.channels } as Record<string, unknown>;
-  delete nextChannels[params.sectionKey];
-  const nextCfg = { ...params.cfg };
-  if (Object.keys(nextChannels).length > 0) {
-    nextCfg.channels = nextChannels as Config["channels"];
-  } else {
-    delete nextCfg.channels;
-  }
-  return nextCfg;
-}
-
-function clearTopLevelChannelConfigFields<Config extends OpenClawConfig>(params: {
-  cfg: Config;
-  sectionKey: string;
-  clearBaseFields: string[];
-}): Config {
-  const section = params.cfg.channels?.[params.sectionKey] as Record<string, unknown> | undefined;
-  if (!section) {
-    return params.cfg;
-  }
-  const nextSection = { ...section };
-  for (const field of params.clearBaseFields) {
-    delete nextSection[field];
-  }
-  return {
-    ...params.cfg,
-    channels: {
-      ...params.cfg.channels,
-      [params.sectionKey]: nextSection,
+): ChannelConfigAdapterWithAccessors<ResolvedAccount>;
+export function createScopedChannelConfigAdapter<
+  ResolvedAccount,
+  AccessorAccount = ResolvedAccount,
+  Config extends OpenClawConfig = OpenClawConfig,
+>(
+  params: NamedAccountChannelConfigBaseParams<ResolvedAccount, Config> &
+    ChannelAccountAccessorOptions<ResolvedAccount, AccessorAccount, Config> & {
+      allowTopLevel?: boolean;
     },
-  } as Config;
+): ChannelConfigAdapterWithAccessors<ResolvedAccount>;
+export function createScopedChannelConfigAdapter<
+  ResolvedAccount,
+  AccessorAccount = ResolvedAccount,
+  Config extends OpenClawConfig = OpenClawConfig,
+>(
+  params: MultiAccountChannelConfigAdapterParams<ResolvedAccount, AccessorAccount, Config> & {
+    allowTopLevel?: boolean;
+  },
+): ChannelConfigAdapterWithAccessors<ResolvedAccount> {
+  return createChannelConfigAdapterFromBase<ResolvedAccount, AccessorAccount, Config>({
+    ...params,
+    base: createScopedChannelConfigBase<ResolvedAccount, Config>({ ...params }),
+    resolveAccountForAccessors({ cfg, accountId }) {
+      return params.resolveAccount(cfg, accountId);
+    },
+  });
 }
 
 /** Build CRUD/config helpers for top-level single-account channels. */
@@ -265,215 +334,158 @@ export function createTopLevelChannelConfigBase<
   inspectAccount?: (cfg: Config) => unknown;
   deleteMode?: "remove-section" | "clear-fields";
   clearBaseFields?: string[];
-}): Pick<
-  ChannelConfigAdapter<ResolvedAccount>,
-  | "listAccountIds"
-  | "resolveAccount"
-  | "inspectAccount"
-  | "defaultAccountId"
-  | "setAccountEnabled"
-  | "deleteAccount"
-> {
+}): ChannelCrudConfigAdapter<ResolvedAccount> {
   return {
-    listAccountIds: (cfg) => params.listAccountIds?.(cfg as Config) ?? [DEFAULT_ACCOUNT_ID],
-    resolveAccount: (cfg) => params.resolveAccount(cfg as Config),
+    listAccountIds(cfg) {
+      return params.listAccountIds?.(cfg as Config) ?? [DEFAULT_ACCOUNT_ID];
+    },
+    resolveAccount(cfg) {
+      return params.resolveAccount(cfg as Config);
+    },
     inspectAccount: params.inspectAccount
       ? (cfg) => params.inspectAccount?.(cfg as Config)
       : undefined,
-    defaultAccountId: (cfg) => params.defaultAccountId?.(cfg as Config) ?? DEFAULT_ACCOUNT_ID,
-    setAccountEnabled: ({ cfg, enabled }) =>
-      setTopLevelChannelEnabledInConfigSection({
+    defaultAccountId(cfg) {
+      return params.defaultAccountId?.(cfg as Config) ?? DEFAULT_ACCOUNT_ID;
+    },
+    setAccountEnabled({ cfg, enabled }) {
+      return setTopLevelChannelEnabledInConfigSection({
         cfg: cfg as Config,
         sectionKey: params.sectionKey,
         enabled,
-      }),
-    deleteAccount: ({ cfg }) =>
-      params.deleteMode === "clear-fields"
+      });
+    },
+    deleteAccount({ cfg }) {
+      return params.deleteMode === "clear-fields"
         ? clearTopLevelChannelConfigFields({
             cfg: cfg as Config,
             sectionKey: params.sectionKey,
             clearBaseFields: params.clearBaseFields ?? [],
           })
-        : removeTopLevelChannelConfigSection({
-            cfg: cfg as Config,
-            sectionKey: params.sectionKey,
-          }),
+        : writeChannelSection(cfg, params.sectionKey, undefined);
+    },
   };
 }
 
 /** Build the full shared config adapter for top-level single-account channels with allowlist/default target accessors. */
+export function createTopLevelChannelConfigAdapter<ResolvedAccount>(
+  params: Parameters<typeof createTopLevelChannelConfigBase<ResolvedAccount>>[0] &
+    ResolvedAccountAccessors<ResolvedAccount>,
+): ChannelConfigAdapterWithAccessors<ResolvedAccount>;
 export function createTopLevelChannelConfigAdapter<
   ResolvedAccount,
   AccessorAccount = ResolvedAccount,
   Config extends OpenClawConfig = OpenClawConfig,
->(params: {
-  sectionKey: string;
-  resolveAccount: (cfg: Config) => ResolvedAccount;
-  resolveAccessorAccount?: (params: { cfg: Config; accountId?: string | null }) => AccessorAccount;
-  listAccountIds?: (cfg: Config) => string[];
-  defaultAccountId?: (cfg: Config) => string;
-  inspectAccount?: (cfg: Config) => unknown;
-  deleteMode?: "remove-section" | "clear-fields";
-  clearBaseFields?: string[];
-  resolveAllowFrom: (account: AccessorAccount) => Array<string | number> | null | undefined;
-  formatAllowFrom: (allowFrom: Array<string | number>) => string[];
-  resolveDefaultTo?: (account: AccessorAccount) => string | number | null | undefined;
-}): Pick<
-  ChannelConfigAdapter<ResolvedAccount>,
-  | "listAccountIds"
-  | "resolveAccount"
-  | "inspectAccount"
-  | "defaultAccountId"
-  | "setAccountEnabled"
-  | "deleteAccount"
-  | "resolveAllowFrom"
-  | "formatAllowFrom"
-  | "resolveDefaultTo"
-> {
-  const resolveAccessorAccount =
-    params.resolveAccessorAccount ??
-    (({ cfg }: { cfg: Config; accountId?: string | null }) =>
-      params.resolveAccount(cfg) as unknown as AccessorAccount);
-
-  return {
-    ...createTopLevelChannelConfigBase<ResolvedAccount, Config>({
-      sectionKey: params.sectionKey,
-      resolveAccount: params.resolveAccount,
-      listAccountIds: params.listAccountIds,
-      defaultAccountId: params.defaultAccountId,
-      inspectAccount: params.inspectAccount,
-      deleteMode: params.deleteMode,
-      clearBaseFields: params.clearBaseFields,
-    }),
-    ...createScopedAccountConfigAccessors<AccessorAccount, Config>({
-      resolveAccount: resolveAccessorAccount,
-      resolveAllowFrom: params.resolveAllowFrom,
-      formatAllowFrom: params.formatAllowFrom,
-      resolveDefaultTo: params.resolveDefaultTo,
-    }),
-  };
+>(
+  params: Parameters<typeof createTopLevelChannelConfigBase<ResolvedAccount, Config>>[0] &
+    ProjectedAccountAccessors<AccessorAccount, Config>,
+): ChannelConfigAdapterWithAccessors<ResolvedAccount>;
+export function createTopLevelChannelConfigAdapter<
+  ResolvedAccount,
+  AccessorAccount = ResolvedAccount,
+  Config extends OpenClawConfig = OpenClawConfig,
+>(
+  params: Parameters<typeof createTopLevelChannelConfigBase<ResolvedAccount, Config>>[0] &
+    ChannelAccountAccessorOptions<ResolvedAccount, AccessorAccount, Config>,
+): ChannelConfigAdapterWithAccessors<ResolvedAccount>;
+export function createTopLevelChannelConfigAdapter<
+  ResolvedAccount,
+  AccessorAccount = ResolvedAccount,
+  Config extends OpenClawConfig = OpenClawConfig,
+>(
+  params: Parameters<typeof createTopLevelChannelConfigBase<ResolvedAccount, Config>>[0] &
+    (
+      | ResolvedAccountAccessors<ResolvedAccount>
+      | ProjectedAccountAccessors<AccessorAccount, Config>
+    ),
+): ChannelConfigAdapterWithAccessors<ResolvedAccount> {
+  return createChannelConfigAdapterFromBase<ResolvedAccount, AccessorAccount, Config>({
+    ...params,
+    base: createTopLevelChannelConfigBase<ResolvedAccount, Config>({ ...params }),
+    resolveAccountForAccessors({ cfg }) {
+      return params.resolveAccount(cfg);
+    },
+  });
 }
 
 /** Build CRUD/config helpers for channels where the default account lives at channel root and named accounts live under `accounts`. */
 export function createHybridChannelConfigBase<
   ResolvedAccount,
   Config extends OpenClawConfig = OpenClawConfig,
->(params: {
-  sectionKey: string;
-  listAccountIds: (cfg: Config) => string[];
-  resolveAccount: (cfg: Config, accountId?: string | null) => ResolvedAccount;
-  defaultAccountId: (cfg: Config) => string;
-  inspectAccount?: (cfg: Config, accountId?: string | null) => unknown;
-  clearBaseFields: string[];
-  preserveSectionOnDefaultDelete?: boolean;
-}): Pick<
-  ChannelConfigAdapter<ResolvedAccount>,
-  | "listAccountIds"
-  | "resolveAccount"
-  | "inspectAccount"
-  | "defaultAccountId"
-  | "setAccountEnabled"
-  | "deleteAccount"
-> {
+>(
+  params: NamedAccountChannelConfigBaseParams<ResolvedAccount, Config> & {
+    preserveSectionOnDefaultDelete?: boolean;
+  },
+): ChannelCrudConfigAdapter<ResolvedAccount> {
+  const base = createScopedChannelConfigBase({ ...params, allowTopLevel: false });
   return {
-    listAccountIds: (cfg) => params.listAccountIds(cfg as Config),
-    resolveAccount: (cfg, accountId) => params.resolveAccount(cfg as Config, accountId),
-    inspectAccount: params.inspectAccount
-      ? (cfg, accountId) => params.inspectAccount?.(cfg as Config, accountId)
-      : undefined,
-    defaultAccountId: (cfg) => params.defaultAccountId(cfg as Config),
-    setAccountEnabled: ({ cfg, accountId, enabled }) => {
-      if (normalizeAccountId(accountId) === DEFAULT_ACCOUNT_ID) {
-        return setTopLevelChannelEnabledInConfigSection({
-          cfg: cfg as Config,
-          sectionKey: params.sectionKey,
-          enabled,
-        });
-      }
-      return setAccountEnabledInConfigSection({
-        cfg: cfg as Config,
-        sectionKey: params.sectionKey,
-        accountId,
-        enabled,
-      });
+    ...base,
+    setAccountEnabled(input) {
+      return normalizeAccountId(input.accountId) === DEFAULT_ACCOUNT_ID
+        ? setTopLevelChannelEnabledInConfigSection({
+            cfg: input.cfg,
+            sectionKey: params.sectionKey,
+            enabled: input.enabled,
+          })
+        : base.setAccountEnabled!(input);
     },
-    deleteAccount: ({ cfg, accountId }) => {
-      if (normalizeAccountId(accountId) === DEFAULT_ACCOUNT_ID) {
-        if (params.preserveSectionOnDefaultDelete) {
-          return clearTopLevelChannelConfigFields({
-            cfg: cfg as Config,
+    deleteAccount(input) {
+      // Hybrid channels may retain non-account settings when default credentials are removed.
+      return normalizeAccountId(input.accountId) === DEFAULT_ACCOUNT_ID &&
+        params.preserveSectionOnDefaultDelete
+        ? clearTopLevelChannelConfigFields({
+            cfg: input.cfg,
             sectionKey: params.sectionKey,
             clearBaseFields: params.clearBaseFields,
-          });
-        }
-        return deleteAccountFromConfigSection({
-          cfg: cfg as Config,
-          sectionKey: params.sectionKey,
-          accountId,
-          clearBaseFields: params.clearBaseFields,
-        });
-      }
-      return deleteAccountFromConfigSection({
-        cfg: cfg as Config,
-        sectionKey: params.sectionKey,
-        accountId,
-        clearBaseFields: params.clearBaseFields,
-      });
+          })
+        : base.deleteAccount!(input);
     },
   };
 }
 
 /** Build the full shared config adapter for hybrid channels with allowlist/default target accessors. */
+export function createHybridChannelConfigAdapter<ResolvedAccount>(
+  params: NamedAccountChannelConfigBaseParams<ResolvedAccount> &
+    ResolvedAccountAccessors<ResolvedAccount> & {
+      preserveSectionOnDefaultDelete?: boolean;
+    },
+): ChannelConfigAdapterWithAccessors<ResolvedAccount>;
 export function createHybridChannelConfigAdapter<
   ResolvedAccount,
   AccessorAccount = ResolvedAccount,
   Config extends OpenClawConfig = OpenClawConfig,
->(params: {
-  sectionKey: string;
-  listAccountIds: (cfg: Config) => string[];
-  resolveAccount: (cfg: Config, accountId?: string | null) => ResolvedAccount;
-  resolveAccessorAccount?: (params: { cfg: Config; accountId?: string | null }) => AccessorAccount;
-  defaultAccountId: (cfg: Config) => string;
-  inspectAccount?: (cfg: Config, accountId?: string | null) => unknown;
-  clearBaseFields: string[];
-  preserveSectionOnDefaultDelete?: boolean;
-  resolveAllowFrom: (account: AccessorAccount) => Array<string | number> | null | undefined;
-  formatAllowFrom: (allowFrom: Array<string | number>) => string[];
-  resolveDefaultTo?: (account: AccessorAccount) => string | number | null | undefined;
-}): Pick<
-  ChannelConfigAdapter<ResolvedAccount>,
-  | "listAccountIds"
-  | "resolveAccount"
-  | "inspectAccount"
-  | "defaultAccountId"
-  | "setAccountEnabled"
-  | "deleteAccount"
-  | "resolveAllowFrom"
-  | "formatAllowFrom"
-  | "resolveDefaultTo"
-> {
-  const resolveAccessorAccount =
-    params.resolveAccessorAccount ??
-    (({ cfg, accountId }: { cfg: Config; accountId?: string | null }) =>
-      params.resolveAccount(cfg, accountId) as unknown as AccessorAccount);
-
-  return {
-    ...createHybridChannelConfigBase<ResolvedAccount, Config>({
-      sectionKey: params.sectionKey,
-      listAccountIds: params.listAccountIds,
-      resolveAccount: params.resolveAccount,
-      inspectAccount: params.inspectAccount,
-      defaultAccountId: params.defaultAccountId,
-      clearBaseFields: params.clearBaseFields,
-      preserveSectionOnDefaultDelete: params.preserveSectionOnDefaultDelete,
-    }),
-    ...createScopedAccountConfigAccessors<AccessorAccount, Config>({
-      resolveAccount: resolveAccessorAccount,
-      resolveAllowFrom: params.resolveAllowFrom,
-      formatAllowFrom: params.formatAllowFrom,
-      resolveDefaultTo: params.resolveDefaultTo,
-    }),
-  };
+>(
+  params: NamedAccountChannelConfigBaseParams<ResolvedAccount, Config> &
+    ProjectedAccountAccessors<AccessorAccount, Config> & {
+      preserveSectionOnDefaultDelete?: boolean;
+    },
+): ChannelConfigAdapterWithAccessors<ResolvedAccount>;
+export function createHybridChannelConfigAdapter<
+  ResolvedAccount,
+  AccessorAccount = ResolvedAccount,
+  Config extends OpenClawConfig = OpenClawConfig,
+>(
+  params: NamedAccountChannelConfigBaseParams<ResolvedAccount, Config> &
+    ChannelAccountAccessorOptions<ResolvedAccount, AccessorAccount, Config> & {
+      preserveSectionOnDefaultDelete?: boolean;
+    },
+): ChannelConfigAdapterWithAccessors<ResolvedAccount>;
+export function createHybridChannelConfigAdapter<
+  ResolvedAccount,
+  AccessorAccount = ResolvedAccount,
+  Config extends OpenClawConfig = OpenClawConfig,
+>(
+  params: MultiAccountChannelConfigAdapterParams<ResolvedAccount, AccessorAccount, Config> & {
+    preserveSectionOnDefaultDelete?: boolean;
+  },
+): ChannelConfigAdapterWithAccessors<ResolvedAccount> {
+  return createChannelConfigAdapterFromBase<ResolvedAccount, AccessorAccount, Config>({
+    ...params,
+    base: createHybridChannelConfigBase<ResolvedAccount, Config>({ ...params }),
+    resolveAccountForAccessors({ cfg, accountId }) {
+      return params.resolveAccount(cfg, accountId);
+    },
+  });
 }
 
 /** Convert account-specific DM security fields into the shared runtime policy resolver shape. */
@@ -483,6 +495,14 @@ export function createScopedDmSecurityResolver<
   channelKey: string;
   resolvePolicy: (account: ResolvedAccount) => string | null | undefined;
   resolveAllowFrom: (account: ResolvedAccount) => Array<string | number> | null | undefined;
+  resolveAccess?: (params: {
+    cfg: OpenClawConfig;
+    accountId?: string | null;
+    account: ResolvedAccount;
+  }) => {
+    dmPolicy?: string | null;
+    allowFrom?: Array<string | number> | null;
+  };
   resolveFallbackAccountId?: (account: ResolvedAccount) => string | null | undefined;
   defaultPolicy?: string;
   allowFromPathSuffix?: string;
@@ -490,6 +510,8 @@ export function createScopedDmSecurityResolver<
   approveChannelId?: string;
   approveHint?: string;
   normalizeEntry?: (raw: string) => string;
+  classifyEntryAuthentication?: ChannelSecurityDmPolicy["classifyEntryAuthentication"];
+  inheritSharedDefaultsFromDefaultAccount?: boolean;
 }) {
   return ({
     cfg,
@@ -499,79 +521,25 @@ export function createScopedDmSecurityResolver<
     cfg: OpenClawConfig;
     accountId?: string | null;
     account: ResolvedAccount;
-  }) =>
-    buildAccountScopedDmSecurityPolicy({
+  }) => {
+    const access = params.resolveAccess?.({ cfg, accountId, account });
+    return buildAccountScopedDmSecurityPolicy({
       cfg,
       channelKey: params.channelKey,
       accountId,
       fallbackAccountId: params.resolveFallbackAccountId?.(account) ?? account.accountId,
-      policy: params.resolvePolicy(account),
-      allowFrom: params.resolveAllowFrom(account) ?? [],
+      policy: access?.dmPolicy ?? params.resolvePolicy(account),
+      allowFrom: access?.allowFrom ?? params.resolveAllowFrom(account) ?? [],
       defaultPolicy: params.defaultPolicy,
       allowFromPathSuffix: params.allowFromPathSuffix,
       policyPathSuffix: params.policyPathSuffix,
       approveChannelId: params.approveChannelId,
       approveHint: params.approveHint,
       normalizeEntry: params.normalizeEntry,
+      classifyEntryAuthentication: params.classifyEntryAuthentication,
+      inheritSharedDefaultsFromDefaultAccount: params.inheritSharedDefaultsFromDefaultAccount,
     });
+  };
 }
 
 export { buildAccountScopedDmSecurityPolicy };
-export {
-  collectAllowlistProviderGroupPolicyWarnings,
-  collectAllowlistProviderRestrictSendersWarnings,
-  collectOpenGroupPolicyConfiguredRouteWarnings,
-  collectOpenGroupPolicyRouteAllowlistWarnings,
-  collectOpenProviderGroupPolicyWarnings,
-};
-
-/** Read the effective WhatsApp allowlist through the active plugin contract. */
-export function resolveWhatsAppConfigAllowFrom(params: {
-  cfg: OpenClawConfig;
-  accountId?: string | null;
-}): string[] {
-  const account = getChannelPlugin("whatsapp")?.config.resolveAccount(params.cfg, params.accountId);
-  return account && typeof account === "object" && Array.isArray(account.allowFrom)
-    ? account.allowFrom.map(String)
-    : [];
-}
-
-/** Format WhatsApp allowlist entries with the same normalization used by the channel plugin. */
-export function formatWhatsAppConfigAllowFromEntries(allowFrom: Array<string | number>): string[] {
-  return normalizeWhatsAppAllowFromEntries(allowFrom);
-}
-
-/** Resolve the effective WhatsApp default recipient after account and root config fallback. */
-export function resolveWhatsAppConfigDefaultTo(params: {
-  cfg: OpenClawConfig;
-  accountId?: string | null;
-}): string | undefined {
-  const root = params.cfg.channels?.whatsapp;
-  const normalized = normalizeAccountId(params.accountId);
-  const account = root?.accounts?.[normalized];
-  return (account?.defaultTo ?? root?.defaultTo)?.trim() || undefined;
-}
-
-/** Read iMessage allowlist entries from the active plugin's resolved account view. */
-export function resolveIMessageConfigAllowFrom(params: {
-  cfg: OpenClawConfig;
-  accountId?: string | null;
-}): string[] {
-  const account = getChannelPlugin("imessage")?.config.resolveAccount(params.cfg, params.accountId);
-  if (!account || typeof account !== "object" || !("config" in account)) {
-    return [];
-  }
-  return mapAllowFromEntries(account.config.allowFrom);
-}
-
-/** Resolve the effective iMessage default recipient from the plugin-resolved account config. */
-export function resolveIMessageConfigDefaultTo(params: {
-  cfg: OpenClawConfig;
-  accountId?: string | null;
-}): string | undefined {
-  const account = getChannelPlugin("imessage")?.config.resolveAccount(params.cfg, params.accountId);
-  if (!account || typeof account !== "object" || !("config" in account)) {
-    return undefined;
-  }
-  return resolveOptionalConfigString(account.config.defaultTo);
-}

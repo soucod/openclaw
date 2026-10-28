@@ -1,44 +1,36 @@
-import fs from "node:fs/promises";
 import path from "node:path";
+import { normalizeTrimmedStringList } from "@openclaw/normalization-core/string-normalization";
 import type { PluginInstallRecord } from "../config/types.plugins.js";
+import { canAccess } from "./path-existence.js";
 
-export type PluginInstallPathIssue = {
+type PluginInstallPathIssue = {
   kind: "custom-path" | "missing-path";
   pluginId: string;
   path: string;
 };
 
-function resolvePluginInstallCandidatePaths(
-  install: PluginInstallRecord | null | undefined,
-): string[] {
-  if (!install || install.source !== "path") {
-    return [];
-  }
-
-  return [install.sourcePath, install.installPath]
-    .map((value) => (typeof value === "string" ? value.trim() : ""))
-    .filter(Boolean);
-}
-
 export async function detectPluginInstallPathIssue(params: {
   pluginId: string;
   install: PluginInstallRecord | null | undefined;
 }): Promise<PluginInstallPathIssue | null> {
-  const candidatePaths = resolvePluginInstallCandidatePaths(params.install);
+  if (params.install?.source !== "path") {
+    return null;
+  }
+  const candidatePaths = normalizeTrimmedStringList([
+    params.install.sourcePath,
+    params.install.installPath,
+  ]);
   if (candidatePaths.length === 0) {
     return null;
   }
 
   for (const candidatePath of candidatePaths) {
-    try {
-      await fs.access(path.resolve(candidatePath));
+    if (await canAccess(path.resolve(candidatePath))) {
       return {
         kind: "custom-path",
         pluginId: params.pluginId,
         path: candidatePath,
       };
-    } catch {
-      // Keep checking remaining candidate paths before warning about a stale install.
     }
   }
 
@@ -53,7 +45,7 @@ export function formatPluginInstallPathIssue(params: {
   issue: PluginInstallPathIssue;
   pluginLabel: string;
   defaultInstallCommand: string;
-  repoInstallCommand: string;
+  repoInstallCommand?: string | null;
   formatCommand?: (command: string) => string;
 }): string[] {
   const formatCommand = params.formatCommand ?? ((command: string) => command);
@@ -62,12 +54,20 @@ export function formatPluginInstallPathIssue(params: {
       `${params.pluginLabel} is installed from a custom path: ${params.issue.path}`,
       `Main updates will not automatically replace that plugin with the repo's default ${params.pluginLabel} package.`,
       `Reinstall with "${formatCommand(params.defaultInstallCommand)}" when you want to return to the standard ${params.pluginLabel} plugin.`,
-      `If you are intentionally running from a repo checkout, reinstall that checkout explicitly with "${formatCommand(params.repoInstallCommand)}" after updates.`,
+      ...(params.repoInstallCommand
+        ? [
+            `If you are intentionally running from a repo checkout, reinstall that checkout explicitly with "${formatCommand(params.repoInstallCommand)}" after updates.`,
+          ]
+        : []),
     ];
   }
   return [
     `${params.pluginLabel} is installed from a custom path that no longer exists: ${params.issue.path}`,
     `Reinstall with "${formatCommand(params.defaultInstallCommand)}".`,
-    `If you are running from a repo checkout, you can also use "${formatCommand(params.repoInstallCommand)}".`,
+    ...(params.repoInstallCommand
+      ? [
+          `If you are running from a repo checkout, you can also use "${formatCommand(params.repoInstallCommand)}".`,
+        ]
+      : []),
   ];
 }

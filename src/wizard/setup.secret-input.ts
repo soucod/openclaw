@@ -1,8 +1,6 @@
-import type { OpenClawConfig } from "../config/config.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { normalizeSecretInputString, resolveSecretInputRef } from "../config/types.secrets.js";
 import { resolveSecretRefString } from "../secrets/resolve.js";
-
-type SecretDefaults = NonNullable<OpenClawConfig["secrets"]>["defaults"];
 
 function formatSecretResolutionError(error: unknown): string {
   if (error instanceof Error && error.message.trim().length > 0) {
@@ -15,13 +13,11 @@ export async function resolveSetupSecretInputString(params: {
   config: OpenClawConfig;
   value: unknown;
   path: string;
-  defaults?: SecretDefaults;
   env?: NodeJS.ProcessEnv;
 }): Promise<string | undefined> {
-  const defaults = params.defaults ?? params.config.secrets?.defaults;
   const { ref } = resolveSecretInputRef({
     value: params.value,
-    defaults,
+    defaults: params.config.secrets?.defaults,
   });
   if (ref) {
     try {

@@ -1,156 +1,98 @@
-import process from "node:process";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import "./test-utils/prepare-compiled-subprocesses.js";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { createDeferred } from "../test/helpers/promise.js";
+// Warm diagnostics before test deadlines, after compiled-subprocess preparation.
+import "./cli/dotenv.js";
+import { tryHandleRootVersionFastPath } from "./entry.version-fast-path.js";
+import { resolveCommitHash } from "./infra/git-commit.js";
+import { resetLogger, setLoggerOverride } from "./logging.js";
+import "./logging/json-console-line.js";
 
-const applyCliProfileEnvMock = vi.hoisted(() => vi.fn());
-const attachChildProcessBridgeMock = vi.hoisted(() => vi.fn());
-const installProcessWarningFilterMock = vi.hoisted(() => vi.fn());
-const isMainModuleMock = vi.hoisted(() => vi.fn(() => true));
-const isRootHelpInvocationMock = vi.hoisted(() => vi.fn(() => false));
-const isRootVersionInvocationMock = vi.hoisted(() => vi.fn(() => true));
-const normalizeEnvMock = vi.hoisted(() => vi.fn());
-const normalizeWindowsArgvMock = vi.hoisted(() => vi.fn((argv: string[]) => argv));
-const parseCliProfileArgsMock = vi.hoisted(() => vi.fn((argv: string[]) => ({ ok: true, argv })));
-const resolveCliContainerTargetMock = vi.hoisted(() => vi.fn<() => string | null>(() => null));
-const resolveCommitHashMock = vi.hoisted(() => vi.fn<() => string | null>(() => "abc1234"));
-const runCliMock = vi.hoisted(() => vi.fn(async () => {}));
-const shouldSkipRespawnForArgvMock = vi.hoisted(() => vi.fn(() => true));
-
-vi.mock("./cli/argv.js", () => ({
-  isRootHelpInvocation: isRootHelpInvocationMock,
-  isRootVersionInvocation: isRootVersionInvocationMock,
-}));
-
-vi.mock("./cli/container-target.js", () => ({
-  parseCliContainerArgs: (argv: string[]) => ({ ok: true, container: null, argv }),
-  resolveCliContainerTarget: resolveCliContainerTargetMock,
-}));
-
-vi.mock("./cli/profile.js", () => ({
-  applyCliProfileEnv: applyCliProfileEnvMock,
-  parseCliProfileArgs: parseCliProfileArgsMock,
-}));
-
-vi.mock("./cli/run-main.js", () => ({
-  runCli: runCliMock,
-}));
-
-vi.mock("./cli/respawn-policy.js", () => ({
-  shouldSkipRespawnForArgv: shouldSkipRespawnForArgvMock,
-}));
-
-vi.mock("./cli/windows-argv.js", () => ({
-  normalizeWindowsArgv: normalizeWindowsArgvMock,
-}));
-
-vi.mock("./infra/env.js", () => ({
-  isTruthyEnvValue: () => false,
-  normalizeEnv: normalizeEnvMock,
-}));
-
-vi.mock("./infra/git-commit.js", () => ({
-  resolveCommitHash: resolveCommitHashMock,
-}));
-
-vi.mock("./infra/is-main.js", () => ({
-  isMainModule: isMainModuleMock,
-}));
-
-vi.mock("./infra/warning-filter.js", () => ({
-  installProcessWarningFilter: installProcessWarningFilterMock,
-}));
-
-vi.mock("./process/child-process-bridge.js", () => ({
-  attachChildProcessBridge: attachChildProcessBridgeMock,
-}));
-
-vi.mock("./version.js", () => ({
+vi.mock("./version.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./version.js")>()),
   VERSION: "9.9.9-test",
 }));
 
-describe("entry root version fast path", () => {
-  let originalArgv: string[];
-  let originalGatewayToken: string | undefined;
-  let exitSpy: ReturnType<typeof vi.spyOn>;
+vi.mock("./infra/git-commit.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./infra/git-commit.js")>()),
+  resolveCommitHash: vi.fn(),
+}));
 
-  beforeEach(() => {
-    vi.resetModules();
-    vi.clearAllMocks();
-    originalArgv = [...process.argv];
-    originalGatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN;
-    delete process.env.OPENCLAW_GATEWAY_TOKEN;
-    process.argv = ["node", "openclaw", "--version"];
-    exitSpy = vi
-      .spyOn(process, "exit")
-      .mockImplementation(((_code?: number) => undefined) as typeof process.exit);
-  });
+const exit = vi.fn<typeof process.exit>();
+const output = vi.fn<typeof console.log>();
+const previousExitCode = process.exitCode;
+const argv = ["node", "openclaw", "--version"];
 
-  afterEach(() => {
-    process.argv = originalArgv;
-    if (originalGatewayToken === undefined) {
-      delete process.env.OPENCLAW_GATEWAY_TOKEN;
-    } else {
-      process.env.OPENCLAW_GATEWAY_TOKEN = originalGatewayToken;
+beforeEach(() => {
+  process.exitCode = undefined;
+  vi.stubEnv("OPENCLAW_CONTAINER", undefined);
+  vi.spyOn(process, "exit").mockImplementation(exit);
+  vi.spyOn(console, "log").mockImplementation(output.mockReset());
+});
+
+afterEach(() => {
+  const nativeExitCalls = exit.mock.calls.length;
+  process.exitCode = previousExitCode;
+  vi.restoreAllMocks();
+  vi.clearAllMocks();
+  vi.unstubAllEnvs();
+  resetLogger();
+  expect(nativeExitCalls).toBe(0);
+});
+
+it("skips host handling when container-targeted", () => {
+  expect(
+    tryHandleRootVersionFastPath(["node", "openclaw", "--container", "demo", "--version"]),
+  ).toBe(false);
+
+  vi.stubEnv("OPENCLAW_CONTAINER", "demo");
+  expect(tryHandleRootVersionFastPath(argv)).toBe(false);
+  expect(resolveCommitHash).not.toHaveBeenCalled();
+  expect(output).not.toHaveBeenCalled();
+});
+
+it.each([
+  ["abc1234", undefined, "OpenClaw 9.9.9-test (abc1234)"],
+  [null, undefined, "OpenClaw 9.9.9-test"],
+  [null, "pretty", undefined],
+  [null, "json", undefined],
+] as const)("handles commit %s with %s diagnostics", async (commit, consoleStyle, expected) => {
+  const printed = createDeferred();
+  let diagnostic = "";
+  output.mockImplementation(() => printed.resolve());
+  if (consoleStyle) {
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      diagnostic += String(chunk);
+      printed.resolve();
+      return true;
+    });
+    setLoggerOverride({ level: "silent", consoleLevel: "info", consoleStyle });
+  }
+  vi.mocked(resolveCommitHash).mockImplementation(() => {
+    if (!consoleStyle) {
+      return commit;
     }
-    exitSpy.mockRestore();
+    const error = new Error("version resolution failed");
+    // Bun can materialize a collected stack with a bare header and no message.
+    error.stack = "Error\n    at resolveCommitHash (git-commit.js:1:1)";
+    throw error;
   });
 
-  it("prints commit-tagged version output when commit metadata is available", async () => {
-    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+  expect(tryHandleRootVersionFastPath(argv)).toBe(true);
+  await printed.promise;
 
-    await import("./entry.js");
-
-    await vi.waitFor(() => {
-      expect(logSpy).toHaveBeenCalledWith("OpenClaw 9.9.9-test (abc1234)");
-      expect(exitSpy).toHaveBeenCalledWith(0);
+  expect(process.exitCode).toBe(consoleStyle ? 1 : 0);
+  if (!consoleStyle) {
+    expect(output).toHaveBeenCalledWith(expected);
+    return;
+  }
+  expect(output).not.toHaveBeenCalled();
+  if (consoleStyle === "json") {
+    expect(JSON.parse(diagnostic)).toMatchObject({
+      level: "error",
+      message: expect.stringContaining("version resolution failed"),
     });
-
-    logSpy.mockRestore();
-  });
-
-  it("falls back to plain version output when commit metadata is unavailable", async () => {
-    resolveCommitHashMock.mockReturnValueOnce(null);
-    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-
-    await import("./entry.js");
-
-    await vi.waitFor(() => {
-      expect(logSpy).toHaveBeenCalledWith("OpenClaw 9.9.9-test");
-      expect(exitSpy).toHaveBeenCalledWith(0);
-    });
-
-    logSpy.mockRestore();
-  });
-
-  it("skips the host version fast path when a container target is active", async () => {
-    resolveCliContainerTargetMock.mockReturnValue("demo");
-    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-
-    await import("./entry.js");
-
-    await vi.waitFor(() => {
-      expect(runCliMock).toHaveBeenCalledWith(["node", "openclaw", "--version"]);
-    });
-    expect(logSpy).not.toHaveBeenCalled();
-    expect(exitSpy).not.toHaveBeenCalled();
-
-    logSpy.mockRestore();
-  });
-
-  it("rejects container mode for root version when gateway override env vars are set", async () => {
-    resolveCliContainerTargetMock.mockReturnValue("demo");
-    process.env.OPENCLAW_GATEWAY_TOKEN = "demo-token";
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
-    await import("./entry.js");
-
-    await vi.waitFor(() => {
-      expect(errorSpy).toHaveBeenCalledWith(
-        "[openclaw] --container cannot be combined with --profile/--dev or gateway override env vars",
-      );
-      expect(exitSpy).toHaveBeenCalledWith(2);
-    });
-    expect(runCliMock).not.toHaveBeenCalled();
-
-    errorSpy.mockRestore();
-  });
+  } else {
+    expect(diagnostic).toContain("version resolution failed");
+  }
 });

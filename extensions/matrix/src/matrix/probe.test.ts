@@ -1,11 +1,17 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const createMatrixClientMock = vi.fn();
-const isBunRuntimeMock = vi.fn(() => false);
+const httpMocks = vi.hoisted(() => ({ create: vi.fn(), requestJson: vi.fn() }));
 
-vi.mock("./client.js", () => ({
-  createMatrixClient: (...args: unknown[]) => createMatrixClientMock(...args),
-  isBunRuntime: () => isBunRuntimeMock(),
+vi.mock("./sdk/http-client.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./sdk/http-client.js")>()),
+  MatrixAuthedHttpClient: class {
+    constructor(params: unknown) {
+      httpMocks.create(params);
+    }
+    requestJson(params: unknown) {
+      return httpMocks.requestJson(params);
+    }
+  },
 }));
 
 import { probeMatrix } from "./probe.js";
@@ -13,67 +19,36 @@ import { probeMatrix } from "./probe.js";
 describe("probeMatrix", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    isBunRuntimeMock.mockReturnValue(false);
-    createMatrixClientMock.mockResolvedValue({
-      getUserId: vi.fn(async () => "@bot:example.org"),
-    });
+    httpMocks.requestJson.mockResolvedValue({ user_id: "@bot:example.org" });
   });
 
-  it("passes undefined userId when not provided", async () => {
+  it("preserves proxy policy and the requested HTTP timeout", async () => {
+    const dispatcherPolicy = {
+      mode: "explicit-proxy" as const,
+      proxyUrl: "http://127.0.0.1:7890",
+    };
     const result = await probeMatrix({
       homeserver: "https://matrix.example.org",
       accessToken: "tok",
       timeoutMs: 1234,
+      dispatcherPolicy,
     });
 
     expect(result.ok).toBe(true);
-    expect(createMatrixClientMock).toHaveBeenCalledWith({
+    expect(httpMocks.create).toHaveBeenCalledWith({
       homeserver: "https://matrix.example.org",
-      userId: undefined,
       accessToken: "tok",
-      localTimeoutMs: 1234,
+      ssrfPolicy: undefined,
+      dispatcherPolicy,
+    });
+    expect(httpMocks.requestJson).toHaveBeenCalledWith({
+      method: "GET",
+      endpoint: "/_matrix/client/v3/account/whoami",
+      timeoutMs: 1234,
     });
   });
 
-  it("trims provided userId before client creation", async () => {
-    await probeMatrix({
-      homeserver: "https://matrix.example.org",
-      accessToken: "tok",
-      userId: "  @bot:example.org  ",
-      timeoutMs: 500,
-    });
-
-    expect(createMatrixClientMock).toHaveBeenCalledWith({
-      homeserver: "https://matrix.example.org",
-      userId: "@bot:example.org",
-      accessToken: "tok",
-      localTimeoutMs: 500,
-    });
-  });
-
-  it("passes accountId through to client creation", async () => {
-    await probeMatrix({
-      homeserver: "https://matrix.example.org",
-      accessToken: "tok",
-      userId: "@bot:example.org",
-      timeoutMs: 500,
-      accountId: "ops",
-    });
-
-    expect(createMatrixClientMock).toHaveBeenCalledWith({
-      homeserver: "https://matrix.example.org",
-      userId: "@bot:example.org",
-      accessToken: "tok",
-      localTimeoutMs: 500,
-      accountId: "ops",
-    });
-  });
-
-  it("returns client validation errors for insecure public http homeservers", async () => {
-    createMatrixClientMock.mockRejectedValue(
-      new Error("Matrix homeserver must use https:// unless it targets a private or loopback host"),
-    );
-
+  it("rejects insecure public http homeservers before making a request", async () => {
     const result = await probeMatrix({
       homeserver: "http://matrix.example.org",
       accessToken: "tok",
@@ -82,5 +57,6 @@ describe("probeMatrix", () => {
 
     expect(result.ok).toBe(false);
     expect(result.error).toContain("Matrix homeserver must use https://");
+    expect(httpMocks.requestJson).not.toHaveBeenCalled();
   });
 });

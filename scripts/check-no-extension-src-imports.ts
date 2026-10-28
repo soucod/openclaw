@@ -1,35 +1,16 @@
 import fs from "node:fs";
 import path from "node:path";
 import { collectFilesSync, isCodeFile, relativeToCwd } from "./check-file-utils.js";
+import { classifyBundledExtensionSourcePath } from "./lib/extension-source-classifier.mts";
 
 const FORBIDDEN_REPO_SRC_IMPORT = /["'](?:\.\.\/)+(?:src\/)[^"']+["']/;
 
-function isProductionExtensionFile(filePath: string): boolean {
-  return !(
-    filePath.endsWith("/runtime-api.ts") ||
-    filePath.endsWith("\\runtime-api.ts") ||
-    filePath.includes(".test.") ||
-    filePath.includes(".spec.") ||
-    filePath.includes(".fixture.") ||
-    filePath.includes(".snap") ||
-    filePath.includes("test-harness") ||
-    filePath.includes("test-support") ||
-    filePath.includes("/__tests__/") ||
-    filePath.includes("/coverage/") ||
-    filePath.includes("/dist/") ||
-    filePath.includes("/node_modules/")
-  );
-}
-
-function collectExtensionSourceFiles(rootDir: string): string[] {
-  return collectFilesSync(rootDir, {
-    includeFile: (filePath) => isCodeFile(filePath) && isProductionExtensionFile(filePath),
-  });
-}
-
 function main() {
   const extensionsDir = path.join(process.cwd(), "extensions");
-  const files = collectExtensionSourceFiles(extensionsDir);
+  const files = collectFilesSync(extensionsDir, {
+    includeFile: (filePath) =>
+      isCodeFile(filePath) && classifyBundledExtensionSourcePath(filePath).isProductionSource,
+  });
   const offenders: string[] = [];
 
   for (const file of files) {

@@ -1,54 +1,56 @@
+// Slack helper module supports prepare helpers behavior.
+import path from "node:path";
 import type { App } from "@slack/bolt";
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
-import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
+import type { ChannelRuntimeSurface } from "openclaw/plugin-sdk/channel-contract";
+import { buildChannelInboundEventContext } from "openclaw/plugin-sdk/channel-inbound";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import { useSessionStoreTempDirs } from "openclaw/plugin-sdk/sqlite-runtime-testing";
+import { afterAll } from "vitest";
 import type { ResolvedSlackAccount } from "../../accounts.js";
-import { createSlackMonitorContext } from "../context.js";
+import { installSlackTestRuntime } from "../../test-runtime.test-support.js";
+import type { SlackChannelConfigEntries } from "../channel-config.js";
+import { createMonitorTestContext } from "../monitor-context.test-support.js";
 
 export function createInboundSlackTestContext(params: {
+  accountId?: string;
+  app?: App;
   cfg: OpenClawConfig;
   appClient?: App["client"];
   defaultRequireMention?: boolean;
-  replyToMode?: "off" | "all" | "first";
-  channelsConfig?: Record<string, { systemPrompt: string }>;
+  replyToMode?: "off" | "all" | "first" | "batched";
+  channelsConfig?: SlackChannelConfigEntries;
+  dmHistoryLimit?: number;
+  groupDmEnabled?: boolean;
+  groupPolicy?: "open" | "disabled" | "allowlist";
+  channelRuntime?: ChannelRuntimeSurface;
 }) {
-  return createSlackMonitorContext({
+  const runtime = installSlackTestRuntime({
+    channel: { inbound: { buildContext: buildChannelInboundEventContext } },
+  });
+  return createMonitorTestContext({
     cfg: params.cfg,
-    accountId: "default",
+    accountId: params.accountId ?? "default",
     botToken: "token",
-    app: { client: params.appClient ?? {} } as App,
-    runtime: {} as RuntimeEnv,
+    app: params.app ?? ({ client: params.appClient ?? {} } as App),
+    channelRuntime: params.channelRuntime ?? runtime.channel,
     botUserId: "B1",
+    botId: "B1",
     teamId: "T1",
     apiAppId: "A1",
-    historyLimit: 0,
-    sessionScope: "per-sender",
-    mainKey: "main",
-    dmEnabled: true,
-    dmPolicy: "open",
-    allowFrom: [],
-    allowNameMatching: false,
-    groupDmEnabled: true,
-    groupDmChannels: [],
+    dmHistoryLimit: params.dmHistoryLimit ?? 0,
+    allowFrom: ["*"],
+    groupDmEnabled: params.groupDmEnabled ?? true,
     defaultRequireMention: params.defaultRequireMention ?? true,
     channelsConfig: params.channelsConfig,
-    groupPolicy: "open",
-    useAccessGroups: false,
-    reactionMode: "off",
-    reactionAllowlist: [],
+    groupPolicy: params.groupPolicy ?? "open",
     replyToMode: params.replyToMode ?? "off",
-    threadHistoryScope: "thread",
-    threadInheritParent: false,
     slashCommand: {
       enabled: false,
       name: "openclaw",
       sessionPrefix: "slack:slash",
       ephemeral: true,
     },
-    textLimit: 4000,
-    ackReactionScope: "group-mentions",
-    typingReaction: "",
     mediaMaxBytes: 1024,
-    removeAckAfterReply: false,
   });
 }
 
@@ -58,6 +60,7 @@ export function createSlackTestAccount(
   return {
     accountId: "default",
     enabled: true,
+    identity: "bot",
     botTokenSource: "config",
     appTokenSource: "config",
     userTokenSource: "none",
@@ -65,5 +68,16 @@ export function createSlackTestAccount(
     replyToMode: config.replyToMode,
     replyToModeByChatType: config.replyToModeByChatType,
     dm: config.dm,
+  };
+}
+
+export function createSlackSessionStoreFixture(prefix: string) {
+  const sessionDirs = useSessionStoreTempDirs(afterAll, prefix);
+
+  return {
+    makeTmpStorePath() {
+      const dir = sessionDirs.make();
+      return { dir, storePath: path.join(dir, "sessions.json") };
+    },
   };
 }

@@ -1,309 +1,171 @@
-import { describe, vi } from "vitest";
-import { discordOutbound } from "../../../../extensions/discord/src/outbound-adapter.js";
-import { whatsappOutbound } from "../../../../extensions/whatsapp/src/outbound-adapter.js";
-import { sendMessageZalo } from "../../../../extensions/zalo/src/send.js";
-import { sendMessageZalouser } from "../../../../extensions/zalouser/src/send.js";
-import { parseZalouserOutboundTarget } from "../../../../extensions/zalouser/src/session-route.js";
+import { expectDefined } from "@openclaw/normalization-core";
+import { describe, expect, it, vi } from "vitest";
+import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 import {
-  chunkTextForOutbound as chunkZaloTextForOutbound,
-  sendPayloadWithChunkedTextAndMedia as sendZaloPayloadWithChunkedTextAndMedia,
-} from "../../../../src/plugin-sdk/zalo.js";
-import { sendPayloadWithChunkedTextAndMedia as sendZalouserPayloadWithChunkedTextAndMedia } from "../../../../src/plugin-sdk/zalouser.js";
-import { slackOutbound } from "../../../../test/channel-outbounds.js";
-import type { ReplyPayload } from "../../../auto-reply/types.js";
-import { createDirectTextMediaOutbound } from "../outbound/direct-text-media.js";
+  createDirectTextMediaOutbound,
+  createScopedChannelMediaMaxBytesResolver,
+} from "../outbound/direct-text-media.js";
 import {
   installChannelOutboundPayloadContractSuite,
-  primeChannelOutboundSendMock,
-} from "./suites.js";
+  type OutboundPayloadHarnessParams,
+} from "./outbound-payload-testkit.js";
+import { primeChannelOutboundSendMock } from "./test-helpers.js";
 
-vi.mock("../../../../extensions/zalo/src/send.js", () => ({
-  sendMessageZalo: vi.fn().mockResolvedValue({ ok: true, messageId: "zl-1" }),
-}));
-
-// This suite only validates payload adaptation. Keep zalouser's runtime-only
-// ZCA import graph mocked so local contract runs don't depend on native socket
-// deps being resolved through the extension runtime seam.
-vi.mock("../../../../extensions/zalouser/src/accounts.js", () => ({
-  listZalouserAccountIds: vi.fn(() => ["default"]),
-  resolveDefaultZalouserAccountId: vi.fn(() => "default"),
-  resolveZalouserAccountSync: vi.fn(() => ({
-    accountId: "default",
-    profile: "default",
-    name: "test",
-    enabled: true,
-    authenticated: true,
-    config: {},
-  })),
-  getZcaUserInfo: vi.fn(async () => null),
-  checkZcaAuthenticated: vi.fn(async () => false),
-}));
-
-vi.mock("../../../../extensions/zalouser/src/zalo-js.js", () => ({
-  checkZaloAuthenticated: vi.fn(async () => false),
-  getZaloUserInfo: vi.fn(async () => null),
-  listZaloFriendsMatching: vi.fn(async () => []),
-  listZaloGroupMembers: vi.fn(async () => []),
-  listZaloGroupsMatching: vi.fn(async () => []),
-  logoutZaloProfile: vi.fn(async () => {}),
-  resolveZaloAllowFromEntries: vi.fn(async ({ entries }: { entries: string[] }) =>
-    entries.map((entry) => ({ input: entry, resolved: true, id: entry, note: undefined })),
-  ),
-  resolveZaloGroupsByEntries: vi.fn(async ({ entries }: { entries: string[] }) =>
-    entries.map((entry) => ({ input: entry, resolved: true, id: entry, note: undefined })),
-  ),
-  startZaloQrLogin: vi.fn(async () => ({
-    message: "qr pending",
-    qrDataUrl: undefined,
-  })),
-  waitForZaloQrLogin: vi.fn(async () => ({
-    connected: false,
-    message: "login pending",
-  })),
-}));
-
-vi.mock("../../../../extensions/zalouser/src/send.js", () => ({
-  sendMessageZalouser: vi.fn().mockResolvedValue({ ok: true, messageId: "zlu-1" }),
-  sendReactionZalouser: vi.fn().mockResolvedValue({ ok: true }),
-}));
-
-type PayloadHarnessParams = {
-  payload: ReplyPayload;
-  sendResults?: Array<{ messageId: string }>;
-};
-
-function buildChannelSendResult(channel: string, result: Record<string, unknown>) {
-  return {
-    channel,
-    messageId: typeof result.messageId === "string" ? result.messageId : "",
-  };
-}
-
-const mockedSendZalo = vi.mocked(sendMessageZalo);
-const mockedSendZalouser = vi.mocked(sendMessageZalouser);
-
-function createSlackHarness(params: PayloadHarnessParams) {
-  const sendSlack = vi.fn();
-  primeChannelOutboundSendMock(
-    sendSlack,
-    { messageId: "sl-1", channelId: "C12345", ts: "1234.5678" },
-    params.sendResults,
-  );
-  const ctx = {
-    cfg: {},
-    to: "C12345",
-    text: "",
-    payload: params.payload,
-    deps: {
-      sendSlack,
-    },
-  };
-  return {
-    run: async () => await slackOutbound.sendPayload!(ctx),
-    sendMock: sendSlack,
-    to: ctx.to,
-  };
-}
-
-function createDiscordHarness(params: PayloadHarnessParams) {
-  const sendDiscord = vi.fn();
-  primeChannelOutboundSendMock(
-    sendDiscord,
-    { messageId: "dc-1", channelId: "123456" },
-    params.sendResults,
-  );
-  const ctx = {
-    cfg: {},
-    to: "channel:123456",
-    text: "",
-    payload: params.payload,
-    deps: {
-      sendDiscord,
-    },
-  };
-  return {
-    run: async () => await discordOutbound.sendPayload!(ctx),
-    sendMock: sendDiscord,
-    to: ctx.to,
-  };
-}
-
-function createWhatsAppHarness(params: PayloadHarnessParams) {
-  const sendWhatsApp = vi.fn();
-  primeChannelOutboundSendMock(sendWhatsApp, { messageId: "wa-1" }, params.sendResults);
-  const ctx = {
-    cfg: {},
-    to: "5511999999999@c.us",
-    text: "",
-    payload: params.payload,
-    deps: {
-      sendWhatsApp,
-    },
-  };
-  return {
-    run: async () => await whatsappOutbound.sendPayload!(ctx),
-    sendMock: sendWhatsApp,
-    to: ctx.to,
-  };
-}
-
-function createDirectTextMediaHarness(params: PayloadHarnessParams) {
+function createDirectTextMediaHarness(params: OutboundPayloadHarnessParams) {
   const sendFn = vi.fn();
   primeChannelOutboundSendMock(sendFn, { messageId: "m1" }, params.sendResults);
   const outbound = createDirectTextMediaOutbound({
-    channel: "imessage",
+    channel: "direct-text-media",
     resolveSender: () => sendFn,
     resolveMaxBytes: () => undefined,
     buildTextOptions: (opts) => opts as never,
     buildMediaOptions: (opts) => opts as never,
   });
-  const ctx = {
-    cfg: {},
-    to: "user1",
-    text: "",
-    payload: params.payload,
-  };
+  const ctx = { cfg: {}, to: "user1", text: "", payload: params.payload };
+  const sendPayload = expectDefined(outbound.sendPayload, "sendPayload");
   return {
-    run: async () => await outbound.sendPayload!(ctx),
+    run: async () => await sendPayload(ctx),
     sendMock: sendFn,
     to: ctx.to,
   };
 }
 
-function createZaloHarness(params: PayloadHarnessParams) {
-  primeChannelOutboundSendMock(mockedSendZalo, { ok: true, messageId: "zl-1" }, params.sendResults);
-  const ctx = {
-    cfg: {},
-    to: "123456789",
-    text: "",
-    payload: params.payload,
-  };
-  return {
-    run: async () =>
-      await sendZaloPayloadWithChunkedTextAndMedia({
-        ctx,
-        textChunkLimit: 2000,
-        chunker: chunkZaloTextForOutbound,
-        sendText: async (nextCtx) =>
-          buildChannelSendResult(
-            "zalo",
-            await mockedSendZalo(nextCtx.to, nextCtx.text, {
-              accountId: undefined,
-              cfg: nextCtx.cfg,
-            }),
-          ),
-        sendMedia: async (nextCtx) =>
-          buildChannelSendResult(
-            "zalo",
-            await mockedSendZalo(nextCtx.to, nextCtx.text, {
-              accountId: undefined,
-              cfg: nextCtx.cfg,
-              mediaUrl: nextCtx.mediaUrl,
-            }),
-          ),
-        emptyResult: { channel: "zalo", messageId: "" },
-      }),
-    sendMock: mockedSendZalo,
-    to: ctx.to,
-  };
-}
+describe("outbound payload contracts: direct text/media", () => {
+  installChannelOutboundPayloadContractSuite({
+    channel: "direct-text-media",
+    chunking: { mode: "split", longTextLength: 5000, maxChunkLength: 4000 },
+    createHarness: createDirectTextMediaHarness,
+  });
+});
 
-function createZalouserHarness(params: PayloadHarnessParams) {
-  primeChannelOutboundSendMock(
-    mockedSendZalouser,
-    { ok: true, messageId: "zlu-1" },
-    params.sendResults,
-  );
-  const ctx = {
-    cfg: {},
-    to: "user:987654321",
-    text: "",
-    payload: params.payload,
-  };
-  return {
-    run: async () =>
-      await sendZalouserPayloadWithChunkedTextAndMedia({
-        ctx,
-        sendText: async (nextCtx) => {
-          const target = parseZalouserOutboundTarget(nextCtx.to);
-          return buildChannelSendResult(
-            "zalouser",
-            await mockedSendZalouser(target.threadId, nextCtx.text, {
-              profile: "default",
-              isGroup: target.isGroup,
-              textMode: "markdown",
-              textChunkMode: "length",
-              textChunkLimit: 1200,
-            }),
-          );
-        },
-        sendMedia: async (nextCtx) => {
-          const target = parseZalouserOutboundTarget(nextCtx.to);
-          return buildChannelSendResult(
-            "zalouser",
-            await mockedSendZalouser(target.threadId, nextCtx.text, {
-              profile: "default",
-              isGroup: target.isGroup,
-              mediaUrl: nextCtx.mediaUrl,
-              textMode: "markdown",
-              textChunkMode: "length",
-              textChunkLimit: 1200,
-            }),
-          );
-        },
-        emptyResult: { channel: "zalouser", messageId: "" },
-      }),
-    sendMock: mockedSendZalouser,
-    to: "987654321",
-  };
-}
+const scopedMediaConfig: OpenClawConfig = {
+  agents: { defaults: { mediaMaxMb: 4 } },
+  channels: {
+    "media-limit-fixture": {
+      mediaMaxMb: 2,
+      accounts: {
+        default: { mediaMaxMb: 3 },
+        office: { mediaMaxMb: 1 },
+        "office-east": { mediaMaxMb: 5 },
+        zero: { mediaMaxMb: 0 },
+        text: { mediaMaxMb: "1" },
+      },
+    },
+  },
+};
 
-describe("channel outbound payload contract", () => {
-  describe("slack", () => {
-    installChannelOutboundPayloadContractSuite({
-      channel: "slack",
-      chunking: { mode: "passthrough", longTextLength: 5000 },
-      createHarness: createSlackHarness,
-    });
+const agentLimit = (mediaMaxMb: number): OpenClawConfig => ({
+  agents: { defaults: { mediaMaxMb } },
+});
+const channelLimit = (mediaMaxMb: number | string, withDefault = true): OpenClawConfig => ({
+  ...(withDefault ? agentLimit(4) : {}),
+  channels: { "media-limit-fixture": { mediaMaxMb } },
+});
+
+// Programmatic inputs, not configuration-schema acceptance. Columns: name, config, account, bytes.
+const mediaLimitCases: Array<
+  [string, OpenClawConfig, string | null | undefined, number | undefined]
+> = [
+  ["no configured limit", {}, undefined, undefined],
+  ["agent default only", agentLimit(4), undefined, 4194304],
+  ["channel overrides agent", scopedMediaConfig, "missing", 2097152],
+  ["default account", scopedMediaConfig, undefined, 3145728],
+  ["trimmed account overrides channel", scopedMediaConfig, " OFFICE ", 1048576],
+  ["canonical account key", scopedMediaConfig, " Office / East ", 5242880],
+  ["zero account uses agent", scopedMediaConfig, "zero", 4194304],
+  ["non-number account uses channel", scopedMediaConfig, "text", 2097152],
+  ["zero channel uses agent", channelLimit(0), undefined, 4194304],
+  ["zero agent default is absent", agentLimit(0), undefined, undefined],
+  [
+    "non-record channel uses agent",
+    { ...agentLimit(4), channels: { "media-limit-fixture": [] } },
+    undefined,
+    4194304,
+  ],
+  ["fractional channel bytes", channelLimit(0.5, false), undefined, 524288],
+  ["non-number channel uses agent", channelLimit("2"), undefined, 4194304],
+];
+
+describe("scoped channel media limits", () => {
+  it.each(mediaLimitCases)("%s", (_name, cfg, accountId, expected) => {
+    const resolveLimit = createScopedChannelMediaMaxBytesResolver("media-limit-fixture");
+    expect(resolveLimit({ cfg, accountId })).toBe(expected);
   });
 
-  describe("discord", () => {
-    installChannelOutboundPayloadContractSuite({
-      channel: "discord",
-      chunking: { mode: "passthrough", longTextLength: 3000 },
-      createHarness: createDiscordHarness,
-    });
+  it("reads the configuration supplied to each call of the same resolver", () => {
+    const resolveLimit = createScopedChannelMediaMaxBytesResolver("media-limit-fixture");
+    for (const [limit, expected] of [
+      [1, 1048576],
+      [2, 2097152],
+    ] as const) {
+      expect(resolveLimit({ cfg: channelLimit(limit, false) })).toBe(expected);
+    }
   });
 
-  describe("whatsapp", () => {
-    installChannelOutboundPayloadContractSuite({
-      channel: "whatsapp",
-      chunking: { mode: "split", longTextLength: 5000, maxChunkLength: 4000 },
-      createHarness: createWhatsAppHarness,
+  it("carries selected limits and unchanged text/media options to the sender", async () => {
+    const cfg = scopedMediaConfig;
+    type BuilderInput = Parameters<
+      Parameters<typeof createDirectTextMediaOutbound>[0]["buildTextOptions"]
+    >[0];
+    const send = vi.fn(async (_to: string, _text: string, _options: BuilderInput) => ({
+      messageId: "fixture-message",
+    }));
+    const outbound = createDirectTextMediaOutbound({
+      channel: "media-limit-fixture",
+      resolveSender: () => send,
+      resolveMaxBytes: createScopedChannelMediaMaxBytesResolver("media-limit-fixture"),
+      buildTextOptions: (options) => ({ ...options, kind: "text" }),
+      buildMediaOptions: (options) => ({ ...options, kind: "media" }),
     });
-  });
+    const sendText = expectDefined(outbound.sendText, "sendText");
+    const sendMedia = expectDefined(outbound.sendMedia, "sendMedia");
+    const readFile = vi.fn(async () => Buffer.from("unused"));
+    const legacyReadFile = vi.fn(async () => Buffer.from("unused-legacy"));
+    const roots = ["/tmp/media-limit-canonical-fixture"];
+    const legacyRoots = ["/tmp/media-limit-legacy-fixture"];
+    const mediaAccess = { localRoots: roots, readFile, workspaceDir: "/tmp/media-limit-workspace" };
+    const context = { cfg, to: "fixture-recipient", accountId: " OFFICE ", replyToId: "reply-1" };
 
-  describe("zalo", () => {
-    installChannelOutboundPayloadContractSuite({
-      channel: "zalo",
-      chunking: { mode: "split", longTextLength: 3000, maxChunkLength: 2000 },
-      createHarness: createZaloHarness,
-    });
-  });
-
-  describe("zalouser", () => {
-    installChannelOutboundPayloadContractSuite({
-      channel: "zalouser",
-      chunking: { mode: "passthrough", longTextLength: 3000 },
-      createHarness: createZalouserHarness,
-    });
-  });
-
-  describe("direct-text-media", () => {
-    installChannelOutboundPayloadContractSuite({
-      channel: "imessage",
-      chunking: { mode: "split", longTextLength: 5000, maxChunkLength: 4000 },
-      createHarness: createDirectTextMediaHarness,
-    });
+    for (const [text, suppliedAccess, expectedAccess] of [
+      ["text", undefined, undefined],
+      ["caption", mediaAccess, mediaAccess],
+      ["legacy caption", undefined, { localRoots: legacyRoots, readFile: legacyReadFile }],
+    ] as const) {
+      const isText = text === "text";
+      const mediaUrl = isText ? undefined : "https://example.test/media.png";
+      const result = await (isText ? sendText : sendMedia)({
+        ...context,
+        text,
+        mediaUrl,
+        ...(!isText && {
+          mediaAccess: suppliedAccess,
+          mediaLocalRoots: legacyRoots,
+          mediaReadFile: legacyReadFile,
+        }),
+      });
+      expect(send).toHaveBeenLastCalledWith(context.to, text, {
+        cfg,
+        accountId: context.accountId,
+        replyToId: context.replyToId,
+        maxBytes: 1048576,
+        kind: isText ? "text" : "media",
+        mediaUrl,
+        mediaAccess: expectedAccess,
+        mediaLocalRoots: expectedAccess?.localRoots,
+        mediaReadFile: expectedAccess?.readFile,
+      });
+      const options = send.mock.lastCall?.[2];
+      expect(options?.cfg).toBe(cfg);
+      if (suppliedAccess) {
+        expect(options?.mediaAccess).toBe(suppliedAccess);
+      }
+      expect(options?.mediaLocalRoots).toBe(expectedAccess?.localRoots);
+      expect(result).toStrictEqual({
+        channel: "media-limit-fixture",
+        messageId: "fixture-message",
+      });
+    }
+    expect(readFile).not.toHaveBeenCalled();
+    expect(legacyReadFile).not.toHaveBeenCalled();
   });
 });

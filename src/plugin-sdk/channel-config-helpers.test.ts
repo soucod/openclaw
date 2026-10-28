@@ -1,70 +1,178 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it } from "vitest";
+import type { ChannelConfigAdapter } from "../channels/plugins/types.adapters.js";
 import { DEFAULT_ACCOUNT_ID } from "../routing/session-key.js";
 import {
   adaptScopedAccountAccessor,
+  authorizeConfigWrite,
   createScopedAccountConfigAccessors,
   createScopedChannelConfigAdapter,
   createScopedChannelConfigBase,
-  createScopedDmSecurityResolver,
   createHybridChannelConfigAdapter,
   createTopLevelChannelConfigAdapter,
   createTopLevelChannelConfigBase,
   createHybridChannelConfigBase,
+  ensureOpenDmPolicyAllowFromWildcard,
   mapAllowFromEntries,
+  normalizeChannelDmPolicy,
+  resolveChannelDmAccess,
+  resolveChannelDmAllowFrom,
+  resolveChannelDmPolicy,
+  resolveChannelConfigWrites,
   resolveOptionalConfigString,
+  setCanonicalDmAllowFrom,
 } from "./channel-config-helpers.js";
 
 const resolveDefaultAccountId = () => DEFAULT_ACCOUNT_ID;
+const namedAccountBase = {
+  sectionKey: "demo",
+  listAccountIds: () => ["default", "alt"],
+  resolveAccount: (_cfg: unknown, accountId?: string | null) => ({
+    accountId: accountId ?? "default",
+  }),
+  defaultAccountId: resolveDefaultAccountId,
+  clearBaseFields: ["token"],
+};
+const selectors = {
+  resolveAllowFrom: (account: { allowFrom: Array<string | number>; defaultTo: string }) =>
+    account.allowFrom,
+  formatAllowFrom: (entries: Array<string | number>) =>
+    entries.map((entry) => String(entry).toUpperCase()),
+  resolveDefaultTo: (account: { defaultTo: string }) => account.defaultTo,
+};
+const enableDefault = { cfg: {}, accountId: "default", enabled: true };
+const credentials = { channels: { demo: { token: "secret" } } };
+const credentialsAndSettings = {
+  channels: { demo: { token: "secret", markdown: { tables: false } } },
+};
 
-describe("mapAllowFromEntries", () => {
-  it("coerces allowFrom entries to strings", () => {
-    expect(mapAllowFromEntries(["user", 42])).toEqual(["user", "42"]);
-  });
-
-  it("returns empty list for missing input", () => {
-    expect(mapAllowFromEntries(undefined)).toEqual([]);
-  });
-});
-
-describe("resolveOptionalConfigString", () => {
-  it("trims and returns string values", () => {
-    expect(resolveOptionalConfigString("  room:123  ")).toBe("room:123");
-  });
-
-  it("coerces numeric values", () => {
-    expect(resolveOptionalConfigString(123)).toBe("123");
-  });
-
-  it("returns undefined for empty values", () => {
-    expect(resolveOptionalConfigString("   ")).toBeUndefined();
-    expect(resolveOptionalConfigString(undefined)).toBeUndefined();
-  });
-});
-
-describe("adaptScopedAccountAccessor", () => {
-  it("binds positional callback args into the shared account context object", () => {
-    const accessor = adaptScopedAccountAccessor(({ cfg, accountId }) => ({
-      channel: cfg.channels?.demo,
-      accountId: accountId ?? "default",
-    }));
-
-    expect(
-      accessor(
-        {
-          channels: {
-            demo: {
-              enabled: true,
-            },
-          },
+function createConfigWritesCfg() {
+  return {
+    channels: {
+      telegram: {
+        configWrites: true,
+        accounts: {
+          Work: { configWrites: false },
         },
-        "alt",
-      ),
-    ).toEqual({
-      channel: {
-        enabled: true,
       },
-      accountId: "alt",
+    },
+  };
+}
+
+function expectAdapterAllowFromAndDefaultTo(
+  channelAdapter: Pick<
+    ChannelConfigAdapter<unknown>,
+    "resolveAllowFrom" | "resolveDefaultTo" | "setAccountEnabled"
+  >,
+) {
+  expect(channelAdapter.resolveAllowFrom?.({ cfg: {}, accountId: "alt" })).toEqual(["alt"]);
+  expect(channelAdapter.resolveDefaultTo?.({ cfg: {}, accountId: "alt" })).toBe("room:123");
+  expect(channelAdapter.setAccountEnabled?.(enableDefault)?.channels?.demo).toEqual({
+    enabled: true,
+  });
+}
+
+it("mapAllowFromEntries returns empty list for missing input", () => {
+  expect(mapAllowFromEntries(undefined)).toEqual([]);
+});
+
+it.each(["   ", undefined])("resolveOptionalConfigString ignores empty or missing %j", (input) => {
+  expect(resolveOptionalConfigString(input)).toBeUndefined();
+});
+
+describe("channel DM access helpers", () => {
+  it("re-exports centralized DM access helpers from the SDK entrypoint", () => {
+    const entry = { dm: { policy: "allowlist", allowFrom: ["U1"] } };
+    const changes: string[] = [];
+
+    expect(normalizeChannelDmPolicy("allowlist")).toBe("allowlist");
+    expect(resolveChannelDmPolicy({ account: entry })).toBe("allowlist");
+    expect(resolveChannelDmAllowFrom({ account: entry })).toEqual(["U1"]);
+
+    setCanonicalDmAllowFrom({
+      entry,
+      mode: "topOnly",
+      allowFrom: ["U2"],
+      pathPrefix: "channels.demo",
+      changes,
+      reason: "normalized by SDK helper",
     });
+
+    expect(entry).toEqual({ dm: { policy: "allowlist" }, allowFrom: ["U2"] });
+    expect(changes).toEqual([
+      "- channels.demo.dm.allowFrom: removed after moving allowlist to channels.demo.allowFrom",
+      "- channels.demo.allowFrom: normalized by SDK helper",
+    ]);
+  });
+
+  it("resolves account legacy allowFrom before inherited root allowFrom", () => {
+    expect(
+      resolveChannelDmAccess({
+        account: { dm: { allowFrom: ["account-legacy"] } },
+        parent: { allowFrom: ["root"] },
+      }),
+    ).toEqual({ allowFrom: ["account-legacy"], dmPolicy: undefined });
+  });
+
+  it("keeps nested-only channels on dm.allowFrom", () => {
+    const entry = { dmPolicy: "open", allowFrom: ["matrix:@owner"] };
+    const changes: string[] = [];
+
+    ensureOpenDmPolicyAllowFromWildcard({
+      entry,
+      mode: "nestedOnly",
+      pathPrefix: "channels.matrix",
+      changes,
+    });
+
+    expect(entry).toEqual({ dm: { policy: "open", allowFrom: ["matrix:@owner", "*"] } });
+    expect(changes).toEqual([
+      '- channels.matrix.dm.policy: set to "open" (migrated from channels.matrix.dmPolicy)',
+      "- channels.matrix.allowFrom: removed after moving allowlist to channels.matrix.dm.allowFrom",
+      '- channels.matrix.dm.allowFrom: added "*" (required by dmPolicy="open")',
+    ]);
+  });
+});
+
+describe("config write helpers", () => {
+  it("matches account ids case-insensitively", () => {
+    expect(
+      resolveChannelConfigWrites({
+        cfg: createConfigWritesCfg(),
+        channelId: "telegram",
+        accountId: "work",
+      }),
+    ).toBe(false);
+  });
+
+  it("blocks account-scoped writes when the configured account key differs only by case", () => {
+    expect(
+      authorizeConfigWrite({
+        cfg: createConfigWritesCfg(),
+        target: {
+          kind: "account",
+          scope: { channelId: "telegram", accountId: "work" },
+        },
+      }),
+    ).toEqual({
+      allowed: false,
+      reason: "target-disabled",
+      blockedScope: {
+        kind: "target",
+        scope: { channelId: "telegram", accountId: "work" },
+      },
+    });
+  });
+});
+
+it("adaptScopedAccountAccessor binds positional callback args into the shared account context", () => {
+  const accessor = adaptScopedAccountAccessor(({ cfg, accountId }) => ({
+    channel: cfg.channels?.demo,
+    accountId: accountId ?? "default",
+  }));
+
+  expect(accessor({ channels: { demo: { enabled: true } } }, "alt")).toEqual({
+    channel: { enabled: true },
+    accountId: "alt",
   });
 });
 
@@ -75,29 +183,12 @@ describe("createScopedAccountConfigAccessors", () => {
         allowFrom: accountId ? [accountId, 42] : ["fallback"],
         defaultTo: " room:123 ",
       }),
-      resolveAllowFrom: (account) => account.allowFrom,
-      formatAllowFrom: (allowFrom) => allowFrom.map((entry) => String(entry).toUpperCase()),
-      resolveDefaultTo: (account) => account.defaultTo,
+      ...selectors,
     });
 
-    expect(
-      accessors.resolveAllowFrom?.({
-        cfg: {},
-        accountId: "owner",
-      }),
-    ).toEqual(["owner", "42"]);
-    expect(
-      accessors.formatAllowFrom?.({
-        cfg: {},
-        allowFrom: ["owner"],
-      }),
-    ).toEqual(["OWNER"]);
-    expect(
-      accessors.resolveDefaultTo?.({
-        cfg: {},
-        accountId: "owner",
-      }),
-    ).toBe("room:123");
+    expect(accessors.resolveAllowFrom?.({ cfg: {}, accountId: "owner" })).toEqual(["owner", "42"]);
+    expect(accessors.formatAllowFrom?.({ cfg: {}, allowFrom: ["owner"] })).toEqual(["OWNER"]);
+    expect(accessors.resolveDefaultTo?.({ cfg: {}, accountId: "owner" })).toBe("room:123");
   });
 
   it("omits resolveDefaultTo when no selector is provided", () => {
@@ -111,104 +202,115 @@ describe("createScopedAccountConfigAccessors", () => {
   });
 });
 
-describe("createScopedChannelConfigBase", () => {
-  it("wires shared account config CRUD through the section helper", () => {
-    const base = createScopedChannelConfigBase({
-      sectionKey: "demo",
-      listAccountIds: () => ["default", "alt"],
-      resolveAccount: (_cfg, accountId) => ({ accountId: accountId ?? "default" }),
-      defaultAccountId: resolveDefaultAccountId,
-      clearBaseFields: ["token"],
-    });
+it("createScopedChannelConfigBase wires shared account config CRUD through the section helper", () => {
+  const base = createScopedChannelConfigBase(namedAccountBase);
 
-    expect(base.listAccountIds({})).toEqual(["default", "alt"]);
-    expect(base.resolveAccount({}, "alt")).toEqual({ accountId: "alt" });
-    expect(base.defaultAccountId!({})).toBe("default");
-    expect(
-      base.setAccountEnabled!({
-        cfg: {},
-        accountId: "default",
-        enabled: true,
-      }).channels?.demo,
-    ).toEqual({ enabled: true });
-    expect(
-      base.deleteAccount!({
-        cfg: {
-          channels: {
-            demo: {
-              token: "secret",
-            },
-          },
-        },
-        accountId: "default",
-      }).channels,
-    ).toBeUndefined();
-  });
-
-  it("can force default account config into accounts.default", () => {
-    const base = createScopedChannelConfigBase({
-      sectionKey: "demo",
-      listAccountIds: () => ["default", "alt"],
-      resolveAccount: (_cfg, accountId) => ({ accountId: accountId ?? "default" }),
-      defaultAccountId: resolveDefaultAccountId,
-      clearBaseFields: [],
-      allowTopLevel: false,
-    });
-
-    expect(
-      base.setAccountEnabled!({
-        cfg: {
-          channels: {
-            demo: {
-              token: "secret",
-            },
-          },
-        },
-        accountId: "default",
-        enabled: true,
-      }).channels?.demo,
-    ).toEqual({
-      token: "secret",
-      accounts: {
-        default: { enabled: true },
-      },
-    });
-    expect(
-      base.deleteAccount!({
-        cfg: {
-          channels: {
-            demo: {
-              token: "secret",
-              accounts: {
-                default: { enabled: true },
-              },
-            },
-          },
-        },
-        accountId: "default",
-      }).channels?.demo,
-    ).toEqual({
-      token: "secret",
-      accounts: undefined,
-    });
-  });
+  expect(base.listAccountIds({})).toEqual(["default", "alt"]);
+  expect(base.resolveAccount({}, "alt")).toEqual({ accountId: "alt" });
+  expect(base.defaultAccountId!({})).toBe("default");
+  expect(base.setAccountEnabled!(enableDefault).channels?.demo).toEqual({ enabled: true });
+  expect(base.deleteAccount!({ cfg: credentials, accountId: "default" }).channels).toBeUndefined();
 });
 
 describe("createScopedChannelConfigAdapter", () => {
+  it("requires a producer for a distinct accessor account shape", () => {
+    type RuntimeAccount = { token: string };
+    type AccessorAccount = { allowFrom: string[] };
+    type MissingProjection = {
+      sectionKey: string;
+      listAccountIds: () => string[];
+      resolveAccount: () => RuntimeAccount;
+      defaultAccountId: () => string;
+      clearBaseFields: string[];
+      resolveAllowFrom: (account: AccessorAccount) => string[];
+      formatAllowFrom: (entries: Array<string | number>) => string[];
+    };
+    expectTypeOf<MissingProjection>().not.toMatchTypeOf<
+      Parameters<typeof createScopedChannelConfigAdapter<RuntimeAccount, AccessorAccount>>[0]
+    >();
+    expectTypeOf<MissingProjection>().not.toMatchTypeOf<
+      Parameters<typeof createHybridChannelConfigAdapter<RuntimeAccount, AccessorAccount>>[0]
+    >();
+    expectTypeOf<MissingProjection>().not.toMatchTypeOf<
+      Parameters<typeof createTopLevelChannelConfigAdapter<RuntimeAccount, AccessorAccount>>[0]
+    >();
+  });
+
+  it.each([false, true])("accepts an optional same-account resolver: %s", (useProjection) => {
+    const runtimeAccount = { allowFrom: ["runtime"] };
+    const projectedAccount = { allowFrom: ["projection"] };
+    const resolveAccessorAccount = useProjection ? () => projectedAccount : undefined;
+    const params = {
+      ...namedAccountBase,
+      resolveAccount: () => runtimeAccount,
+      resolveAccessorAccount,
+      resolveAllowFrom: (account: typeof runtimeAccount) => account.allowFrom,
+      formatAllowFrom: mapAllowFromEntries,
+    };
+    const adapters = [
+      createScopedChannelConfigAdapter(params),
+      createHybridChannelConfigAdapter(params),
+      createTopLevelChannelConfigAdapter(params),
+    ];
+    for (const adapter of adapters) {
+      expect(adapter.resolveAllowFrom?.({ cfg: {} })).toEqual([
+        useProjection ? "projection" : "runtime",
+      ]);
+    }
+  });
+
+  it("contextually types explicitly selected optional projection fields", () => {
+    type RuntimeAccount = { enabled: boolean; token: string };
+    type AccessorAccount = { enabled?: boolean; allowFrom?: string[]; defaultTo?: string };
+    const params = {
+      ...namedAccountBase,
+      resolveAccount: () => ({ enabled: true, token: "runtime" }),
+      formatAllowFrom: mapAllowFromEntries,
+    };
+    const adapters = [
+      createScopedChannelConfigAdapter<RuntimeAccount, AccessorAccount>({
+        ...params,
+        resolveAccessorAccount: ({ accountId }) => ({
+          allowFrom: [accountId ?? "projection"],
+          defaultTo: "target",
+        }),
+        resolveAllowFrom: (account) => account.allowFrom,
+        resolveDefaultTo: (account) => account.defaultTo,
+      }),
+      createHybridChannelConfigAdapter<RuntimeAccount, AccessorAccount>({
+        ...params,
+        resolveAccessorAccount: ({ accountId }) => ({
+          allowFrom: [accountId ?? "projection"],
+          defaultTo: "target",
+        }),
+        resolveAllowFrom: (account) => account.allowFrom,
+        resolveDefaultTo: (account) => account.defaultTo,
+      }),
+      createTopLevelChannelConfigAdapter<RuntimeAccount, AccessorAccount>({
+        ...params,
+        resolveAccessorAccount: ({ accountId }) => ({
+          allowFrom: [accountId ?? "projection"],
+          defaultTo: "target",
+        }),
+        resolveAllowFrom: (account) => account.allowFrom,
+        resolveDefaultTo: (account) => account.defaultTo,
+      }),
+    ];
+    for (const adapter of adapters) {
+      expect(adapter.resolveAllowFrom?.({ cfg: {} })).toEqual(["projection"]);
+      expect(adapter.resolveDefaultTo?.({ cfg: {} })).toBe("target");
+    }
+  });
+
   it("combines scoped CRUD and allowFrom accessors", () => {
     const adapter = createScopedChannelConfigAdapter({
-      sectionKey: "demo",
-      listAccountIds: () => ["default", "alt"],
+      ...namedAccountBase,
       resolveAccount: (_cfg, accountId) => ({
         accountId: accountId ?? "default",
         allowFrom: accountId ? [accountId] : ["fallback"],
         defaultTo: " room:123 ",
       }),
-      defaultAccountId: resolveDefaultAccountId,
-      clearBaseFields: ["token"],
-      resolveAllowFrom: (account) => account.allowFrom,
-      formatAllowFrom: (allowFrom) => allowFrom.map((entry) => String(entry).toUpperCase()),
-      resolveDefaultTo: (account) => account.defaultTo,
+      ...selectors,
     });
 
     expect(adapter.listAccountIds({})).toEqual(["default", "alt"]);
@@ -217,278 +319,127 @@ describe("createScopedChannelConfigAdapter", () => {
       allowFrom: ["alt"],
       defaultTo: " room:123 ",
     });
-    expect(adapter.resolveAllowFrom?.({ cfg: {}, accountId: "alt" })).toEqual(["alt"]);
-    expect(adapter.resolveDefaultTo?.({ cfg: {}, accountId: "alt" })).toBe("room:123");
-    expect(
-      adapter.setAccountEnabled!({
-        cfg: {},
-        accountId: "default",
-        enabled: true,
-      }).channels?.demo,
-    ).toEqual({ enabled: true });
-  });
-});
-
-describe("createScopedDmSecurityResolver", () => {
-  it("builds account-aware DM policy payloads", () => {
-    const resolveDmPolicy = createScopedDmSecurityResolver<{
-      accountId?: string | null;
-      dmPolicy?: string;
-      allowFrom?: string[];
-    }>({
-      channelKey: "demo",
-      resolvePolicy: (account) => account.dmPolicy,
-      resolveAllowFrom: (account) => account.allowFrom,
-      policyPathSuffix: "dmPolicy",
-      normalizeEntry: (raw) => raw.toLowerCase(),
-    });
-
-    expect(
-      resolveDmPolicy({
-        cfg: {
-          channels: {
-            demo: {
-              accounts: {
-                alt: {},
-              },
-            },
-          },
-        },
-        accountId: "alt",
-        account: {
-          accountId: "alt",
-          dmPolicy: "allowlist",
-          allowFrom: ["Owner"],
-        },
-      }),
-    ).toEqual({
-      policy: "allowlist",
-      allowFrom: ["Owner"],
-      policyPath: "channels.demo.accounts.alt.dmPolicy",
-      allowFromPath: "channels.demo.accounts.alt.",
-      approveHint: "Approve via: openclaw pairing list demo / openclaw pairing approve demo <code>",
-      normalizeEntry: expect.any(Function),
-    });
-  });
-});
-
-describe("createTopLevelChannelConfigBase", () => {
-  it("wires top-level enable/delete semantics", () => {
-    const base = createTopLevelChannelConfigBase({
-      sectionKey: "demo",
-      resolveAccount: () => ({ accountId: "default" }),
-    });
-
-    expect(base.listAccountIds({})).toEqual(["default"]);
-    expect(base.defaultAccountId!({})).toBe("default");
-    expect(
-      base.setAccountEnabled!({
-        cfg: {},
-        accountId: "default",
-        enabled: true,
-      }).channels?.demo,
-    ).toEqual({ enabled: true });
-    expect(
-      base.deleteAccount!({
-        cfg: {
-          channels: {
-            demo: {
-              enabled: true,
-            },
-          },
-        },
-        accountId: "default",
-      }).channels,
-    ).toBeUndefined();
+    expectAdapterAllowFromAndDefaultTo(adapter);
   });
 
-  it("can clear only account-scoped fields while preserving channel settings", () => {
-    const base = createTopLevelChannelConfigBase({
-      sectionKey: "demo",
-      resolveAccount: () => ({ accountId: "default" }),
-      deleteMode: "clear-fields",
-      clearBaseFields: ["token", "allowFrom"],
-    });
-
-    expect(
-      base.deleteAccount!({
-        cfg: {
-          channels: {
-            demo: {
-              token: "secret",
-              allowFrom: ["owner"],
-              markdown: { tables: false },
-            },
-          },
-        },
-        accountId: "default",
-      }).channels?.demo,
-    ).toEqual({
-      markdown: { tables: false },
-    });
-  });
-});
-
-describe("createTopLevelChannelConfigAdapter", () => {
-  it("combines top-level CRUD with separate accessor account resolution", () => {
-    const adapter = createTopLevelChannelConfigAdapter<
-      { accountId: string; enabled: boolean },
+  it("keeps read-only accessors on the accessor resolver", () => {
+    const adapter = createScopedChannelConfigAdapter<
+      { accountId: string; token: string },
       { allowFrom: string[]; defaultTo: string }
     >({
-      sectionKey: "demo",
-      resolveAccount: () => ({ accountId: "default", enabled: true }),
-      resolveAccessorAccount: () => ({ allowFrom: ["owner"], defaultTo: " chat:123 " }),
-      deleteMode: "clear-fields",
-      clearBaseFields: ["token"],
+      ...namedAccountBase,
+      listAccountIds: () => ["default"],
+      resolveAccount: () => {
+        throw new Error("runtime account resolver should not run for read-only accessors");
+      },
+      resolveAccessorAccount: ({ accountId }) => ({
+        allowFrom: [accountId ?? "default"],
+        defaultTo: " room:123 ",
+      }),
       resolveAllowFrom: (account) => account.allowFrom,
       formatAllowFrom: (allowFrom) => allowFrom.map((entry) => String(entry)),
       resolveDefaultTo: (account) => account.defaultTo,
     });
 
-    expect(adapter.resolveAccount({})).toEqual({ accountId: "default", enabled: true });
-    expect(adapter.resolveAllowFrom?.({ cfg: {} })).toEqual(["owner"]);
-    expect(adapter.resolveDefaultTo?.({ cfg: {} })).toBe("chat:123");
-    expect(
-      adapter.deleteAccount!({
-        cfg: {
-          channels: {
-            demo: {
-              token: "secret",
-              markdown: { tables: false },
-            },
-          },
-        },
-        accountId: "default",
-      }).channels?.demo,
-    ).toEqual({
-      markdown: { tables: false },
-    });
+    expect(adapter.resolveAllowFrom?.({ cfg: {}, accountId: "default" })).toEqual(["default"]);
+    expect(adapter.resolveDefaultTo?.({ cfg: {}, accountId: "default" })).toBe("room:123");
   });
 });
 
-describe("createHybridChannelConfigBase", () => {
-  it("writes default account enable at the channel root and named accounts under accounts", () => {
-    const base = createHybridChannelConfigBase({
-      sectionKey: "demo",
-      listAccountIds: () => ["default", "alt"],
-      resolveAccount: (_cfg, accountId) => ({ accountId: accountId ?? "default" }),
-      defaultAccountId: resolveDefaultAccountId,
-      clearBaseFields: ["token"],
-    });
+it("createTopLevelChannelConfigBase wires top-level enable/delete semantics", () => {
+  const base = createTopLevelChannelConfigBase({
+    sectionKey: "demo",
+    resolveAccount: () => ({ accountId: "default" }),
+  });
 
-    expect(
-      base.setAccountEnabled!({
-        cfg: {
-          channels: {
-            demo: {
-              accounts: {
-                alt: { enabled: false },
-              },
-            },
-          },
-        },
-        accountId: "default",
-        enabled: true,
-      }).channels?.demo,
-    ).toEqual({
-      accounts: {
-        alt: { enabled: false },
-      },
+  expect(base.listAccountIds({})).toEqual(["default"]);
+  expect(base.defaultAccountId!({})).toBe("default");
+  expect(base.setAccountEnabled!(enableDefault).channels?.demo).toEqual({ enabled: true });
+  expect(
+    base.deleteAccount!({
+      cfg: { channels: { demo: { enabled: true } } },
+      accountId: "default",
+    }).channels,
+  ).toBeUndefined();
+});
+
+it("createTopLevelChannelConfigAdapter combines CRUD with separate accessor account resolution", () => {
+  const adapter = createTopLevelChannelConfigAdapter<
+    { accountId: string; enabled: boolean },
+    { allowFrom: string[]; defaultTo: string }
+  >({
+    sectionKey: "demo",
+    resolveAccount: () => ({ accountId: "default", enabled: true }),
+    resolveAccessorAccount: () => ({ allowFrom: ["owner"], defaultTo: " chat:123 " }),
+    deleteMode: "clear-fields",
+    clearBaseFields: ["token"],
+    resolveAllowFrom: (account) => account.allowFrom,
+    formatAllowFrom: (allowFrom) => allowFrom.map((entry) => String(entry)),
+    resolveDefaultTo: (account) => account.defaultTo,
+  });
+
+  expect(adapter.resolveAccount({})).toEqual({ accountId: "default", enabled: true });
+  expect(adapter.resolveAllowFrom?.({ cfg: {} })).toEqual(["owner"]);
+  expect(adapter.resolveDefaultTo?.({ cfg: {} })).toBe("chat:123");
+  expect(
+    adapter.deleteAccount!({
+      cfg: credentialsAndSettings,
+      accountId: "default",
+    }).channels?.demo,
+  ).toEqual({
+    markdown: { tables: false },
+  });
+});
+
+it("createHybridChannelConfigBase enables default at root and named accounts under accounts", () => {
+  const base = createHybridChannelConfigBase(namedAccountBase);
+
+  expect(
+    base.setAccountEnabled!({
+      cfg: { channels: { demo: { accounts: { alt: { enabled: false } } } } },
+      accountId: "default",
       enabled: true,
-    });
-    expect(
-      base.setAccountEnabled!({
-        cfg: {},
-        accountId: "alt",
-        enabled: true,
-      }).channels?.demo,
-    ).toEqual({
-      accounts: {
-        alt: { enabled: true },
-      },
-    });
+    }).channels?.demo,
+  ).toEqual({
+    accounts: { alt: { enabled: false } },
+    enabled: true,
   });
-
-  it("can preserve the section when deleting the default account", () => {
-    const base = createHybridChannelConfigBase({
-      sectionKey: "demo",
-      listAccountIds: () => ["default", "alt"],
-      resolveAccount: (_cfg, accountId) => ({ accountId: accountId ?? "default" }),
-      defaultAccountId: resolveDefaultAccountId,
-      clearBaseFields: ["token", "name"],
-      preserveSectionOnDefaultDelete: true,
-    });
-
-    expect(
-      base.deleteAccount!({
-        cfg: {
-          channels: {
-            demo: {
-              token: "secret",
-              name: "bot",
-              accounts: {
-                alt: { enabled: true },
-              },
-            },
-          },
-        },
-        accountId: "default",
-      }).channels?.demo,
-    ).toEqual({
-      accounts: {
-        alt: { enabled: true },
-      },
-    });
+  expect(
+    base.setAccountEnabled!({
+      cfg: {},
+      accountId: "alt",
+      enabled: true,
+    }).channels?.demo,
+  ).toEqual({
+    accounts: { alt: { enabled: true } },
   });
 });
 
-describe("createHybridChannelConfigAdapter", () => {
-  it("combines hybrid CRUD with allowFrom/defaultTo accessors", () => {
-    const adapter = createHybridChannelConfigAdapter<
-      { accountId: string; enabled: boolean },
-      { allowFrom: string[]; defaultTo: string }
-    >({
-      sectionKey: "demo",
-      listAccountIds: () => ["default", "alt"],
-      resolveAccount: (_cfg, accountId) => ({
-        accountId: accountId ?? "default",
-        enabled: true,
-      }),
-      resolveAccessorAccount: ({ accountId }) => ({
-        allowFrom: [accountId ?? "default"],
-        defaultTo: " room:123 ",
-      }),
-      defaultAccountId: resolveDefaultAccountId,
-      clearBaseFields: ["token"],
-      preserveSectionOnDefaultDelete: true,
-      resolveAllowFrom: (account) => account.allowFrom,
-      formatAllowFrom: (allowFrom) => allowFrom.map((entry) => String(entry).toUpperCase()),
-      resolveDefaultTo: (account) => account.defaultTo,
-    });
+it("createHybridChannelConfigAdapter combines hybrid CRUD with allowFrom/defaultTo accessors", () => {
+  const adapter = createHybridChannelConfigAdapter<
+    { accountId: string; enabled: boolean },
+    { allowFrom: string[]; defaultTo: string }
+  >({
+    ...namedAccountBase,
+    resolveAccount: (_cfg, accountId) => ({
+      accountId: accountId ?? "default",
+      enabled: true,
+    }),
+    resolveAccessorAccount: ({ accountId }) => ({
+      allowFrom: [accountId ?? "default"],
+      defaultTo: " room:123 ",
+    }),
+    preserveSectionOnDefaultDelete: true,
+    ...selectors,
+  });
 
-    expect(adapter.resolveAllowFrom?.({ cfg: {}, accountId: "alt" })).toEqual(["alt"]);
-    expect(adapter.resolveDefaultTo?.({ cfg: {}, accountId: "alt" })).toBe("room:123");
-    expect(
-      adapter.setAccountEnabled!({
-        cfg: {},
-        accountId: "default",
-        enabled: true,
-      }).channels?.demo,
-    ).toEqual({ enabled: true });
-    expect(
-      adapter.deleteAccount!({
-        cfg: {
-          channels: {
-            demo: {
-              token: "secret",
-              markdown: { tables: false },
-            },
-          },
-        },
-        accountId: "default",
-      }).channels?.demo,
-    ).toEqual({
-      markdown: { tables: false },
-    });
+  expectAdapterAllowFromAndDefaultTo(adapter);
+  expect(
+    adapter.deleteAccount!({
+      cfg: credentialsAndSettings,
+      accountId: "default",
+    }).channels?.demo,
+  ).toEqual({
+    markdown: { tables: false },
   });
 });

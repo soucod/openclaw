@@ -1,175 +1,54 @@
+import {
+  normalizeOptionalLowercaseString,
+  normalizeOptionalString,
+  resolvePrimaryStringValue,
+} from "@openclaw/normalization-core/string-coerce";
+import {
+  normalizeBindingConfig,
+  normalizeMode,
+  normalizeText,
+  toConfiguredAcpBindingRecord,
+} from "../../acp/persistent-bindings.types.js";
+import { resolveAgentConfig, resolveAgentWorkspaceDir } from "../../agents/agent-scope.js";
+import { parseModelRef } from "../../agents/model-selection-normalize.js";
+import { resolveConfiguredThinkingDefault } from "../../agents/model-thinking-default.js";
 import { listConfiguredBindings } from "../../config/bindings.js";
-import type { OpenClawConfig } from "../../config/config.js";
-import { getActivePluginRegistry, getActivePluginRegistryVersion } from "../../plugins/runtime.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { getPluginRegistryForContext } from "../../plugins/runtime/gateway-request-scope.js";
 import { pickFirstExistingAgentId } from "../../routing/resolve-route.js";
-import { resolveChannelConfiguredBindingProvider } from "./binding-provider.js";
-import type { CompiledConfiguredBinding, ConfiguredBindingChannel } from "./binding-types.js";
-import { resolveConfiguredBindingConsumer } from "./configured-binding-consumers.js";
-import { getChannelPlugin } from "./index.js";
-import type {
-  ChannelConfiguredBindingConversationRef,
-  ChannelConfiguredBindingProvider,
-} from "./types.adapters.js";
+import type { CompiledConfiguredBinding } from "./binding-types.js";
+import { getLoadedChannelPluginEntryById } from "./registry-loaded.js";
+import type { ChannelId } from "./types.public.js";
 
-// Configured bindings are channel-owned rules compiled from config, separate
-// from runtime plugin-owned conversation bindings.
+export function resolveCompiledBindingRegistry(cfg: OpenClawConfig) {
+  const rulesByChannel = new Map<ChannelId, CompiledConfiguredBinding[]>();
 
-type ChannelPluginLike = NonNullable<ReturnType<typeof getChannelPlugin>>;
-
-export type CompiledConfiguredBindingRegistry = {
-  rulesByChannel: Map<ConfiguredBindingChannel, CompiledConfiguredBinding[]>;
-};
-
-type CachedCompiledConfiguredBindingRegistry = {
-  registryVersion: number;
-  registry: CompiledConfiguredBindingRegistry;
-};
-
-const compiledRegistryCache = new WeakMap<
-  OpenClawConfig,
-  CachedCompiledConfiguredBindingRegistry
->();
-
-function findChannelPlugin(params: {
-  registry:
-    | {
-        channels?: Array<{ plugin?: ChannelPluginLike | null } | null> | null;
-      }
-    | null
-    | undefined;
-  channel: string;
-}): ChannelPluginLike | undefined {
-  return (
-    params.registry?.channels?.find((entry) => entry?.plugin?.id === params.channel)?.plugin ??
-    undefined
-  );
-}
-
-function resolveLoadedChannelPlugin(channel: string) {
-  const normalized = channel.trim().toLowerCase();
-  if (!normalized) {
-    return undefined;
-  }
-
-  const current = getChannelPlugin(normalized as ConfiguredBindingChannel);
-  if (current) {
-    return current;
-  }
-
-  return findChannelPlugin({
-    registry: getActivePluginRegistry(),
-    channel: normalized,
-  });
-}
-
-function resolveConfiguredBindingAdapter(channel: string): {
-  channel: ConfiguredBindingChannel;
-  provider: ChannelConfiguredBindingProvider;
-} | null {
-  const normalized = channel.trim().toLowerCase();
-  if (!normalized) {
-    return null;
-  }
-  const plugin = resolveLoadedChannelPlugin(normalized);
-  const provider = resolveChannelConfiguredBindingProvider(plugin);
-  if (
-    !plugin ||
-    !provider ||
-    !provider.compileConfiguredBinding ||
-    !provider.matchInboundConversation
-  ) {
-    return null;
-  }
-  return {
-    channel: plugin.id,
-    provider,
-  };
-}
-
-function resolveBindingConversationId(binding: {
-  match?: { peer?: { id?: string } };
-}): string | null {
-  const id = binding.match?.peer?.id?.trim();
-  return id ? id : null;
-}
-
-function compileConfiguredBindingTarget(params: {
-  provider: ChannelConfiguredBindingProvider;
-  binding: CompiledConfiguredBinding["binding"];
-  conversationId: string;
-}): ChannelConfiguredBindingConversationRef | null {
-  return params.provider.compileConfiguredBinding({
-    binding: params.binding,
-    conversationId: params.conversationId,
-  });
-}
-
-function compileConfiguredBindingRule(params: {
-  cfg: OpenClawConfig;
-  channel: ConfiguredBindingChannel;
-  binding: CompiledConfiguredBinding["binding"];
-  target: ChannelConfiguredBindingConversationRef;
-  bindingConversationId: string;
-  provider: ChannelConfiguredBindingProvider;
-}): CompiledConfiguredBinding | null {
-  const agentId = pickFirstExistingAgentId(params.cfg, params.binding.agentId ?? "main");
-  const consumer = resolveConfiguredBindingConsumer(params.binding);
-  if (!consumer) {
-    return null;
-  }
-  const targetFactory = consumer.buildTargetFactory({
-    cfg: params.cfg,
-    binding: params.binding,
-    channel: params.channel,
-    agentId,
-    target: params.target,
-    bindingConversationId: params.bindingConversationId,
-  });
-  if (!targetFactory) {
-    return null;
-  }
-  return {
-    channel: params.channel,
-    accountPattern: params.binding.match.accountId?.trim() || undefined,
-    binding: params.binding,
-    bindingConversationId: params.bindingConversationId,
-    target: params.target,
-    agentId,
-    provider: params.provider,
-    targetFactory,
-  };
-}
-
-function pushCompiledRule(
-  target: Map<ConfiguredBindingChannel, CompiledConfiguredBinding[]>,
-  rule: CompiledConfiguredBinding,
-) {
-  const existing = target.get(rule.channel);
-  if (existing) {
-    existing.push(rule);
-    return;
-  }
-  target.set(rule.channel, [rule]);
-}
-
-function compileConfiguredBindingRegistry(params: {
-  cfg: OpenClawConfig;
-}): CompiledConfiguredBindingRegistry {
-  const rulesByChannel = new Map<ConfiguredBindingChannel, CompiledConfiguredBinding[]>();
-
-  for (const binding of listConfiguredBindings(params.cfg)) {
-    const bindingConversationId = resolveBindingConversationId(binding);
+  for (const binding of listConfiguredBindings(cfg)) {
+    // Ordinary routing bindings share the config array but have no stateful target.
+    // Reject them before consulting the loaded channel registry on request-time route lookups.
+    if (binding.type !== "acp") {
+      continue;
+    }
+    const bindingConversationId = normalizeOptionalString(binding.match?.peer?.id);
     if (!bindingConversationId) {
       continue;
     }
 
-    const resolvedChannel = resolveConfiguredBindingAdapter(binding.match.channel);
-    if (!resolvedChannel) {
+    const channel = normalizeOptionalLowercaseString(binding.match.channel);
+    if (!channel) {
       continue;
     }
-
-    const target = compileConfiguredBindingTarget({
-      provider: resolvedChannel.provider,
+    // Candidate validation and admitted routing compile against their exact owner.
+    const plugin = getLoadedChannelPluginEntryById(
+      channel,
+      getPluginRegistryForContext() ?? undefined,
+    )?.plugin;
+    const provider = plugin?.bindings;
+    if (!plugin || !provider?.compileConfiguredBinding || !provider.matchInboundConversation) {
+      continue;
+    }
+    const channelId = plugin.id;
+    const target = provider.compileConfiguredBinding({
       binding,
       conversationId: bindingConversationId,
     });
@@ -177,64 +56,72 @@ function compileConfiguredBindingRegistry(params: {
       continue;
     }
 
-    const rule = compileConfiguredBindingRule({
-      cfg: params.cfg,
-      channel: resolvedChannel.channel,
+    const agentId = pickFirstExistingAgentId(cfg, binding.agentId ?? "main");
+    // Binding config overrides ACP runtime defaults; unset fields remain harness-owned.
+    const agent = resolveAgentConfig(cfg, agentId);
+    const runtimeDefaults = agent?.runtime?.type === "acp" ? agent.runtime.acp : undefined;
+    const acpAgentId = normalizeText(runtimeDefaults?.agent);
+    const bindingOverrides = normalizeBindingConfig(binding.acp);
+    const mode = normalizeMode(bindingOverrides.mode ?? normalizeText(runtimeDefaults?.mode));
+    // Every ACP binding uses its owner's explicit model, regardless of the owner's runtime type.
+    const model = resolvePrimaryStringValue(agent?.model);
+    const modelRef = model ? parseModelRef(model, "") : null;
+    const thinking =
+      agent?.thinkingDefault ??
+      (modelRef
+        ? resolveConfiguredThinkingDefault({ cfg, ...modelRef })
+        : cfg.agents?.defaults?.thinkingDefault);
+    // Unconfigured workspaces stay unset so ACP can choose its normal default.
+    const cwd =
+      bindingOverrides.cwd ??
+      normalizeText(runtimeDefaults?.cwd) ??
+      (normalizeText(agent?.workspace) || normalizeText(cfg.agents?.defaults?.workspace)
+        ? resolveAgentWorkspaceDir(cfg, agentId)
+        : undefined);
+    const backend = bindingOverrides.backend ?? normalizeText(runtimeDefaults?.backend);
+    const rule: CompiledConfiguredBinding = {
+      channel: channelId,
+      accountPattern: normalizeOptionalString(binding.match.accountId),
       binding,
-      target,
       bindingConversationId,
-      provider: resolvedChannel.provider,
-    });
-    if (!rule) {
-      continue;
-    }
-    pushCompiledRule(rulesByChannel, rule);
+      target,
+      agentId,
+      provider,
+      targetFactory: {
+        driverId: "acp",
+        materialize: ({ accountId, conversation }) => {
+          // Wildcard bindings get a stable session key only after the conversation is known.
+          const record = toConfiguredAcpBindingRecord({
+            channel: channelId,
+            accountId,
+            conversationId: conversation.conversationId,
+            parentConversationId: conversation.parentConversationId,
+            agentId,
+            acpAgentId,
+            mode,
+            model,
+            thinking,
+            cwd,
+            backend,
+            label: bindingOverrides.label,
+          });
+          return {
+            record,
+            statefulTarget: {
+              kind: "stateful",
+              driverId: "acp",
+              sessionKey: record.targetSessionKey,
+              agentId,
+              ...(bindingOverrides.label ? { label: bindingOverrides.label } : {}),
+            },
+          };
+        },
+      },
+    };
+    const rules = rulesByChannel.get(rule.channel) ?? [];
+    rules.push(rule);
+    rulesByChannel.set(rule.channel, rules);
   }
 
-  return {
-    rulesByChannel,
-  };
-}
-
-export function resolveCompiledBindingRegistry(
-  cfg: OpenClawConfig,
-): CompiledConfiguredBindingRegistry {
-  const registryVersion = getActivePluginRegistryVersion();
-  const cached = compiledRegistryCache.get(cfg);
-  if (cached?.registryVersion === registryVersion) {
-    return cached.registry;
-  }
-
-  const registry = compileConfiguredBindingRegistry({
-    cfg,
-  });
-  compiledRegistryCache.set(cfg, {
-    registryVersion,
-    registry,
-  });
-  return registry;
-}
-
-export function primeCompiledBindingRegistry(
-  cfg: OpenClawConfig,
-): CompiledConfiguredBindingRegistry {
-  const registry = compileConfiguredBindingRegistry({ cfg });
-  compiledRegistryCache.set(cfg, {
-    registryVersion: getActivePluginRegistryVersion(),
-    registry,
-  });
-  return registry;
-}
-
-export function countCompiledBindingRegistry(registry: CompiledConfiguredBindingRegistry): {
-  bindingCount: number;
-  channelCount: number;
-} {
-  return {
-    bindingCount: [...registry.rulesByChannel.values()].reduce(
-      (sum, rules) => sum + rules.length,
-      0,
-    ),
-    channelCount: registry.rulesByChannel.size,
-  };
+  return rulesByChannel;
 }

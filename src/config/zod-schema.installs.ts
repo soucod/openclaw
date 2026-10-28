@@ -1,15 +1,14 @@
 import { z } from "zod";
 
-export const InstallSourceSchema = z.union([
+const InstallSourceSchema = z.union([
   z.literal("npm"),
   z.literal("archive"),
   z.literal("path"),
   z.literal("clawhub"),
+  z.literal("git"),
 ]);
 
-export const PluginInstallSourceSchema = z.union([InstallSourceSchema, z.literal("marketplace")]);
-
-export const InstallRecordShape = {
+const InstallRecordShape = {
   source: InstallSourceSchema,
   spec: z.string().optional(),
   sourcePath: z.string().optional(),
@@ -28,12 +27,63 @@ export const InstallRecordShape = {
   clawhubChannel: z
     .union([z.literal("official"), z.literal("community"), z.literal("private")])
     .optional(),
+  clawhubTrustDisposition: z
+    .union([
+      z.literal("clean"),
+      z.literal("review-recommended"),
+      z.literal("review-required"),
+      z.literal("blocked"),
+    ])
+    .optional(),
+  clawhubTrustScanStatus: z.string().optional(),
+  clawhubTrustModerationState: z.string().optional(),
+  clawhubTrustReasons: z.array(z.string()).optional(),
+  clawhubTrustPending: z.boolean().optional(),
+  clawhubTrustStale: z.boolean().optional(),
+  clawhubTrustCheckedAt: z.string().optional(),
+  clawhubTrustAcknowledgedAt: z.string().optional(),
+  artifactKind: z.union([z.literal("legacy-zip"), z.literal("npm-pack")]).optional(),
+  artifactFormat: z.union([z.literal("zip"), z.literal("tgz")]).optional(),
+  npmIntegrity: z.string().optional(),
+  npmShasum: z.string().optional(),
+  npmTarballName: z.string().optional(),
+  clawpackSha256: z.string().optional(),
+  clawpackSpecVersion: z.number().int().nonnegative().optional(),
+  clawpackManifestSha256: z.string().optional(),
+  clawpackSize: z.number().int().nonnegative().optional(),
+  gitUrl: z.string().optional(),
+  gitRef: z.string().optional(),
+  gitCommit: z.string().optional(),
 } as const;
 
-export const PluginInstallRecordShape = {
+const InstallRecordSchema = z.object(InstallRecordShape);
+export type InstallRecordBase = z.infer<typeof InstallRecordSchema>;
+
+export const StrictPluginInstallRecordSchema = z.object({
   ...InstallRecordShape,
-  source: PluginInstallSourceSchema,
+  source: z.union([InstallSourceSchema, z.literal("marketplace")]),
+  /** Retained package child-plugin engine ownership for uninstall without runtime files. */
+  contextEngineIdsByPlugin: z.record(z.string().min(1), z.array(z.string().min(1))).optional(),
   marketplaceName: z.string().optional(),
   marketplaceSource: z.string().optional(),
   marketplacePlugin: z.string().optional(),
-} as const;
+  acceptedSurface: z
+    .strictObject({
+      channels: z.array(z.string().min(1)),
+      providers: z.array(z.string().min(1)),
+      tools: z.array(z.string().min(1)),
+      contracts: z.array(z.string().min(1)),
+      hooks: z.array(z.string().min(1)),
+      mcpServers: z.array(z.string().min(1)),
+      cliCommands: z.array(z.string().min(1)),
+      cliBackends: z.array(z.string().min(1)),
+      skills: z.array(z.string().min(1)),
+      dangerousConfigFlags: z.array(z.string().min(1)),
+    })
+    .optional(),
+  acceptedSurfaceHash: z.string().optional(),
+  acceptedSurfaceAt: z.string().optional(),
+  acceptedSurfaceIntegrity: z.string().optional(),
+} as const);
+export type PluginInstallRecord = z.infer<typeof StrictPluginInstallRecordSchema>;
+export type PluginAcceptedDeclaredSurface = NonNullable<PluginInstallRecord["acceptedSurface"]>;

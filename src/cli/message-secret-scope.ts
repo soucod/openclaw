@@ -1,3 +1,4 @@
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { normalizeAccountId } from "../routing/session-key.js";
 import { isDeliverableMessageChannel, normalizeMessageChannel } from "../utils/message-channel.js";
 
@@ -13,10 +14,7 @@ function resolveScopedChannelCandidate(value: unknown): string | undefined {
 }
 
 function resolveChannelFromTargetValue(target: unknown): string | undefined {
-  if (typeof target !== "string") {
-    return undefined;
-  }
-  const trimmed = target.trim();
+  const trimmed = normalizeOptionalString(target);
   if (!trimmed) {
     return undefined;
   }
@@ -31,24 +29,14 @@ function resolveChannelFromTargets(targets: unknown): string | undefined {
   if (!Array.isArray(targets)) {
     return undefined;
   }
-  const seen = new Set<string>();
-  for (const target of targets) {
-    const channel = resolveChannelFromTargetValue(target);
-    if (channel) {
-      seen.add(channel);
-    }
-  }
-  if (seen.size !== 1) {
-    return undefined;
-  }
-  return [...seen][0];
+  const channels = new Set(
+    targets.map(resolveChannelFromTargetValue).filter((channel) => channel !== undefined),
+  );
+  return channels.size === 1 ? [...channels][0] : undefined;
 }
 
 function resolveScopedAccountId(value: unknown): string | undefined {
-  if (typeof value !== "string") {
-    return undefined;
-  }
-  const trimmed = value.trim();
+  const trimmed = normalizeOptionalString(value);
   if (!trimmed) {
     return undefined;
   }

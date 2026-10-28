@@ -1,21 +1,24 @@
-import {
-  assertOkOrThrowHttpError,
-  describeImageWithModel,
-  describeImagesWithModel,
-  normalizeBaseUrl,
-  postJsonRequest,
-  type AudioTranscriptionRequest,
-  type AudioTranscriptionResult,
-  type MediaUnderstandingProvider,
-  type VideoDescriptionRequest,
-  type VideoDescriptionResult,
+import type {
+  AudioTranscriptionRequest,
+  AudioTranscriptionResult,
+  MediaUnderstandingProvider,
+  VideoDescriptionRequest,
+  VideoDescriptionResult,
 } from "openclaw/plugin-sdk/media-understanding";
-import { normalizeGoogleModelId, parseGeminiAuth } from "./runtime-api.js";
+import {
+  assertOkOrThrowProviderError,
+  postJsonRequest,
+  readProviderJsonResponse,
+  type ProviderRequestTransportOverrides,
+} from "openclaw/plugin-sdk/provider-http";
+import type { GoogleGenerateContentResponse } from "./generate-content-response.js";
+import {
+  createGoogleMediaUnderstandingProviderMetadata,
+  GOOGLE_MEDIA_UNDERSTANDING_DEFAULT_MODELS,
+} from "./generation-provider-metadata.js";
+import { resolveGoogleGenerativeAiHttpRequestConfig } from "./http-request.js";
+import { normalizeGoogleModelId } from "./model-id.js";
 
-export const DEFAULT_GOOGLE_AUDIO_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
-export const DEFAULT_GOOGLE_VIDEO_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
-const DEFAULT_GOOGLE_AUDIO_MODEL = "gemini-3-flash-preview";
-const DEFAULT_GOOGLE_VIDEO_MODEL = "gemini-3-flash-preview";
 const DEFAULT_GOOGLE_AUDIO_PROMPT = "Transcribe the audio.";
 const DEFAULT_GOOGLE_VIDEO_PROMPT = "Describe the video.";
 
@@ -25,11 +28,12 @@ async function generateGeminiInlineDataText(params: {
   apiKey: string;
   baseUrl?: string;
   headers?: Record<string, string>;
+  request?: ProviderRequestTransportOverrides;
   model?: string;
   prompt?: string;
   timeoutMs: number;
+  signal?: AbortSignal;
   fetchFn?: typeof fetch;
-  defaultBaseUrl: string;
   defaultModel: string;
   defaultPrompt: string;
   defaultMime: string;
@@ -37,29 +41,20 @@ async function generateGeminiInlineDataText(params: {
   missingTextError: string;
 }): Promise<{ text: string; model: string }> {
   const fetchFn = params.fetchFn ?? fetch;
-  const baseUrl = normalizeBaseUrl(params.baseUrl, params.defaultBaseUrl);
-  const allowPrivate = Boolean(params.baseUrl?.trim());
-  const model = (() => {
-    const trimmed = params.model?.trim();
-    if (!trimmed) {
-      return params.defaultModel;
-    }
-    return normalizeGoogleModelId(trimmed);
-  })();
+  const requestedModel = params.model?.trim();
+  const model = requestedModel ? normalizeGoogleModelId(requestedModel) : params.defaultModel;
+  const { baseUrl, allowPrivateNetwork, headers, dispatcherPolicy } =
+    resolveGoogleGenerativeAiHttpRequestConfig({
+      apiKey: params.apiKey,
+      baseUrl: params.baseUrl,
+      headers: params.headers,
+      request: params.request,
+      capability: params.defaultMime.startsWith("audio/") ? "audio" : "video",
+      transport: "media-understanding",
+    });
   const url = `${baseUrl}/models/${model}:generateContent`;
 
-  const authHeaders = parseGeminiAuth(params.apiKey);
-  const headers = new Headers(params.headers);
-  for (const [key, value] of Object.entries(authHeaders.headers)) {
-    if (!headers.has(key)) {
-      headers.set(key, value);
-    }
-  }
-
-  const prompt = (() => {
-    const trimmed = params.prompt?.trim();
-    return trimmed || params.defaultPrompt;
-  })();
+  const prompt = params.prompt?.trim() || params.defaultPrompt;
 
   const body = {
     contents: [
@@ -83,18 +78,20 @@ async function generateGeminiInlineDataText(params: {
     headers,
     body,
     timeoutMs: params.timeoutMs,
+    ...(params.signal ? { signal: params.signal } : {}),
     fetchFn,
-    allowPrivateNetwork: allowPrivate,
+    allowPrivateNetwork,
+    dispatcherPolicy,
   });
 
   try {
-    await assertOkOrThrowHttpError(res, params.httpErrorLabel);
+    await assertOkOrThrowProviderError(res, params.httpErrorLabel, { requestHeaders: headers });
 
-    const payload = (await res.json()) as {
-      candidates?: Array<{
-        content?: { parts?: Array<{ text?: string }> };
-      }>;
-    };
+    const payload = await readProviderJsonResponse<GoogleGenerateContentResponse>(
+      res,
+      params.httpErrorLabel,
+      { requestHeaders: headers },
+    );
     const parts = payload.candidates?.[0]?.content?.parts ?? [];
     const text = parts
       .map((part) => part?.text?.trim())
@@ -112,38 +109,31 @@ async function generateGeminiInlineDataText(params: {
 export async function transcribeGeminiAudio(
   params: AudioTranscriptionRequest,
 ): Promise<AudioTranscriptionResult> {
-  const { text, model } = await generateGeminiInlineDataText({
+  return await generateGeminiInlineDataText({
     ...params,
-    defaultBaseUrl: DEFAULT_GOOGLE_AUDIO_BASE_URL,
-    defaultModel: DEFAULT_GOOGLE_AUDIO_MODEL,
+    defaultModel: GOOGLE_MEDIA_UNDERSTANDING_DEFAULT_MODELS.audio,
     defaultPrompt: DEFAULT_GOOGLE_AUDIO_PROMPT,
     defaultMime: "audio/wav",
     httpErrorLabel: "Audio transcription failed",
     missingTextError: "Audio transcription response missing text",
   });
-  return { text, model };
 }
 
 export async function describeGeminiVideo(
   params: VideoDescriptionRequest,
 ): Promise<VideoDescriptionResult> {
-  const { text, model } = await generateGeminiInlineDataText({
+  return await generateGeminiInlineDataText({
     ...params,
-    defaultBaseUrl: DEFAULT_GOOGLE_VIDEO_BASE_URL,
-    defaultModel: DEFAULT_GOOGLE_VIDEO_MODEL,
+    defaultModel: GOOGLE_MEDIA_UNDERSTANDING_DEFAULT_MODELS.video,
     defaultPrompt: DEFAULT_GOOGLE_VIDEO_PROMPT,
     defaultMime: "video/mp4",
     httpErrorLabel: "Video description failed",
     missingTextError: "Video description response missing text",
   });
-  return { text, model };
 }
 
-export const googleMediaUnderstandingProvider: MediaUnderstandingProvider = {
-  id: "google",
-  capabilities: ["image", "audio", "video"],
-  describeImage: describeImageWithModel,
-  describeImages: describeImagesWithModel,
+export const googleMediaUnderstandingProvider = {
+  ...createGoogleMediaUnderstandingProviderMetadata(),
   transcribeAudio: transcribeGeminiAudio,
   describeVideo: describeGeminiVideo,
-};
+} satisfies MediaUnderstandingProvider;

@@ -1,30 +1,28 @@
+import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
+import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime";
 import { hasExplicitMatrixAccountConfig } from "./matrix/account-config.js";
 import { resolveMatrixAccountConfig } from "./matrix/accounts.js";
 import { bootstrapMatrixVerification } from "./matrix/actions/verification.js";
-import type { RuntimeEnv } from "./runtime-api.js";
 import type { CoreConfig } from "./types.js";
-
-export type MatrixSetupVerificationBootstrapResult = {
-  attempted: boolean;
-  success: boolean;
-  recoveryKeyCreatedAt: string | null;
-  backupVersion: string | null;
-  error?: string;
-};
 
 export async function maybeBootstrapNewEncryptedMatrixAccount(params: {
   previousCfg: CoreConfig;
   cfg: CoreConfig;
   accountId: string;
-}): Promise<MatrixSetupVerificationBootstrapResult> {
+}) {
   const accountConfig = resolveMatrixAccountConfig({
     cfg: params.cfg,
     accountId: params.accountId,
   });
+  const previousAccountConfig = resolveMatrixAccountConfig({
+    cfg: params.previousCfg,
+    accountId: params.accountId,
+  });
 
   if (
-    hasExplicitMatrixAccountConfig(params.previousCfg, params.accountId) ||
-    accountConfig.encryption !== true
+    accountConfig.encryption !== true ||
+    (hasExplicitMatrixAccountConfig(params.previousCfg, params.accountId) &&
+      previousAccountConfig.encryption === true)
   ) {
     return {
       attempted: false,
@@ -35,10 +33,13 @@ export async function maybeBootstrapNewEncryptedMatrixAccount(params: {
   }
 
   try {
-    const bootstrap = await bootstrapMatrixVerification({ accountId: params.accountId });
+    const bootstrap = await bootstrapMatrixVerification({
+      accountId: params.accountId,
+      cfg: params.cfg,
+    });
     return {
       attempted: true,
-      success: bootstrap.success === true,
+      success: bootstrap.success,
       recoveryKeyCreatedAt: bootstrap.verification.recoveryKeyCreatedAt,
       backupVersion: bootstrap.verification.backupVersion,
       ...(bootstrap.success
@@ -51,7 +52,7 @@ export async function maybeBootstrapNewEncryptedMatrixAccount(params: {
       success: false,
       recoveryKeyCreatedAt: null,
       backupVersion: null,
-      error: err instanceof Error ? err.message : String(err),
+      error: formatErrorMessage(err),
     };
   }
 }
@@ -62,14 +63,6 @@ export async function runMatrixSetupBootstrapAfterConfigWrite(params: {
   accountId: string;
   runtime: RuntimeEnv;
 }): Promise<void> {
-  const nextAccountConfig = resolveMatrixAccountConfig({
-    cfg: params.cfg,
-    accountId: params.accountId,
-  });
-  if (nextAccountConfig.encryption !== true) {
-    return;
-  }
-
   const bootstrap = await maybeBootstrapNewEncryptedMatrixAccount({
     previousCfg: params.previousCfg,
     cfg: params.cfg,

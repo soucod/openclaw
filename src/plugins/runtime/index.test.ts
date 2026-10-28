@@ -1,150 +1,102 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "../../agents/defaults.js";
-import { onAgentEvent } from "../../infra/agent-events.js";
-import { requestHeartbeatNow } from "../../infra/heartbeat-wake.js";
-import * as execModule from "../../process/exec.js";
-import { onSessionTranscriptUpdate } from "../../sessions/transcript-events.js";
-import { VERSION } from "../../version.js";
 import {
-  clearGatewaySubagentRuntime,
-  createPluginRuntime,
-  setGatewaySubagentRuntime,
-} from "./index.js";
+  resetConfigRuntimeState,
+  setRuntimeConfigSnapshot,
+  type OpenClawConfig,
+} from "../../config/config.js";
+
+const runtimeModelAuthMocks = vi.hoisted(() => ({
+  getApiKeyForModel: vi.fn(),
+  getRuntimeAuthForModelCore: vi.fn(),
+  resolveProviderRuntimeApiKey: vi.fn(),
+}));
+// mock-isolation: Exercise the lazy runtime facade without loading credential-backed model auth.
+vi.mock("./runtime-model-auth.runtime.js", () => runtimeModelAuthMocks);
+
+import { createPluginRuntime } from "./index.js";
 
 describe("plugin runtime command execution", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
-    clearGatewaySubagentRuntime();
+    Object.values(runtimeModelAuthMocks).forEach((mock) => mock.mockReset());
+    resetConfigRuntimeState();
   });
 
-  it("exposes runtime.system.runCommandWithTimeout by default", async () => {
-    const commandResult = {
-      pid: 12345,
-      stdout: "hello\n",
-      stderr: "",
-      code: 0,
-      signal: null,
-      killed: false,
-      noOutputTimedOut: false,
-      termination: "exit" as const,
+  it("resolves thinking policy with configured model compat from runtime config", () => {
+    const model = {
+      id: "gpt-5.4",
+      name: "GPT 5.4 via GMN",
+      reasoning: true,
+      compat: { supportedReasoningEfforts: ["low", "medium", "high", "xhigh"] },
     };
-    const runCommandWithTimeoutMock = vi
-      .spyOn(execModule, "runCommandWithTimeout")
-      .mockResolvedValue(commandResult);
+    const providers = { gmn: { baseUrl: "https://gmn.example.com/v1", models: [model] } };
+    setRuntimeConfigSnapshot({ models: { providers } } as unknown as OpenClawConfig);
 
     const runtime = createPluginRuntime();
-    await expect(
-      runtime.system.runCommandWithTimeout(["echo", "hello"], { timeoutMs: 1000 }),
-    ).resolves.toEqual(commandResult);
-    expect(runCommandWithTimeoutMock).toHaveBeenCalledWith(["echo", "hello"], { timeoutMs: 1000 });
+    const policy = runtime.agent.resolveThinkingPolicy({ provider: "gmn", model: "gpt-5.4" });
+
+    expect(policy.levels.map((level) => level.id)).toContain("xhigh");
   });
 
-  it("forwards runtime.system.runCommandWithTimeout errors", async () => {
-    const runCommandWithTimeoutMock = vi
-      .spyOn(execModule, "runCommandWithTimeout")
-      .mockRejectedValue(new Error("boom"));
+  it("includes persisted session exec overrides in sandbox authority", () => {
     const runtime = createPluginRuntime();
-    await expect(
-      runtime.system.runCommandWithTimeout(["echo", "hello"], { timeoutMs: 1000 }),
-    ).rejects.toThrow("boom");
-    expect(runCommandWithTimeoutMock).toHaveBeenCalledWith(["echo", "hello"], { timeoutMs: 1000 });
-  });
-
-  it("exposes runtime.events listener registration helpers", () => {
-    const runtime = createPluginRuntime();
-    expect(runtime.events.onAgentEvent).toBe(onAgentEvent);
-    expect(runtime.events.onSessionTranscriptUpdate).toBe(onSessionTranscriptUpdate);
-  });
-
-  it("exposes runtime.mediaUnderstanding helpers and keeps stt as an alias", () => {
-    const runtime = createPluginRuntime();
-    expect(typeof runtime.mediaUnderstanding.runFile).toBe("function");
-    expect(typeof runtime.mediaUnderstanding.describeImageFile).toBe("function");
-    expect(typeof runtime.mediaUnderstanding.describeImageFileWithModel).toBe("function");
-    expect(typeof runtime.mediaUnderstanding.describeVideoFile).toBe("function");
-    expect(runtime.mediaUnderstanding.transcribeAudioFile).toBe(runtime.stt.transcribeAudioFile);
-  });
-
-  it("exposes runtime.imageGeneration helpers", () => {
-    const runtime = createPluginRuntime();
-    expect(typeof runtime.imageGeneration.generate).toBe("function");
-    expect(typeof runtime.imageGeneration.listProviders).toBe("function");
-  });
-
-  it("exposes runtime.webSearch helpers", () => {
-    const runtime = createPluginRuntime();
-    expect(typeof runtime.webSearch.listProviders).toBe("function");
-    expect(typeof runtime.webSearch.search).toBe("function");
-  });
-
-  it("exposes runtime.system.requestHeartbeatNow", () => {
-    const runtime = createPluginRuntime();
-    expect(runtime.system.requestHeartbeatNow).toBe(requestHeartbeatNow);
-  });
-
-  it("exposes runtime.agent host helpers", () => {
-    const runtime = createPluginRuntime();
-    expect(runtime.agent.defaults).toEqual({
-      model: DEFAULT_MODEL,
-      provider: DEFAULT_PROVIDER,
+    vi.spyOn(runtime.agent.session, "getSessionEntry").mockReturnValue({
+      sessionId: "session",
+      updatedAt: 1,
+      execHost: "gateway",
     });
-    expect(typeof runtime.agent.runEmbeddedPiAgent).toBe("function");
-    expect(typeof runtime.agent.resolveAgentDir).toBe("function");
-    expect(typeof runtime.agent.session.resolveSessionFilePath).toBe("function");
+    const config: OpenClawConfig = {
+      agents: { defaults: { sandbox: { mode: "all", scope: "session", workspaceAccess: "rw" } } },
+      tools: { elevated: { enabled: false } },
+    };
+
+    const scope = {
+      agentId: "main",
+      sessionKey: "agent:main:subagent:workboard-card",
+    };
+    const result = runtime.sandbox.resolveWorkspaceAuthority({ config, ...scope });
+
+    expect(result.confinementError).toContain("outside the sandbox");
   });
 
-  it("exposes runtime.modelAuth with getApiKeyForModel and resolveApiKeyForProvider", () => {
+  it("modelAuth wrappers preserve workspace scope while stripping credential steering", async () => {
     const runtime = createPluginRuntime();
-    expect(runtime.modelAuth).toBeDefined();
-    expect(typeof runtime.modelAuth.getApiKeyForModel).toBe("function");
-    expect(typeof runtime.modelAuth.resolveApiKeyForProvider).toBe("function");
+    const model = {
+      id: "workspace-cloud/model",
+      provider: "workspace-cloud",
+    };
+    const cfg: OpenClawConfig = { plugins: { allow: ["workspace-cloud"] } };
+    const scope = {
+      cfg,
+      workspaceDir: "/tmp/workspace",
+      agentDir: "/tmp/agent",
+      store: { version: 1, profiles: {} },
+    };
+    for (const [method, mockName, apiKey] of [
+      ["getApiKeyForModel", "getApiKeyForModel", "model-key"],
+      ["getRuntimeAuthForModel", "getRuntimeAuthForModelCore", "runtime-key"],
+      ["resolveApiKeyForProvider", "resolveProviderRuntimeApiKey", "provider-key"],
+    ] as const) {
+      const mock = runtimeModelAuthMocks[mockName];
+      const target =
+        method === "resolveApiKeyForProvider" ? { provider: "workspace-cloud" } : { model };
+      mock.mockResolvedValue({ apiKey, source: "workspace cloud credentials", mode: "api-key" });
+      const auth = await runtime.modelAuth[method]({ ...scope, ...target } as never);
+      expect(auth.apiKey).toBe(apiKey);
+      expect(mock).toHaveBeenCalledWith({ ...target, cfg, workspaceDir: scope.workspaceDir });
+    }
   });
 
-  it("modelAuth wrappers strip agentDir and store to prevent credential steering", async () => {
-    // The wrappers should not forward agentDir or store from plugin callers.
-    // We verify this by checking the wrapper functions exist and are not the
-    // raw implementations (they are wrapped, not direct references).
-    const { getApiKeyForModel: rawGetApiKey } = await import("../../agents/model-auth.js");
-    const runtime = createPluginRuntime();
-    // Wrappers should NOT be the same reference as the raw functions
-    expect(runtime.modelAuth.getApiKeyForModel).not.toBe(rawGetApiKey);
+  it("keeps subagent unavailable by default", () => {
+    expect(() =>
+      createPluginRuntime().subagent.run({ sessionKey: "s-1", message: "hello" }),
+    ).toThrow("Plugin runtime subagent methods are only available during a gateway request.");
   });
 
-  it("keeps subagent unavailable by default even after gateway initialization", async () => {
-    const runtime = createPluginRuntime();
-    setGatewaySubagentRuntime({
-      run: vi.fn(),
-      waitForRun: vi.fn(),
-      getSessionMessages: vi.fn(),
-      getSession: vi.fn(),
-      deleteSession: vi.fn(),
-    });
-
-    expect(() => runtime.subagent.run({ sessionKey: "s-1", message: "hello" })).toThrow(
-      "Plugin runtime subagent methods are only available during a gateway request.",
+  it("exposes a node duplex capability even when Gateway access is unavailable", () => {
+    const nodes = createPluginRuntime().nodes;
+    expect(() => nodes.openDuplex({ nodeId: "node-1", command: "image.bridge" })).toThrow(
+      "only available inside the Gateway",
     );
-  });
-
-  it("late-binds to the gateway subagent when explicitly enabled", async () => {
-    const run = vi.fn().mockResolvedValue({ runId: "run-1" });
-    const runtime = createPluginRuntime({ allowGatewaySubagentBinding: true });
-
-    setGatewaySubagentRuntime({
-      run,
-      waitForRun: vi.fn(),
-      getSessionMessages: vi.fn(),
-      getSession: vi.fn(),
-      deleteSession: vi.fn(),
-    });
-
-    await expect(runtime.subagent.run({ sessionKey: "s-2", message: "hello" })).resolves.toEqual({
-      runId: "run-1",
-    });
-    expect(run).toHaveBeenCalledWith({ sessionKey: "s-2", message: "hello" });
-  });
-
-  it("exposes runtime.version from the shared VERSION constant", () => {
-    const runtime = createPluginRuntime();
-    expect(runtime.version).toBe(VERSION);
   });
 });

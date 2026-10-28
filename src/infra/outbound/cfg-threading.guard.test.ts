@@ -1,196 +1,72 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+// Outbound entrypoints must use their supplied config, not discover it at runtime.
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { bundledPluginFile } from "openclaw/plugin-sdk/test-fixtures";
+import { expect, it } from "vitest";
 
-const thisFilePath = fileURLToPath(import.meta.url);
-const thisDir = path.dirname(thisFilePath);
-const repoRoot = path.resolve(thisDir, "../../..");
-const loadConfigPattern = /\b(?:loadConfig|config\.loadConfig)\s*\(/;
-
-function toPosix(relativePath: string): string {
-  return relativePath.split(path.sep).join("/");
-}
-
-function readRepoFile(relativePath: string): string {
-  const absolute = path.join(repoRoot, relativePath);
-  return readFileSync(absolute, "utf8");
-}
-
-function listCoreOutboundEntryFiles(): string[] {
-  const outboundDir = path.join(repoRoot, "src/channels/plugins/outbound");
-  return readdirSync(outboundDir)
-    .filter((name) => name.endsWith(".ts") && !name.endsWith(".test.ts"))
-    .map((name) => toPosix(path.join("src/channels/plugins/outbound", name)))
-    .toSorted();
-}
-
-function listExtensionFiles(): {
-  adapterEntrypoints: string[];
-  inlineChannelEntrypoints: string[];
-} {
-  const extensionsRoot = path.join(repoRoot, "extensions");
-  const adapterEntrypoints: string[] = [];
-  const inlineChannelEntrypoints: string[] = [];
-
-  for (const entry of readdirSync(extensionsRoot, { withFileTypes: true })) {
-    if (!entry.isDirectory()) {
-      continue;
-    }
-    const srcDir = path.join(extensionsRoot, entry.name, "src");
-    const outboundPath = path.join(srcDir, "outbound.ts");
-    if (existsSync(outboundPath)) {
-      adapterEntrypoints.push(toPosix(path.join("extensions", entry.name, "src/outbound.ts")));
-    }
-
-    const channelPath = path.join(srcDir, "channel.ts");
-    if (!existsSync(channelPath)) {
-      continue;
-    }
-    const source = readFileSync(channelPath, "utf8");
-    if (source.includes("outbound:")) {
-      inlineChannelEntrypoints.push(toPosix(path.join("extensions", entry.name, "src/channel.ts")));
-    }
-  }
-
-  return {
-    adapterEntrypoints: adapterEntrypoints.toSorted(),
-    inlineChannelEntrypoints: inlineChannelEntrypoints.toSorted(),
-  };
-}
-
-function listHighRiskRuntimeCfgFiles(): string[] {
-  return [
-    "extensions/telegram/src/action-runtime.ts",
-    "extensions/discord/src/monitor/reply-delivery.ts",
-    "extensions/discord/src/monitor/thread-bindings.discord-api.ts",
-    "extensions/discord/src/monitor/thread-bindings.manager.ts",
-  ];
-}
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+const read = (file: string) => fs.readFileSync(path.join(repoRoot, file), "utf8");
+const loadConfigPattern = /\b(?:getRuntimeConfig|config\.getRuntimeConfig)\s*\(/;
+const coreDirectory = "src/channels/plugins/outbound";
+const coreFiles = fs
+  .readdirSync(path.join(repoRoot, coreDirectory))
+  .filter((name) => name.endsWith(".ts") && !name.endsWith(".test.ts"))
+  .map((name) => path.posix.join(coreDirectory, name));
+const extensionFiles = fs
+  .readdirSync(path.join(repoRoot, "extensions"), { withFileTypes: true })
+  .filter((entry) => entry.isDirectory())
+  .flatMap((entry) =>
+    ["outbound.ts", "channel.ts"].map((name) =>
+      path.posix.join("extensions", entry.name, "src", name),
+    ),
+  )
+  .filter((file) => fs.existsSync(path.join(repoRoot, file)));
 
 function extractOutboundBlock(source: string, file: string): string {
-  const outboundKeyIndex = source.indexOf("outbound:");
-  expect(outboundKeyIndex, `${file} should define outbound:`).toBeGreaterThanOrEqual(0);
-  const braceStart = source.indexOf("{", outboundKeyIndex);
-  expect(braceStart, `${file} should define outbound object`).toBeGreaterThanOrEqual(0);
-
+  const key = source.indexOf("outbound:");
+  expect(key, file).toBeGreaterThanOrEqual(0);
+  const start = source.indexOf("{", key);
+  expect(start, file).toBeGreaterThanOrEqual(0);
   let depth = 0;
-  let state: "code" | "single" | "double" | "template" | "lineComment" | "blockComment" = "code";
-  for (let i = braceStart; i < source.length; i += 1) {
-    const current = source[i];
-    const next = source[i + 1];
-
-    if (state === "lineComment") {
-      if (current === "\n") {
-        state = "code";
-      }
-      continue;
-    }
-    if (state === "blockComment") {
-      if (current === "*" && next === "/") {
-        state = "code";
-        i += 1;
-      }
-      continue;
-    }
-    if (state === "single") {
-      if (current === "\\" && next) {
-        i += 1;
-        continue;
-      }
-      if (current === "'") {
-        state = "code";
-      }
-      continue;
-    }
-    if (state === "double") {
-      if (current === "\\" && next) {
-        i += 1;
-        continue;
-      }
-      if (current === '"') {
-        state = "code";
-      }
-      continue;
-    }
-    if (state === "template") {
-      if (current === "\\" && next) {
-        i += 1;
-        continue;
-      }
-      if (current === "`") {
-        state = "code";
-      }
-      continue;
-    }
-
-    if (current === "/" && next === "/") {
-      state = "lineComment";
-      i += 1;
-      continue;
-    }
-    if (current === "/" && next === "*") {
-      state = "blockComment";
-      i += 1;
-      continue;
-    }
-    if (current === "'") {
-      state = "single";
-      continue;
-    }
-    if (current === '"') {
-      state = "double";
-      continue;
-    }
-    if (current === "`") {
-      state = "template";
-      continue;
-    }
-    if (current === "{") {
+  // Consume comments and quoted strings whole so their braces do not affect depth.
+  const tokens =
+    /\/\/[^\n]*|\/\*[\s\S]*?\*\/|'(?:\\[\s\S]|[^'\\])*'|"(?:\\[\s\S]|[^"\\])*"|`(?:\\[\s\S]|[^`\\])*`|[{}]/g;
+  for (const token of source.slice(start).matchAll(tokens)) {
+    if (token[0] === "{") {
       depth += 1;
-      continue;
-    }
-    if (current === "}") {
-      depth -= 1;
-      if (depth === 0) {
-        return source.slice(braceStart, i + 1);
-      }
+    } else if (token[0] === "}" && --depth === 0) {
+      return source.slice(start, start + token.index + 1);
     }
   }
-
   throw new Error(`Unable to parse outbound block in ${file}`);
 }
 
-describe("outbound cfg-threading guard", () => {
-  it("keeps outbound adapter entrypoints free of loadConfig calls", () => {
-    const coreAdapterFiles = listCoreOutboundEntryFiles();
-    const extensionAdapterFiles = listExtensionFiles().adapterEntrypoints;
-    const adapterFiles = [...coreAdapterFiles, ...extensionAdapterFiles];
+it.each([
+  ["core adapters", coreFiles],
+  ["extension adapters", extensionFiles.filter((file) => file.endsWith("/outbound.ts"))],
+  [
+    "high-risk runtime paths",
+    [
+      bundledPluginFile("telegram", "src/action-runtime.ts"),
+      bundledPluginFile("discord", "src/monitor/reply-delivery.ts"),
+      bundledPluginFile("discord", "src/monitor/thread-bindings.discord-api.ts"),
+      bundledPluginFile("discord", "src/monitor/thread-bindings.manager.ts"),
+    ],
+  ],
+] as const)("keeps %s free of runtime config reads", (_scope, files) => {
+  expect(files.length).toBeGreaterThan(0);
+  for (const file of files) {
+    expect(read(file), file).not.toMatch(loadConfigPattern);
+  }
+});
 
-    for (const file of adapterFiles) {
-      const source = readRepoFile(file);
-      expect(source, `${file} must not call loadConfig in outbound entrypoint`).not.toMatch(
-        loadConfigPattern,
-      );
+it("keeps inline channel outbound blocks free of runtime config reads", () => {
+  const channels = extensionFiles.filter((file) => file.endsWith("/channel.ts"));
+  for (const file of channels) {
+    const source = read(file);
+    if (/\boutbound\s*:\s*\{/.test(source)) {
+      expect(extractOutboundBlock(source, file), file).not.toMatch(loadConfigPattern);
     }
-  });
-
-  it("keeps inline channel outbound blocks free of loadConfig calls", () => {
-    const inlineFiles = listExtensionFiles().inlineChannelEntrypoints;
-    for (const file of inlineFiles) {
-      const source = readRepoFile(file);
-      const outboundBlock = extractOutboundBlock(source, file);
-      expect(outboundBlock, `${file} outbound block must not call loadConfig`).not.toMatch(
-        loadConfigPattern,
-      );
-    }
-  });
-
-  it("keeps high-risk runtime delivery paths free of loadConfig calls", () => {
-    const runtimeFiles = listHighRiskRuntimeCfgFiles();
-    for (const file of runtimeFiles) {
-      const source = readRepoFile(file);
-      expect(source, `${file} must not call loadConfig`).not.toMatch(loadConfigPattern);
-    }
-  });
+  }
 });

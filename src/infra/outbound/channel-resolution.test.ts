@@ -1,21 +1,31 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+// Verifies outbound channel resolution fast paths, active-registry reads,
+// bootstrap fallback, and runtime facade projection.
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import "../../test-utils/prepare-compiled-subprocesses.js";
+import {
+  createChannelTestPluginBase,
+  createTestRegistry,
+} from "../../test-utils/channel-plugins.js";
 
-const resolveDefaultAgentIdMock = vi.hoisted(() => vi.fn());
+const tryResolveAmbientOwnerAgentIdMock = vi.hoisted(() => vi.fn());
 const resolveAgentWorkspaceDirMock = vi.hoisted(() => vi.fn());
+const getLoadedChannelPluginMock = vi.hoisted(() => vi.fn());
 const getChannelPluginMock = vi.hoisted(() => vi.fn());
 const applyPluginAutoEnableMock = vi.hoisted(() => vi.fn());
-const loadOpenClawPluginsMock = vi.hoisted(() => vi.fn());
+const resolveDiscoverableScopedChannelPluginIdsMock = vi.hoisted(() => vi.fn());
+const resolveRuntimePluginRegistryMock = vi.hoisted(() => vi.fn());
 const getActivePluginRegistryMock = vi.hoisted(() => vi.fn());
-const getActivePluginRegistryKeyMock = vi.hoisted(() => vi.fn());
+const getActivePluginRegistryVersionMock = vi.hoisted(() => vi.fn());
 const normalizeMessageChannelMock = vi.hoisted(() => vi.fn());
 const isDeliverableMessageChannelMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../../agents/agent-scope.js", () => ({
-  resolveDefaultAgentId: (...args: unknown[]) => resolveDefaultAgentIdMock(...args),
+  tryResolveAmbientOwnerAgentId: (...args: unknown[]) => tryResolveAmbientOwnerAgentIdMock(...args),
   resolveAgentWorkspaceDir: (...args: unknown[]) => resolveAgentWorkspaceDirMock(...args),
 }));
 
 vi.mock("../../channels/plugins/index.js", () => ({
+  getLoadedChannelPlugin: (...args: unknown[]) => getLoadedChannelPluginMock(...args),
   getChannelPlugin: (...args: unknown[]) => getChannelPluginMock(...args),
 }));
 
@@ -23,38 +33,52 @@ vi.mock("../../config/plugin-auto-enable.js", () => ({
   applyPluginAutoEnable: (...args: unknown[]) => applyPluginAutoEnableMock(...args),
 }));
 
+vi.mock("../../plugins/channel-plugin-ids.js", () => ({
+  resolveDiscoverableScopedChannelPluginIds: (...args: unknown[]) =>
+    resolveDiscoverableScopedChannelPluginIdsMock(...args),
+}));
+
 vi.mock("../../plugins/loader.js", () => ({
-  loadOpenClawPlugins: (...args: unknown[]) => loadOpenClawPluginsMock(...args),
+  loadPluginRegistryHandle: (...args: unknown[]) => resolveRuntimePluginRegistryMock(...args),
+}));
+
+vi.mock("../../plugins/plugin-metadata-state-worker.js", () => ({
+  readPluginMetadataStateRow: vi.fn(async () => undefined),
 }));
 
 vi.mock("../../plugins/runtime.js", () => ({
   getActivePluginRegistry: (...args: unknown[]) => getActivePluginRegistryMock(...args),
-  getActivePluginRegistryKey: (...args: unknown[]) => getActivePluginRegistryKeyMock(...args),
+  getActivePluginRegistryVersion: (...args: unknown[]) =>
+    getActivePluginRegistryVersionMock(...args),
 }));
 
 vi.mock("../../utils/message-channel.js", () => ({
+  INTERNAL_MESSAGE_CHANNEL: "webchat",
   normalizeMessageChannel: (...args: unknown[]) => normalizeMessageChannelMock(...args),
   isDeliverableMessageChannel: (...args: unknown[]) => isDeliverableMessageChannelMock(...args),
 }));
 
-import { importFreshModule } from "../../../test/helpers/import-fresh.js";
+let channelResolution: typeof import("./channel-resolution.js");
+let withPluginRuntimeRegistryScope: typeof import("../../plugins/runtime/gateway-request-scope.js").withPluginRuntimeRegistryScope;
 
-async function importChannelResolution(scope: string) {
-  return await importFreshModule<typeof import("./channel-resolution.js")>(
-    import.meta.url,
-    `./channel-resolution.js?scope=${scope}`,
-  );
-}
+beforeAll(async () => {
+  vi.resetModules();
+  ({ withPluginRuntimeRegistryScope } =
+    await import("../../plugins/runtime/gateway-request-scope.js"));
+  channelResolution = await import("./channel-resolution.js");
+});
 
 describe("outbound channel resolution", () => {
   beforeEach(() => {
-    resolveDefaultAgentIdMock.mockReset();
+    tryResolveAmbientOwnerAgentIdMock.mockReset();
     resolveAgentWorkspaceDirMock.mockReset();
+    getLoadedChannelPluginMock.mockReset();
     getChannelPluginMock.mockReset();
     applyPluginAutoEnableMock.mockReset();
-    loadOpenClawPluginsMock.mockReset();
+    resolveDiscoverableScopedChannelPluginIdsMock.mockReset();
+    resolveRuntimePluginRegistryMock.mockReset();
     getActivePluginRegistryMock.mockReset();
-    getActivePluginRegistryKeyMock.mockReset();
+    getActivePluginRegistryVersionMock.mockReset();
     normalizeMessageChannelMock.mockReset();
     isDeliverableMessageChannelMock.mockReset();
 
@@ -62,122 +86,139 @@ describe("outbound channel resolution", () => {
       typeof value === "string" ? value.trim().toLowerCase() : undefined,
     );
     isDeliverableMessageChannelMock.mockImplementation((value?: string) =>
-      ["telegram", "discord", "slack"].includes(String(value)),
+      ["alpha", "beta", "gamma"].includes(String(value)),
     );
     getActivePluginRegistryMock.mockReturnValue({ channels: [] });
-    getActivePluginRegistryKeyMock.mockReturnValue("registry-key");
-    applyPluginAutoEnableMock.mockReturnValue({ config: { autoEnabled: true } });
-    resolveDefaultAgentIdMock.mockReturnValue("main");
+    getActivePluginRegistryVersionMock.mockReturnValue(1);
+    applyPluginAutoEnableMock.mockReturnValue({
+      config: { autoEnabled: true },
+      autoEnabledReasons: {},
+    });
+    resolveDiscoverableScopedChannelPluginIdsMock.mockReturnValue(["alpha-plugin"]);
+    resolveRuntimePluginRegistryMock.mockReturnValue({ channels: [] });
+    tryResolveAmbientOwnerAgentIdMock.mockReturnValue("main");
     resolveAgentWorkspaceDirMock.mockReturnValue("/tmp/workspace");
   });
 
-  it("normalizes deliverable channels and rejects unknown ones", async () => {
-    const channelResolution = await importChannelResolution("normalize");
-
-    expect(channelResolution.normalizeDeliverableOutboundChannel(" Telegram ")).toBe("telegram");
-    expect(channelResolution.normalizeDeliverableOutboundChannel("unknown")).toBeUndefined();
-    expect(channelResolution.normalizeDeliverableOutboundChannel(null)).toBeUndefined();
+  it.each([
+    { input: " Alpha ", expected: "alpha" },
+    { input: "unknown", expected: undefined },
+  ])("normalizes deliverable outbound channel for %j", async ({ input, expected }) => {
+    expect(channelResolution.normalizeDeliverableOutboundChannel(input)).toBe(expected);
   });
 
-  it("returns the already-registered plugin without bootstrapping", async () => {
-    const plugin = { id: "telegram" };
-    getChannelPluginMock.mockReturnValueOnce(plugin);
-    const channelResolution = await importChannelResolution("existing-plugin");
+  it.each(["loaded"] as const)(
+    "does not borrow a %s message adapter from a scoped outbound-only registration",
+    async (fallback) => {
+      const sibling = { id: "alpha", message: { send: { text: vi.fn() } } };
+      (fallback === "loaded" ? getLoadedChannelPluginMock : getChannelPluginMock).mockReturnValue(
+        sibling,
+      );
+      const scoped = {
+        ...createChannelTestPluginBase({ id: "alpha" }),
+        outbound: { deliveryMode: "direct" as const, sendText: vi.fn() },
+      };
+      const registry = createTestRegistry([{ pluginId: "scoped", plugin: scoped, source: "test" }]);
 
-    expect(
-      channelResolution.resolveOutboundChannelPlugin({
-        channel: "telegram",
-        cfg: {} as never,
-      }),
-    ).toBe(plugin);
-    expect(loadOpenClawPluginsMock).not.toHaveBeenCalled();
-  });
+      await withPluginRuntimeRegistryScope(registry, async () => {
+        expect(channelResolution.resolveOutboundChannelPlugin({ channel: "alpha" })).toBe(scoped);
+        expect(
+          await channelResolution.resolveOutboundChannelMessageAdapter({ channel: "alpha" }),
+        ).toBeUndefined();
+      });
+      expect(resolveRuntimePluginRegistryMock).not.toHaveBeenCalled();
+    },
+  );
 
-  it("falls back to the active registry when getChannelPlugin misses", async () => {
-    const plugin = { id: "telegram" };
+  it("keeps a bootstrapped external alias available to normal runtime lookups", async () => {
+    const message = { send: { text: vi.fn() } };
+    const plugin = {
+      id: "external-channel",
+      meta: { aliases: ["external"] },
+      message,
+    };
+    isDeliverableMessageChannelMock.mockReturnValue(false);
+    getLoadedChannelPluginMock.mockReturnValue(undefined);
     getChannelPluginMock.mockReturnValue(undefined);
-    getActivePluginRegistryMock.mockReturnValue({
-      channels: [{ plugin }],
-    });
-    const channelResolution = await importChannelResolution("direct-registry");
+    getActivePluginRegistryMock.mockImplementation(() =>
+      resolveRuntimePluginRegistryMock.mock.calls.length > 0 ? { channels: [{ plugin }] } : null,
+    );
 
     expect(
       channelResolution.resolveOutboundChannelPlugin({
-        channel: "telegram",
-        cfg: {} as never,
+        channel: "external",
+        cfg: { channels: {} } as never,
+        allowBootstrap: true,
       }),
     ).toBe(plugin);
-  });
-
-  it("bootstraps plugins once per registry key and returns the newly loaded plugin", async () => {
-    const plugin = { id: "telegram" };
-    getChannelPluginMock.mockReturnValueOnce(undefined).mockReturnValueOnce(plugin);
-    const channelResolution = await importChannelResolution("bootstrap-success");
-
     expect(
       channelResolution.resolveOutboundChannelPlugin({
-        channel: "telegram",
+        channel: "external",
         cfg: { channels: {} } as never,
       }),
     ).toBe(plugin);
-    expect(loadOpenClawPluginsMock).toHaveBeenCalledWith({
-      config: { autoEnabled: true },
-      workspaceDir: "/tmp/workspace",
-      runtimeOptions: {
-        allowGatewaySubagentBinding: true,
-      },
-    });
-
-    getChannelPluginMock.mockReturnValue(undefined);
-    channelResolution.resolveOutboundChannelPlugin({
-      channel: "telegram",
-      cfg: { channels: {} } as never,
-    });
-    expect(loadOpenClawPluginsMock).toHaveBeenCalledTimes(1);
-    expect(loadOpenClawPluginsMock).toHaveBeenLastCalledWith({
-      config: { autoEnabled: true },
-      workspaceDir: "/tmp/workspace",
-      runtimeOptions: {
-        allowGatewaySubagentBinding: true,
-      },
-    });
+    expect(
+      await channelResolution.resolveOutboundChannelMessageAdapter({
+        channel: "external",
+        cfg: { channels: {} } as never,
+      }),
+    ).toBe(message);
+    expect(resolveRuntimePluginRegistryMock).toHaveBeenCalledTimes(1);
   });
 
-  it("bootstraps when the active registry has other channels but not the requested one", async () => {
-    const plugin = { id: "telegram" };
-    getChannelPluginMock.mockReturnValueOnce(undefined).mockReturnValueOnce(plugin);
-    getActivePluginRegistryMock.mockReturnValue({
-      channels: [{ plugin: { id: "discord" } }],
-    });
-    const channelResolution = await importChannelResolution("bootstrap-missing-target");
+  it("bootstraps instead of returning direct outbound metadata from a setup shell", async () => {
+    const setupPlugin = { id: "alpha", outbound: { deliveryMode: "direct" } };
+    const runtimePlugin = { id: "alpha", outbound: { deliveryMode: "direct", sendText: vi.fn() } };
+    getLoadedChannelPluginMock.mockReturnValue(setupPlugin);
+    getChannelPluginMock.mockReturnValue(undefined);
+    getActivePluginRegistryMock.mockImplementation(() =>
+      resolveRuntimePluginRegistryMock.mock.calls.length > 0
+        ? { channels: [{ plugin: runtimePlugin }] }
+        : { channels: [{ plugin: setupPlugin }] },
+    );
 
     expect(
       channelResolution.resolveOutboundChannelPlugin({
-        channel: "telegram",
+        channel: "alpha",
+        cfg: { channels: {} } as never,
+        allowBootstrap: true,
+      }),
+    ).toBe(runtimePlugin);
+    expect(resolveRuntimePluginRegistryMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("bootstraps an external channel before resolving its message adapter", async () => {
+    const message = { send: { text: vi.fn() } };
+    const plugin = { id: "external-channel", message };
+    isDeliverableMessageChannelMock.mockImplementation(
+      (value?: string) =>
+        value === "external-channel" && resolveRuntimePluginRegistryMock.mock.calls.length > 0,
+    );
+    getLoadedChannelPluginMock.mockImplementation(() =>
+      resolveRuntimePluginRegistryMock.mock.calls.length > 0 ? plugin : undefined,
+    );
+
+    expect(
+      await channelResolution.resolveOutboundChannelMessageAdapter({
+        channel: "external-channel",
+        cfg: { channels: {} } as never,
+        allowBootstrap: true,
+      }),
+    ).toBe(message);
+    expect(resolveRuntimePluginRegistryMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not bootstrap by default for outbound hot-path resolution", async () => {
+    const plugin = { id: "alpha" };
+    getLoadedChannelPluginMock.mockReturnValue(undefined);
+    getChannelPluginMock.mockReturnValue(plugin);
+
+    expect(
+      channelResolution.resolveOutboundChannelPlugin({
+        channel: "alpha",
         cfg: { channels: {} } as never,
       }),
     ).toBe(plugin);
-    expect(loadOpenClawPluginsMock).toHaveBeenCalledTimes(1);
-  });
-
-  it("retries bootstrap after a transient load failure", async () => {
-    getChannelPluginMock.mockReturnValue(undefined);
-    loadOpenClawPluginsMock.mockImplementationOnce(() => {
-      throw new Error("transient");
-    });
-    const channelResolution = await importChannelResolution("bootstrap-retry");
-
-    expect(
-      channelResolution.resolveOutboundChannelPlugin({
-        channel: "telegram",
-        cfg: { channels: {} } as never,
-      }),
-    ).toBeUndefined();
-
-    channelResolution.resolveOutboundChannelPlugin({
-      channel: "telegram",
-      cfg: { channels: {} } as never,
-    });
-    expect(loadOpenClawPluginsMock).toHaveBeenCalledTimes(2);
+    expect(resolveRuntimePluginRegistryMock).not.toHaveBeenCalled();
   });
 });

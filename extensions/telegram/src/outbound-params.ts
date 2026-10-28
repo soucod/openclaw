@@ -1,32 +1,20 @@
-export function parseTelegramReplyToMessageId(replyToId?: string | null): number | undefined {
-  if (!replyToId) {
-    return undefined;
-  }
-  const parsed = Number.parseInt(replyToId, 10);
-  return Number.isFinite(parsed) ? parsed : undefined;
-}
+import { parseStrictInteger } from "openclaw/plugin-sdk/number-runtime";
 
-function parseIntegerId(value: string): number | undefined {
-  if (!/^-?\d+$/.test(value)) {
-    return undefined;
-  }
-  const parsed = Number.parseInt(value, 10);
-  return Number.isFinite(parsed) ? parsed : undefined;
+export {
+  parseStrictInteger as normalizeTelegramReplyToMessageId,
+  parseStrictNonNegativeInteger as parseTelegramMessageThreadId,
+} from "openclaw/plugin-sdk/number-runtime";
+
+export function parseTelegramReplyToMessageId(replyToId?: unknown): number | undefined {
+  return parseStrictInteger(replyToId);
 }
 
 export function parseTelegramThreadId(threadId?: string | number | null): number | undefined {
-  if (threadId == null) {
-    return undefined;
-  }
-  if (typeof threadId === "number") {
-    return Number.isFinite(threadId) ? Math.trunc(threadId) : undefined;
+  if (typeof threadId !== "string") {
+    return parseStrictInteger(threadId);
   }
   const trimmed = threadId.trim();
-  if (!trimmed) {
-    return undefined;
-  }
-  // DM topic session keys may scope thread ids as "<chatId>:<threadId>".
-  const scopedMatch = /^-?\d+:(-?\d+)$/.exec(trimmed);
-  const rawThreadId = scopedMatch ? scopedMatch[1] : trimmed;
-  return parseIntegerId(rawThreadId);
+  // Forum topics require a nonnegative ID; DM topic session keys also carry signed IDs.
+  const scopedMatch = /^-?\d+:(?:topic:(\d+)|(-?\d+))$/.exec(trimmed);
+  return parseStrictInteger(scopedMatch?.[1] ?? scopedMatch?.[2] ?? trimmed);
 }

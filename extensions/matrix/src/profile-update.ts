@@ -1,22 +1,8 @@
 import { updateMatrixOwnProfile } from "./matrix/actions/profile.js";
+import { resolveMatrixAuthContext } from "./matrix/client.js";
 import { updateMatrixAccountConfig, resolveMatrixConfigPath } from "./matrix/config-update.js";
-import { normalizeAccountId } from "./runtime-api.js";
 import { getMatrixRuntime } from "./runtime.js";
 import type { CoreConfig } from "./types.js";
-
-export type MatrixProfileUpdateResult = {
-  accountId: string;
-  displayName: string | null;
-  avatarUrl: string | null;
-  profile: {
-    displayNameUpdated: boolean;
-    avatarUpdated: boolean;
-    resolvedAvatarUrl: string | null;
-    uploadedAvatarSource: "http" | "path" | null;
-    convertedAvatarFromHttp: boolean;
-  };
-  configPath: string;
-};
 
 export async function applyMatrixProfileUpdate(params: {
   cfg?: CoreConfig;
@@ -25,19 +11,20 @@ export async function applyMatrixProfileUpdate(params: {
   avatarUrl?: string;
   avatarPath?: string;
   mediaLocalRoots?: readonly string[];
-}): Promise<MatrixProfileUpdateResult> {
+}) {
   const runtime = getMatrixRuntime();
-  const persistedCfg = runtime.config.loadConfig() as CoreConfig;
-  const accountId = normalizeAccountId(params.account);
+  const persistedCfg = runtime.config.current() as CoreConfig;
+  const cfg = params.cfg ?? persistedCfg;
   const displayName = params.displayName?.trim() || null;
   const avatarUrl = params.avatarUrl?.trim() || null;
   const avatarPath = params.avatarPath?.trim() || null;
   if (!displayName && !avatarUrl && !avatarPath) {
     throw new Error("Provide name/displayName and/or avatarUrl/avatarPath.");
   }
+  const accountId = resolveMatrixAuthContext({ cfg, accountId: params.account }).accountId;
 
   const synced = await updateMatrixOwnProfile({
-    cfg: params.cfg,
+    cfg,
     accountId,
     displayName: displayName ?? undefined,
     avatarUrl: avatarUrl ?? undefined,
@@ -50,19 +37,16 @@ export async function applyMatrixProfileUpdate(params: {
     name: displayName ?? undefined,
     avatarUrl: persistedAvatarUrl ?? undefined,
   });
-  await runtime.config.writeConfigFile(updated as never);
+  await runtime.config.replaceConfigFile({
+    nextConfig: updated as never,
+    afterWrite: { mode: "auto" },
+  });
 
   return {
     accountId,
     displayName,
     avatarUrl: persistedAvatarUrl ?? null,
-    profile: {
-      displayNameUpdated: synced.displayNameUpdated,
-      avatarUpdated: synced.avatarUpdated,
-      resolvedAvatarUrl: synced.resolvedAvatarUrl,
-      uploadedAvatarSource: synced.uploadedAvatarSource,
-      convertedAvatarFromHttp: synced.convertedAvatarFromHttp,
-    },
+    profile: synced,
     configPath: resolveMatrixConfigPath(updated, accountId),
   };
 }

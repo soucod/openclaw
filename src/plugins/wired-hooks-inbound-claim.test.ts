@@ -1,175 +1,102 @@
+import { expectDefined } from "@openclaw/normalization-core";
 import { describe, expect, it, vi } from "vitest";
-import { createHookRunner } from "./hooks.js";
-import { createMockPluginRegistry } from "./hooks.test-helpers.js";
+import { createHookRunnerWithRegistry } from "./hooks.test-fixtures.js";
+
+const inboundClaimEvent = {
+  content: "who are you",
+  channel: "guildchat",
+  accountId: "default",
+  conversationId: "channel:1",
+  isGroup: true,
+};
+
+const inboundClaimCtx = {
+  channelId: "guildchat",
+  accountId: "default",
+  conversationId: "channel:1",
+};
 
 describe("inbound_claim hook runner", () => {
-  it("stops at the first handler that claims the event", async () => {
-    const first = vi.fn().mockResolvedValue({ handled: true });
-    const second = vi.fn().mockResolvedValue({ handled: true });
-    const registry = createMockPluginRegistry([
-      { hookName: "inbound_claim", handler: first },
-      { hookName: "inbound_claim", handler: second },
-    ]);
-    const runner = createHookRunner(registry);
+  const runTargeted = (
+    runner: ReturnType<typeof createHookRunnerWithRegistry>["runner"],
+    pluginId = "test-plugin",
+  ) => runner.runInboundClaimForPluginOutcome(pluginId, inboundClaimEvent, inboundClaimCtx);
 
-    const result = await runner.runInboundClaim(
-      {
-        content: "who are you",
-        channel: "telegram",
-        accountId: "default",
-        conversationId: "123:topic:77",
-        isGroup: true,
-      },
-      {
-        channelId: "telegram",
-        accountId: "default",
-        conversationId: "123:topic:77",
-      },
-    );
+  it.each([undefined, "beta-plugin"])(
+    "selects the first eligible claimant (target=%s)",
+    async (target) => {
+      const first = vi.fn().mockResolvedValue({ handled: true });
+      const second = vi.fn().mockResolvedValue({ handled: true });
+      const { runner } = createHookRunnerWithRegistry([
+        {
+          hookName: "inbound_claim",
+          handler: first,
+          pluginId: target ? "alpha-plugin" : undefined,
+        },
+        { hookName: "inbound_claim", handler: second, pluginId: target },
+      ]);
 
-    expect(result).toEqual({ handled: true });
-    expect(first).toHaveBeenCalledTimes(1);
-    expect(second).not.toHaveBeenCalled();
-  });
+      const result = target
+        ? await runner.runInboundClaimForPlugin(target, inboundClaimEvent, inboundClaimCtx)
+        : await runner.runInboundClaim(inboundClaimEvent, inboundClaimCtx);
+
+      expect(result).toEqual({ handled: true });
+      expect(first).toHaveBeenCalledTimes(target ? 0 : 1);
+      expect(second).toHaveBeenCalledTimes(target ? 1 : 0);
+    },
+  );
 
   it("continues to the next handler when a higher-priority handler throws", async () => {
-    const logger = {
-      warn: vi.fn(),
-      error: vi.fn(),
-    };
+    const logger = { warn: vi.fn(), error: vi.fn() };
     const failing = vi.fn().mockRejectedValue(new Error("boom"));
     const succeeding = vi.fn().mockResolvedValue({ handled: true });
-    const registry = createMockPluginRegistry([
-      { hookName: "inbound_claim", handler: failing },
-      { hookName: "inbound_claim", handler: succeeding },
-    ]);
-    const runner = createHookRunner(registry, { logger });
-
-    const result = await runner.runInboundClaim(
-      {
-        content: "hi",
-        channel: "telegram",
-        accountId: "default",
-        conversationId: "123",
-        isGroup: false,
-      },
-      {
-        channelId: "telegram",
-        accountId: "default",
-        conversationId: "123",
-      },
+    const { runner } = createHookRunnerWithRegistry(
+      [
+        { hookName: "inbound_claim", handler: failing },
+        { hookName: "inbound_claim", handler: succeeding },
+      ],
+      { logger },
     );
 
+    const result = await runner.runInboundClaim(inboundClaimEvent, inboundClaimCtx);
+
     expect(result).toEqual({ handled: true });
-    expect(logger.error).toHaveBeenCalledWith(
-      expect.stringContaining("inbound_claim handler from test-plugin failed: Error: boom"),
+    expect(logger.error).toHaveBeenCalledExactlyOnceWith(
+      "[hooks] inbound_claim handler from test-plugin failed: boom",
     );
     expect(succeeding).toHaveBeenCalledTimes(1);
   });
 
-  it("can target a single plugin when core already owns the binding", async () => {
-    const first = vi.fn().mockResolvedValue({ handled: true });
-    const second = vi.fn().mockResolvedValue({ handled: true });
-    const registry = createMockPluginRegistry([
-      { hookName: "inbound_claim", handler: first },
-      { hookName: "inbound_claim", handler: second },
-    ]);
-    registry.typedHooks[1].pluginId = "other-plugin";
-    const runner = createHookRunner(registry);
-
-    const result = await runner.runInboundClaimForPlugin(
-      "test-plugin",
-      {
-        content: "who are you",
-        channel: "discord",
-        accountId: "default",
-        conversationId: "channel:1",
-        isGroup: true,
-      },
-      {
-        channelId: "discord",
-        accountId: "default",
-        conversationId: "channel:1",
-      },
-    );
-
-    expect(result).toEqual({ handled: true });
-    expect(first).toHaveBeenCalledTimes(1);
-    expect(second).not.toHaveBeenCalled();
+  it.each([false, true])("reports absent targeted hooks (plugin loaded=%s)", async (loaded) => {
+    const { registry, runner } = createHookRunnerWithRegistry([]);
+    if (!loaded) {
+      registry.plugins = [];
+    }
+    expect(await runTargeted(runner, loaded ? "test-plugin" : "missing-plugin")).toEqual({
+      status: loaded ? "no_handler" : "missing_plugin",
+    });
   });
 
-  it("reports missing_plugin when the bound plugin is not loaded", async () => {
-    const registry = createMockPluginRegistry([]);
-    registry.plugins = [];
-    const runner = createHookRunner(registry);
+  it("reports targeted per-hook registration timeouts as handler errors", async () => {
+    vi.useFakeTimers();
+    try {
+      const logger = { warn: vi.fn(), error: vi.fn() };
+      const slow = vi.fn(() => new Promise(() => {}));
+      const { registry, runner } = createHookRunnerWithRegistry(
+        [{ hookName: "inbound_claim", handler: slow }],
+        { logger },
+      );
+      expectDefined(registry.typedHooks[0], "registry.typedHooks[0] test invariant").timeoutMs = 5;
 
-    const result = await runner.runInboundClaimForPluginOutcome(
-      "missing-plugin",
-      {
-        content: "who are you",
-        channel: "discord",
-        accountId: "default",
-        conversationId: "channel:1",
-        isGroup: true,
-      },
-      {
-        channelId: "discord",
-        accountId: "default",
-        conversationId: "channel:1",
-      },
-    );
+      const run = runTargeted(runner);
+      await vi.advanceTimersByTimeAsync(5);
 
-    expect(result).toEqual({ status: "missing_plugin" });
-  });
-
-  it("reports no_handler when the plugin is loaded but has no targeted hooks", async () => {
-    const registry = createMockPluginRegistry([]);
-    const runner = createHookRunner(registry);
-
-    const result = await runner.runInboundClaimForPluginOutcome(
-      "test-plugin",
-      {
-        content: "who are you",
-        channel: "discord",
-        accountId: "default",
-        conversationId: "channel:1",
-        isGroup: true,
-      },
-      {
-        channelId: "discord",
-        accountId: "default",
-        conversationId: "channel:1",
-      },
-    );
-
-    expect(result).toEqual({ status: "no_handler" });
-  });
-
-  it("reports error when a targeted handler throws and none claim the event", async () => {
-    const logger = {
-      warn: vi.fn(),
-      error: vi.fn(),
-    };
-    const failing = vi.fn().mockRejectedValue(new Error("boom"));
-    const registry = createMockPluginRegistry([{ hookName: "inbound_claim", handler: failing }]);
-    const runner = createHookRunner(registry, { logger });
-
-    const result = await runner.runInboundClaimForPluginOutcome(
-      "test-plugin",
-      {
-        content: "who are you",
-        channel: "discord",
-        accountId: "default",
-        conversationId: "channel:1",
-        isGroup: true,
-      },
-      {
-        channelId: "discord",
-        accountId: "default",
-        conversationId: "channel:1",
-      },
-    );
-
-    expect(result).toEqual({ status: "error", error: "boom" });
+      await expect(run).resolves.toEqual({ status: "error", error: "timed out after 5ms" });
+      expect(logger.error).toHaveBeenCalledExactlyOnceWith(
+        "[hooks] inbound_claim handler from test-plugin failed: timed out after 5ms",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

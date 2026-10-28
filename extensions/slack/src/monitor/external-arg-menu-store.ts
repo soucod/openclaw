@@ -1,4 +1,5 @@
-import { generateSecureToken } from "openclaw/plugin-sdk/infra-runtime";
+import { generateSecureToken } from "openclaw/plugin-sdk/secure-random-runtime";
+import { pruneExpiredMapEntries } from "./lru-map-cache.js";
 
 const SLACK_EXTERNAL_ARG_MENU_TOKEN_BYTES = 18;
 const SLACK_EXTERNAL_ARG_MENU_TOKEN_LENGTH = Math.ceil(
@@ -12,25 +13,14 @@ const SLACK_EXTERNAL_ARG_MENU_TTL_MS = 10 * 60 * 1000;
 export const SLACK_EXTERNAL_ARG_MENU_PREFIX = "openclaw_cmdarg_ext:";
 
 export type SlackExternalArgMenuChoice = { label: string; value: string };
-export type SlackExternalArgMenuEntry = {
+type SlackExternalArgMenuEntry = {
   choices: SlackExternalArgMenuChoice[];
   userId: string;
   expiresAt: number;
 };
 
-function pruneSlackExternalArgMenuStore(
-  store: Map<string, SlackExternalArgMenuEntry>,
-  now: number,
-): void {
-  for (const [token, entry] of store.entries()) {
-    if (entry.expiresAt <= now) {
-      store.delete(token);
-    }
-  }
-}
-
 function createSlackExternalArgMenuToken(store: Map<string, SlackExternalArgMenuEntry>): string {
-  let token = "";
+  let token;
   do {
     token = generateSecureToken(SLACK_EXTERNAL_ARG_MENU_TOKEN_BYTES);
   } while (store.has(token));
@@ -45,7 +35,7 @@ export function createSlackExternalArgMenuStore() {
       params: { choices: SlackExternalArgMenuChoice[]; userId: string },
       now = Date.now(),
     ): string {
-      pruneSlackExternalArgMenuStore(store, now);
+      pruneExpiredMapEntries(store, now);
       const token = createSlackExternalArgMenuToken(store);
       store.set(token, {
         choices: params.choices,
@@ -62,7 +52,7 @@ export function createSlackExternalArgMenuStore() {
       return SLACK_EXTERNAL_ARG_MENU_TOKEN_PATTERN.test(token) ? token : undefined;
     },
     get(token: string, now = Date.now()): SlackExternalArgMenuEntry | undefined {
-      pruneSlackExternalArgMenuStore(store, now);
+      pruneExpiredMapEntries(store, now);
       return store.get(token);
     },
   };

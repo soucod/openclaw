@@ -1,180 +1,157 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { normalizeMessageActionInput } from "./message-action-normalization.js";
 
+vi.mock("../../channels/plugins/bootstrap-registry.js", async () => ({
+  getBootstrapChannelPlugin: (
+    await import("./message-action-runner.test-support.js")
+  ).createPinboardMessageActionBootstrapRegistryMock(),
+}));
+
+vi.mock("../../utils/message-channel.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../utils/message-channel.js")>()),
+  isDeliverableMessageChannel: (value: string) => ["workspace", "forum"].includes(value),
+  normalizeMessageChannel: (value?: string | null) =>
+    typeof value === "string" ? value.trim().toLowerCase() : undefined,
+}));
+
 describe("normalizeMessageActionInput", () => {
-  it("prefers explicit target and clears legacy target fields", () => {
-    const normalized = normalizeMessageActionInput({
-      action: "send",
-      args: {
-        target: "channel:C1",
-        to: "legacy",
-        channelId: "legacy-channel",
-      },
-    });
-
-    expect(normalized.target).toBe("channel:C1");
-    expect(normalized.to).toBe("channel:C1");
-    expect("channelId" in normalized).toBe(false);
+  type Input = Parameters<typeof normalizeMessageActionInput>[0];
+  const makeInput = (
+    action: Input["action"],
+    args: Input["args"] = {},
+    extra: Partial<Input> = {},
+  ): Input => ({ action, args, ...extra });
+  const context = (currentChannelId: string, currentChannelProvider: string) => ({
+    toolContext: { currentChannelId, currentChannelProvider },
   });
+  const routedThreadContext = {
+    currentChannelProvider: "discord",
+    currentChatType: "channel" as const,
+    currentChannelId: "channel:parent",
+    currentMessagingTarget: "channel:thread",
+    currentMessageId: "thread",
+  };
 
-  it("ignores empty-string legacy target fields when explicit target is present", () => {
-    const normalized = normalizeMessageActionInput({
-      action: "send",
-      args: {
-        target: "1214056829",
-        channelId: "",
-        to: "   ",
-      },
-    });
+  it.each(["read", "react", "edit", "delete"] as const)(
+    "keeps the native message conversation for an implicit %s",
+    (action) => {
+      expect(
+        normalizeMessageActionInput({
+          action,
+          args: { channel: "discord", messageId: "thread" },
+          toolContext: routedThreadContext,
+          targetAliasSpec: { aliases: ["messageId"], deliveryTargetAliases: [] },
+        }),
+      ).toMatchObject({ target: "channel:parent", to: "channel:parent", messageId: "thread" });
+    },
+  );
 
-    expect(normalized.target).toBe("1214056829");
-    expect(normalized.to).toBe("1214056829");
-    expect("channelId" in normalized).toBe(false);
-  });
-
-  it("maps legacy target fields into canonical target", () => {
-    const normalized = normalizeMessageActionInput({
-      action: "send",
-      args: {
-        to: "channel:C1",
-      },
-    });
-
-    expect(normalized.target).toBe("channel:C1");
-    expect(normalized.to).toBe("channel:C1");
-  });
-
-  it("infers target from tool context when required", () => {
-    const normalized = normalizeMessageActionInput({
-      action: "send",
-      args: {},
-      toolContext: {
-        currentChannelId: "channel:C1",
-      },
-    });
-
-    expect(normalized.target).toBe("channel:C1");
-    expect(normalized.to).toBe("channel:C1");
-  });
-
-  it("infers channel from tool context provider", () => {
-    const normalized = normalizeMessageActionInput({
-      action: "send",
-      args: {
-        target: "channel:C1",
-      },
-      toolContext: {
-        currentChannelId: "C1",
-        currentChannelProvider: "slack",
-      },
-    });
-
-    expect(normalized.channel).toBe("slack");
-  });
-
-  it("does not infer a target for actions that do not accept one", () => {
-    const normalized = normalizeMessageActionInput({
-      action: "broadcast",
-      args: {},
-      toolContext: {
-        currentChannelId: "channel:C1",
-      },
-    });
-
-    expect("target" in normalized).toBe(false);
-    expect("to" in normalized).toBe(false);
-  });
-
-  it("does not backfill a non-deliverable tool-context channel", () => {
-    const normalized = normalizeMessageActionInput({
-      action: "send",
-      args: {
-        target: "channel:C1",
-      },
-      toolContext: {
-        currentChannelProvider: "webchat",
-      },
-    });
-
-    expect("channel" in normalized).toBe(false);
-  });
-
-  it("keeps alias-based targets without inferring the current channel", () => {
-    const normalized = normalizeMessageActionInput({
-      action: "edit",
-      args: {
+  it.each<[Input, Record<string, unknown>, string[]]>([
+    [makeInput("send", { target: "  channel:C1  " }), { to: "channel:C1" }, []],
+    [makeInput("channel-info", { target: "  C123  " }), { channelId: "C123" }, []],
+    [
+      makeInput("send", { target: "channel:C1", to: "legacy", channelId: "legacy-channel" }),
+      { target: "channel:C1", to: "channel:C1" },
+      ["channelId"],
+    ],
+    [
+      makeInput("broadcast", {}, { toolContext: { currentChannelId: "channel:C1" } }),
+      {},
+      ["target", "to"],
+    ],
+    [
+      makeInput(
+        "unsend",
+        { channel: "imessage", messageId: "msg_123" },
+        context("chat_guid:iMessage;+;chat0000", "imessage"),
+      ),
+      {
+        target: "chat_guid:iMessage;+;chat0000",
+        to: "chat_guid:iMessage;+;chat0000",
         messageId: "msg_123",
       },
-      toolContext: {
-        currentChannelId: "channel:C1",
+      [],
+    ],
+    [
+      makeInput("pin", { channel: "pinboard", messageId: "om_123" }),
+      { messageId: "om_123" },
+      ["target", "to"],
+    ],
+    [
+      makeInput("poll-vote", { channel: "imessage", chatId: 42 }),
+      { target: "chat_id:42", to: "chat_id:42", chatId: 42 },
+      [],
+    ],
+  ])("normalizes message action input for %j", (input, expected, absent) => {
+    const normalized = normalizeMessageActionInput(input);
+    expect(normalized).toMatchObject(expected);
+    for (const field of absent) {
+      expect(field in normalized).toBe(false);
+    }
+  });
+  it.each<[string, Input]>([
+    ["blank target", makeInput("send", { target: "   " })],
+    ["heartbeat sentinel", makeInput("send", {}, context("heartbeat", "telegram"))],
+    [
+      "internal session",
+      {
+        action: "send",
+        args: { channel: "discord" },
+        toolContext: {
+          currentChannelId: "channel:agent:main:subagent:worker",
+          currentChannelProvider: "discord",
+        },
       },
-    });
-
-    expect(normalized.messageId).toBe("msg_123");
-    expect("target" in normalized).toBe(false);
-    expect("to" in normalized).toBe(false);
+    ],
+    [
+      "explicit empty targets",
+      makeInput("read", { targets: [] }, context("C_CURRENT", "workspace")),
+    ],
+    [
+      "resource without conversation",
+      makeInput("poll-vote", { channel: "imessage", pollId: "poll_123" }),
+    ],
+  ])("rejects %s as a target", (_name, input) => {
+    expect(() => normalizeMessageActionInput(input)).toThrow(/requires a target/);
   });
 
-  it("keeps Feishu message and chat aliases without forcing canonical targets", () => {
-    const pin = normalizeMessageActionInput({
-      action: "pin",
-      args: {
-        channel: "feishu",
-        messageId: "om_123",
-      },
-    });
-    const listPins = normalizeMessageActionInput({
-      action: "list-pins",
-      args: {
-        channel: "feishu",
-        chatId: "oc_123",
-      },
-    });
-
-    expect(pin.messageId).toBe("om_123");
-    expect("target" in pin).toBe(false);
-    expect("to" in pin).toBe(false);
-    expect(listPins.chatId).toBe("oc_123");
-    expect("target" in listPins).toBe(false);
-    expect("to" in listPins).toBe(false);
+  it.each<[Input, string]>([
+    [
+      makeInput("broadcast", { to: "legacy" }),
+      "Use `target` for actions that accept a destination.",
+    ],
+    [
+      makeInput("broadcast", { target: "channel:C1" }),
+      "Action broadcast does not accept a target.",
+    ],
+  ])("rejects a destination for no-target action %j", (input, message) => {
+    expect(() => normalizeMessageActionInput(input)).toThrow(message);
   });
 
-  it("still backfills target for non-Feishu read actions with messageId-only input", () => {
-    const normalized = normalizeMessageActionInput({
-      action: "read",
-      args: {
-        channel: "slack",
-        messageId: "123.456",
-      },
-      toolContext: {
-        currentChannelId: "C12345678",
-        currentChannelProvider: "slack",
-      },
-    });
-
-    expect(normalized.target).toBe("C12345678");
-    expect(normalized.messageId).toBe("123.456");
-  });
-
-  it("maps legacy channelId inputs through canonical target for channel-id actions", () => {
-    const normalized = normalizeMessageActionInput({
-      action: "channel-info",
-      args: {
-        channelId: "C123",
-      },
-    });
-
-    expect(normalized.target).toBe("C123");
-    expect(normalized.channelId).toBe("C123");
-    expect("to" in normalized).toBe(false);
-  });
-
-  it("throws when required target remains unresolved", () => {
+  it("rejects conflicting canonical and plugin delivery targets", () => {
     expect(() =>
       normalizeMessageActionInput({
-        action: "send",
-        args: {},
+        action: "poll-vote",
+        args: {
+          channel: "imessage",
+          target: "chat_guid:iMessage;-;+15550001111",
+          chatGuid: "iMessage;-;+15559998888",
+        },
       }),
-    ).toThrow(/requires a target/);
+    ).toThrow(/conflicting target and delivery alias/);
+  });
+
+  it("allows a trusted direct operator to use an opaque resource without a conversation", () => {
+    expect(
+      normalizeMessageActionInput({
+        action: "unpin",
+        args: { channel: "pinboard", postId: "post_123" },
+        targetAliasSpec: {
+          aliases: ["postId", "roomId"],
+          deliveryTargetAliases: ["roomId"],
+        },
+        allowResourceOnly: true,
+      }),
+    ).toEqual({ channel: "pinboard", postId: "post_123" });
   });
 });

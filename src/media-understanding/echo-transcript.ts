@@ -1,31 +1,33 @@
+import { createHash } from "node:crypto";
+import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import type { MsgContext } from "../auto-reply/templating.js";
-import type { OpenClawConfig } from "../config/config.js";
+import type { OpenClawConfig } from "../config/types.js";
 import { logVerbose, shouldLogVerbose } from "../globals.js";
+import { createLazyRuntimeModule } from "../shared/lazy-runtime.js";
 import { isDeliverableMessageChannel } from "../utils/message-channel.js";
 
-let deliverRuntimePromise: Promise<typeof import("../infra/outbound/deliver-runtime.js")> | null =
-  null;
+// The message runtime is heavy and only needed when echo delivery actually
+// proceeds to a deliverable channel.
+const loadMessageRuntime = createLazyRuntimeModule(() => import("../channels/message/runtime.js"));
 
-function loadDeliverRuntime() {
-  deliverRuntimePromise ??= import("../infra/outbound/deliver-runtime.js");
-  return deliverRuntimePromise;
-}
-
+/** Default operator-visible transcript echo format for preflight audio transcription. */
 export const DEFAULT_ECHO_TRANSCRIPT_FORMAT = '📝 "{transcript}"';
 
-function formatEchoTranscript(transcript: string, format: string): string {
-  return format.replace("{transcript}", transcript);
-}
+const TELEGRAM_TRANSCRIPT_ECHO_INTENT_PREFIX = "transcript-echo:v1:";
+const TELEGRAM_TRANSCRIPT_ECHO_COMPLETION_RETENTION = {
+  idPrefix: TELEGRAM_TRANSCRIPT_ECHO_INTENT_PREFIX,
+  maxAgeMs: 24 * 60 * 60_000,
+  maxEntries: 2_000,
+} as const;
 
-/**
- * Sends the transcript echo back to the originating chat.
- * Best-effort: logs on failure, never throws.
- */
+/** Sends a transcript echo back to the originating deliverable chat. */
 export async function sendTranscriptEcho(params: {
   ctx: MsgContext;
   cfg: OpenClawConfig;
   transcript: string;
   format?: string;
+  logSuccess?: boolean;
+  failureLogPrefix?: string;
 }): Promise<void> {
   const { ctx, cfg, transcript } = params;
   const channel = ctx.Provider ?? ctx.Surface ?? "";
@@ -38,33 +40,68 @@ export async function sendTranscriptEcho(params: {
     return;
   }
 
-  const normalizedChannel = channel.trim().toLowerCase();
+  const normalizedChannel = normalizeLowercaseStringOrEmpty(channel);
   if (!isDeliverableMessageChannel(normalizedChannel)) {
     if (shouldLogVerbose()) {
       logVerbose(
-        `media: echo-transcript skipped (channel "${String(normalizedChannel)}" is not deliverable)`,
+        `media: echo-transcript skipped (channel "${normalizedChannel}" is not deliverable)`,
       );
     }
     return;
   }
 
-  const text = formatEchoTranscript(transcript, params.format ?? DEFAULT_ECHO_TRANSCRIPT_FORMAT);
+  // Function replacer keeps `$` sequences in the transcript literal instead of
+  // being parsed as String.prototype.replace substitution patterns.
+  const text = (params.format ?? DEFAULT_ECHO_TRANSCRIPT_FORMAT).replace(
+    "{transcript}",
+    () => transcript,
+  );
+  let deliveryIntentId: string | undefined;
+  if (normalizedChannel === "telegram") {
+    const echoAccountId = ctx.AccountId;
+    const echoMessageSid = ctx.MessageSid;
+    const accountId = echoAccountId?.trim();
+    const chatId = to
+      .trim()
+      .replace(/^telegram:/iu, "")
+      .replace(/^(?:group|user):/iu, "")
+      .replace(/:(?:direct-)?topic:[^:]+$/iu, "")
+      .trim()
+      .toLowerCase();
+    const messageSid = echoMessageSid?.trim();
+    if (accountId && chatId && !/\s/u.test(chatId) && messageSid) {
+      const identity = JSON.stringify([accountId, chatId, messageSid]);
+      const digest = createHash("sha256").update(identity).digest("hex");
+      deliveryIntentId = `${TELEGRAM_TRANSCRIPT_ECHO_INTENT_PREFIX}${digest}`;
+    }
+  }
 
   try {
-    const { deliverOutboundPayloads } = await loadDeliverRuntime();
-    await deliverOutboundPayloads({
+    const { sendDurableMessageBatchCore } = await loadMessageRuntime();
+    const send = await sendDurableMessageBatchCore({
       cfg,
       channel: normalizedChannel,
       to,
       accountId: ctx.AccountId ?? undefined,
       threadId: ctx.MessageThreadId ?? undefined,
       payloads: [{ text }],
-      bestEffort: true,
+      bestEffort: !deliveryIntentId,
+      durability: deliveryIntentId ? "required" : "best_effort",
+      ...(deliveryIntentId
+        ? {
+            deliveryIntentId,
+            completionRetention: TELEGRAM_TRANSCRIPT_ECHO_COMPLETION_RETENTION,
+          }
+        : {}),
     });
-    if (shouldLogVerbose()) {
+    if (send.status === "failed") {
+      throw send.error;
+    }
+    if ((params.logSuccess ?? true) && shouldLogVerbose()) {
       logVerbose(`media: echo-transcript sent to ${normalizedChannel}/${to}`);
     }
   } catch (err) {
-    logVerbose(`media: echo-transcript delivery failed: ${String(err)}`);
+    const prefix = params.failureLogPrefix ?? "media: echo-transcript delivery failed";
+    logVerbose(`${prefix}: ${String(err)}`);
   }
 }

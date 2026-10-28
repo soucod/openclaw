@@ -1,9 +1,11 @@
+// Discord helper module supports native command helpers behavior.
 import { ChannelType } from "discord-api-types/v10";
 import { vi } from "vitest";
+import type { resolveDiscordNativeInteractionRouteState } from "./native-command-route.js";
 
 export type MockCommandInteraction = {
   user: { id: string; username: string; globalName: string };
-  channel: { type: ChannelType; id: string };
+  channel: { type: ChannelType; id: string; parentId?: string | null };
   guild: { id: string; name?: string } | null;
   rawData: { id: string; member: { roles: string[] } };
   options: {
@@ -11,6 +13,9 @@ export type MockCommandInteraction = {
     getNumber: ReturnType<typeof vi.fn>;
     getBoolean: ReturnType<typeof vi.fn>;
   };
+  responseState: "unacknowledged" | "deferred" | "deferred-update" | "replied";
+  defer: ReturnType<typeof vi.fn>;
+  deleteReply: ReturnType<typeof vi.fn>;
   reply: ReturnType<typeof vi.fn>;
   followUp: ReturnType<typeof vi.fn>;
   client: object;
@@ -22,6 +27,7 @@ type CreateMockCommandInteractionParams = {
   globalName?: string;
   channelType?: ChannelType;
   channelId?: string;
+  threadParentId?: string | null;
   guildId?: string | null;
   guildName?: string;
   interactionId?: string;
@@ -33,7 +39,7 @@ export function createMockCommandInteraction(
   const guildId = params.guildId;
   const guild =
     guildId === null || guildId === undefined ? null : { id: guildId, name: params.guildName };
-  return {
+  const interaction: MockCommandInteraction = {
     user: {
       id: params.userId ?? "owner",
       username: params.username ?? "tester",
@@ -42,6 +48,7 @@ export function createMockCommandInteraction(
     channel: {
       type: params.channelType ?? ChannelType.DM,
       id: params.channelId ?? "dm-1",
+      parentId: params.threadParentId,
     },
     guild,
     rawData: {
@@ -53,8 +60,40 @@ export function createMockCommandInteraction(
       getNumber: vi.fn().mockReturnValue(null),
       getBoolean: vi.fn().mockReturnValue(null),
     },
+    responseState: "unacknowledged",
+    defer: vi.fn(async () => {
+      interaction.responseState = "deferred";
+    }),
+    deleteReply: vi.fn(async () => {
+      interaction.responseState = "replied";
+    }),
     reply: vi.fn().mockResolvedValue({ ok: true }),
     followUp: vi.fn().mockResolvedValue({ ok: true }),
     client: {},
+  };
+  return interaction;
+}
+
+type NativeRouteState = ReturnType<typeof resolveDiscordNativeInteractionRouteState>;
+export function createRouteState(params: {
+  sessionKey: string;
+  agentId?: string;
+  accountId?: string;
+  bound?: boolean;
+}): NativeRouteState {
+  const agentId = params.agentId ?? "main";
+  const route: NativeRouteState["effectiveRoute"] = {
+    agentId,
+    channel: "discord",
+    accountId: params.accountId ?? "default",
+    sessionKey: params.sessionKey,
+    mainSessionKey: `agent:${agentId}:main`,
+    lastRoutePolicy: "session",
+    matchedBy: params.bound ? "binding.channel" : "default",
+  };
+  return {
+    effectiveRoute: route,
+    boundSessionKey: params.bound ? params.sessionKey : undefined,
+    configuredBinding: null,
   };
 }
