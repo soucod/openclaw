@@ -1,0 +1,70 @@
+# 第一层：GitHub 推送后通知 CNB 拉取（全分支主路径）。
+# CNB API 失败时，自动 workflow_dispatch 本仓 sync-to-cnb.yml（第三层保底）。
+# 保底会在日志里写明「走保底」。
+#
+# Secret：与 sync-to-cnb.yml 共用 secrets.GIT_CNB_TOKEN。
+#   - 这里：Authorization: Bearer，权限是「触发构建」
+#   - sync-to-cnb.yml：git 密码，权限是「git 推送」
+# 令牌必须同时具备这两项。组织若拆开权限，再拆成两个 secret，不要在模板里写死第二套名字。
+#
+# 实例化：只把 <REPO_NAME> 换成产品 GitHub 仓名。见 template/README.md。
+# 本文件从 template/_shared/github-cnb-sync/ 复制，改公共副本后重跑 apply.py。
+
+name: Notify CNB to pull
+
+on: [push, workflow_dispatch]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# dispatch 保底需要 actions:write。默认 GITHUB_TOKEN 只读时，gh workflow run 会被拒。
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger CNB api_trigger_github_push
+        id: trigger
+        continue-on-error: true
+        env:
+          GIT_CNB_TOKEN: ${{ secrets.GIT_CNB_TOKEN }}
+          CNB_REPO_SLUG: "soucod-github/soucod/openclaw"
+          TARGET_BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GIT_CNB_TOKEN:-}" ]; then
+            echo "缺少 Secret GIT_CNB_TOKEN（notify 与 sync 共用；这里需要触发构建权限）"
+            exit 1
+          fi
+          code=$(curl -sS -o /tmp/cnb-trigger.json -w '%{http_code}' \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${GIT_CNB_TOKEN}" \
+            -d "$(jq -n \
+              --arg event "api_trigger_github_push" \
+              --arg branch "${TARGET_BRANCH}" \
+              --arg title "github notify pull" \
+              '{event:$event, branch:$branch, title:$title}')" \
+            "https://api.cnb.cool/${CNB_REPO_SLUG}/-/build/start")
+          echo "HTTP ${code}"
+          cat /tmp/cnb-trigger.json || true
+          echo
+          case "$code" in
+            2??) echo "CNB trigger accepted" ;;
+            *) echo "CNB trigger failed"; exit 1 ;;
+          esac
+
+      - name: Fallback dispatch sync-to-cnb
+        if: steps.trigger.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "CNB notify 失败，走保底：workflow_dispatch sync-to-cnb.yml"
+          echo "::warning::CNB notify 失败，已自动 dispatch sync-to-cnb.yml 保底"
+          gh workflow run sync-to-cnb.yml --ref "${GITHUB_REF_NAME}"
+          echo "保底 workflow_dispatch 已提交（sync-to-cnb.yml @ ${GITHUB_REF_NAME}）"
