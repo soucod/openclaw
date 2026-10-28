@@ -1,11 +1,7 @@
-# 第三层保底：纯 git force push 到 CNB。不依赖 Docker，也不在 push 上跑。
-# 只由 notify-cnb-pull.yml 在 CNB API 失败时 workflow_dispatch，或人工手动跑。
+# 独立保底：纯 git force push 到 CNB。不依赖 Docker。
+# 支持在 GitHub Actions 页面通过 workflow_dispatch 手动一键触发全部分支与 Tag 同步。
 #
-# Secret：与 notify-cnb-pull.yml 共用 secrets.GIT_CNB_TOKEN（此处作 git 密码）。
-# 令牌必须同时具备「触发构建」和「git 推送」。组织若拆开权限，再拆 secret。
-#
-# 实例化：只把 <REPO_NAME> 换成产品 GitHub 仓名。
-# 本文件从 template/_shared/github-cnb-sync/ 复制，改公共副本后重跑 apply.py。
+# Secret：支持 secrets.GIT_CNB_TOKEN 或 secrets.GIT_PASSWORD。
 
 name: Sync to CNB
 
@@ -19,22 +15,23 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Push branches and tags to CNB
         env:
-          PLUGIN_PASSWORD: ${{ secrets.GIT_CNB_TOKEN }}
+          TOKEN: ${{ secrets.GIT_CNB_TOKEN || secrets.GIT_PASSWORD }}
           TARGET_URL: "https://cnb.cool/soucod-github/soucod/openclaw.git"
         run: |
           set -euo pipefail
-          if [ -z "${PLUGIN_PASSWORD:-}" ]; then
-            echo "缺少 Secret GIT_CNB_TOKEN（notify 与 sync 共用；这里需要 git 推送权限）"
+          if [ -z "${TOKEN:-}" ]; then
+            echo "缺少 Secret: 请在 GitHub 仓库配置 GIT_CNB_TOKEN 或 GIT_PASSWORD（需要 git 推送权限）"
             exit 1
           fi
-          auth_url="https://cnb:${PLUGIN_PASSWORD}@${TARGET_URL#https://}"
+          auth_url="https://cnb:${TOKEN}@${TARGET_URL#https://}"
           git remote remove cnb 2>/dev/null || true
           git remote add cnb "$auth_url"
           git push --force cnb --all
           git push --force cnb --tags || true
+          echo "全部分支与 Tag 已同步至 CNB！"
