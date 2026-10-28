@@ -19,8 +19,8 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /tmp
-RUN git clone --depth 1 https://cnb.cool/cnb/sdk/cnb-openapi-skills /tmp/cnb-openapi-skills && \
-    rm -rf /tmp/cnb-openapi-skills/.git
+RUN git clone --depth 1 https://cnb.cool/avwq/cnb.cool/cnb-skill /tmp/cnb-skill && \
+    rm -rf /tmp/cnb-skill/.git
 
 FROM node:24 AS runtime-base
 
@@ -57,7 +57,7 @@ WORKDIR /workspace
 
 COPY --from=builder /srv/dist /srv/dist
 RUN mkdir -p /root/.openclaw/skills
-COPY --from=skills /tmp/cnb-openapi-skills /root/.openclaw/skills/cnb-openapi-skills
+COPY --from=skills /tmp/cnb-skill /root/.openclaw/skills/cnb-skill
 COPY openclaw.json /srv/openclaw.json
 COPY start.sh /srv/start.sh
 RUN chmod +x /srv/start.sh
