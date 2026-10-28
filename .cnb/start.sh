@@ -357,6 +357,9 @@ wait_mcp_ready "bing-cn-mcp" "$BING_CN_PID" "bing-cn-mcp.log" 20 3
 
 sleep 2
 
+# 预检并自动修复潜在的历史配置项
+openclaw doctor --fix >/dev/null 2>&1 || true
+
 openclaw gateway --allow-unconfigured > openclaw.log 2>&1 &
 
 PID=$!
