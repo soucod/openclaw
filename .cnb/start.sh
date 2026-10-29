@@ -243,6 +243,11 @@ http {
         "" 1;
     }
 
+    map \$http_x_forwarded_proto \$forwarded_proto {
+        default \$http_x_forwarded_proto;
+        ''      \$scheme;
+    }
+
     server {
         listen 8686;
         server_name _;
@@ -255,7 +260,7 @@ http {
             proxy_set_header Host \$host;
             proxy_set_header X-Real-IP \$remote_addr;
             proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-            proxy_set_header X-Forwarded-Proto \$scheme;
+            proxy_set_header X-Forwarded-Proto \$forwarded_proto;
 
             proxy_http_version 1.1;
             proxy_set_header Upgrade \$http_upgrade;
@@ -272,7 +277,7 @@ http {
             proxy_set_header Host \$host;
             proxy_set_header X-Real-IP \$remote_addr;
             proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-            proxy_set_header X-Forwarded-Proto \$scheme;
+            proxy_set_header X-Forwarded-Proto \$forwarded_proto;
 
             proxy_http_version 1.1;
             proxy_set_header Upgrade \$http_upgrade;

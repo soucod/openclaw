@@ -107,11 +107,17 @@
     },
     "port": 18789,
     "bind": "loopback",
+    "trustedProxies": [
+      "127.0.0.1",
+      "::1"
+    ],
+    "allowRealIpFallback": true,
     "tailscale": {
       "mode": "off"
     },
     "controlUi": {
-      "enabled": true
+      "enabled": true,
+      "dangerouslyAllowHostHeaderOriginFallback": true
     }
   },
   "skills": {
