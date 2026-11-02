@@ -52,7 +52,9 @@ Claims have no budget.
 - Edits that keep a body the same size or smaller always succeed, even on a page
   already over budget. Such a page can only shrink.
 - On rejection, don't truncate, summarize away detail, or park the text on an
-  unrelated nearby page. Move a whole section that has its own subject with
+  unrelated nearby page. If the page has a written `## Timeline` section, retire
+  it ([retire a written Timeline](profiles.md#retire-a-written-timeline)); never
+  extract it. Otherwise move a whole section that has its own subject with
   `knowledge_extract_section`, to a listed candidate it is about or to a new page,
   then reread and retry your edit.
 - A rejected page edit never blocks a fact: save it with `knowledge_remember` or
@@ -65,8 +67,12 @@ Claims have no budget.
 source, or `{title, type}` for a new page), a one-line `summary`, a reason, and
 the vault and ontology fences. In one publication the section moves verbatim with
 its links and the source evidence it quotes; claims it cites that name the source
-as a subject move to the destination; the source keeps the heading, your summary
-and a link. The destination's own budget applies.
+as a subject gain the destination as primary subject and keep the source; the
+source keeps the heading, your summary and a link. The destination's own budget
+applies. Afterwards decide for each moved claim whether the source page is still
+a subject, and remove it with `knowledge_annotate` `entities` when it is not.
+Reference-style links and a destination ending inside an open code block reject
+the move: write the section's links inline or as `[[id|label]]` first.
 
 ## Publish related records together
 
