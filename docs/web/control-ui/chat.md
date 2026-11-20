@@ -1143,10 +1143,14 @@ If you use the `coding` tool profile, include `"message"` in `tools.alsoAllow`
 deny rules still apply. See [Tool access configuration](/gateway/config-tools).
 
 Select a card to open its listing inside the Control UI: plugins open in
-**Plugins**, and skills open in **Skills**. A card's **Install** button opens
-the capability details. Select **Install** on a plugin overview to start installation
-immediately. Configured install-policy warnings still require an explicit
-acknowledgment; see [Manage plugins](/web/control-ui/settings#manage-plugins).
+**Plugins**, and skills open in **Skills**. On an official plugin card,
+**Install** starts the installation in the conversation: the card shows
+**Installing**, then the result, and you stay in the chat. On community plugin
+and skill cards, **Install** opens the capability details; select **Install**
+on the plugin overview to start installation. Configured install-policy
+warnings still require an explicit acknowledgment. When an official plugin has
+one, the card opens the plugin overview, where you review and acknowledge it;
+see [Manage plugins](/web/control-ui/settings#manage-plugins).
 **Dismiss** dismisses the card from the current view.
 
 An installed capability shows a green checkmark and **Installed**. This means the
@@ -1452,6 +1456,11 @@ Use `trusted` only when the embedded document genuinely needs same-origin behavi
 Absolute external `http(s)` embed URLs stay blocked by default, except for the dedicated [YouTube video card](/web/control-ui/chat#youtube-videos). To let `[embed url="https://..."]` load other third-party pages, set `gateway.controlUi.allowExternalEmbedUrls: true`.
 
 Widgets created by `show_widget` load through the authenticated Gateway connection in every sandbox mode, including while settings are loading. In `strict` mode, their content remains visible but scripted interactions are disabled. Authenticated conversation readers, including guests, receive the configured sandbox policy without needing general operator read access. Bootstrap does not grant access to plugin modules or configuration settings that their scopes do not allow.
+
+Widgets that are no longer available keep their error visible instead of reloading on later chat
+activity or when their chat row remounts. Reload the page or ask the agent to
+recreate the widget. Temporary loading failures retry up to five times with exponential
+backoff; after that, the error offers a manual **Retry**.
 
 When a live widget moves into the assistant's final reply, Chrome and Edge 133+
 and Firefox 144+ preserve its playback and local interaction state. Browsers
